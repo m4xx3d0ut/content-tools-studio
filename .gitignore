@@ -11,10 +11,10 @@ node_modules/
 .pnpm-store/
 
 # Build output
-/dist/
-/build/
-/coverage/
-/.vite/
+dist/
+build/
+coverage/
+.vite/
 
 # Local workspace/output
 /workspace/

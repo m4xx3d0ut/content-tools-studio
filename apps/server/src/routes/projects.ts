@@ -99,7 +99,16 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
 
     await pipeline(data.file, createWriteStream(targetPath));
 
-    const video = await probeVideo(targetPath);
+    let video;
+    try {
+      video = await probeVideo(targetPath);
+    } catch (error) {
+      await fs.unlink(targetPath).catch(() => undefined);
+      return reply.code(400).send({
+        error: "video probe failed",
+        message: (error as Error).message,
+      });
+    }
     const now = new Date().toISOString();
     const updatedProject = ProjectSchema.parse({
       ...project,
