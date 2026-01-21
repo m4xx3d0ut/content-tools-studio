@@ -243,26 +243,39 @@ function buildReadme(
 ): string {
   const preset = EXPORT_PRESETS[manifest.presetId] ??
     EXPORT_PRESETS[DEFAULT_PRESET_ID];
-  const overlayArgs = cardInputs
-    .map((input) => `  -loop 1 -i ${relPath(exportDir, input.filePath)}`)
-    .join(" \\\n");
-  const arrowArgs = arrowInputs
-    .map((input) => `  -loop 1 -i ${relPath(exportDir, input.filePath)}`)
-    .join(" \\\n");
+  const overlayLines = cardInputs.map(
+    (input) => `  -loop 1 -i ${relPath(exportDir, input.filePath)} \\\\`
+  );
+  const arrowLines = arrowInputs.map(
+    (input) => `  -loop 1 -i ${relPath(exportDir, input.filePath)} \\\\`
+  );
 
   const inputVideo = relPath(exportDir, manifest.source);
   const cardsScript = manifest.filterCards;
   const cardsArrowsScript = manifest.filterCardsArrows;
 
-  const cardsCommand = `ffmpeg -y -i ${inputVideo} \\\n${overlayArgs} \\\n  -filter_complex_script ${cardsScript} \\\n  -map "${manifest.outputLabelCards}" -c:v ${preset.codec} ${preset.args.join(
-    " "
-  )} -pix_fmt yuv420p \\\n  main_noslug.mp4`;
+  const cardsCommand = [
+    `ffmpeg -y -i ${inputVideo} \\\\`,
+    ...overlayLines,
+    `  -filter_complex_script ${cardsScript} \\\\`,
+    `  -map "${manifest.outputLabelCards}" -c:v ${preset.codec} ${preset.args.join(
+      " "
+    )} -pix_fmt yuv420p \\\\`,
+    "  main_noslug.mp4",
+  ].join("\n");
 
   let arrowsCommand = "";
   if (arrowInputs.length) {
-    arrowsCommand = `ffmpeg -y -i ${inputVideo} \\\n${overlayArgs} \\\n${arrowArgs} \\\n  -filter_complex_script ${cardsArrowsScript} \\\n  -map "${manifest.outputLabelCardsArrows}" -c:v ${preset.codec} ${preset.args.join(
-      " "
-    )} -pix_fmt yuv420p \\\n  main_noslug_arrows.mp4`;
+    arrowsCommand = [
+      `ffmpeg -y -i ${inputVideo} \\\\`,
+      ...overlayLines,
+      ...arrowLines,
+      `  -filter_complex_script ${cardsArrowsScript} \\\\`,
+      `  -map "${manifest.outputLabelCardsArrows}" -c:v ${preset.codec} ${preset.args.join(
+        " "
+      )} -pix_fmt yuv420p \\\\`,
+      "  main_noslug_arrows.mp4",
+    ].join("\n");
   }
 
   const slugNote = manifest.includeSlug
