@@ -30,16 +30,22 @@ export const SourceSchema = z.object({
 
 export const MotionSchema = z
   .object({
-    // Card slide-in
+    // Card slide-in/out
     slideInFrames: z.number().int().nonnegative().optional(),
     displayFrames: z.number().int().nonnegative().optional(),
+    slideOutFrames: z.number().int().nonnegative().optional(),
     slideDirection: z.enum(["fromLeft", "fromRight", "none"]).optional(),
 
     // Visibility override (esp. arrows)
     visibleStartFrame: z.number().int().nonnegative().optional(),
     visibleEndFrame: z.number().int().nonnegative().optional(),
 
-    // Arrow bounce
+    // Arrow pulse
+    pulsePeriodFrames: z.number().int().positive().optional(),
+    pulseMinAlpha: z.number().min(0).max(1).optional(),
+    pulseMaxAlpha: z.number().min(0).max(1).optional(),
+
+    // Arrow bounce (optional)
     bouncePx: z.number().finite().nonnegative().optional(),
     bouncePeriodFrames: z.number().int().positive().optional(),
     bounceAxis: z.enum(["x", "y"]).optional(),
