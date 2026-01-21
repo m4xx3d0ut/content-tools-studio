@@ -12,9 +12,10 @@ import {
   writeProject,
 } from "../services/workspace.js";
 import { probeVideo } from "../services/ffprobe.js";
-import { renderFinal, writeExportBundle } from "../services/exporter.js";
+import { renderFinal, writeExportBundle, type RenderProgress } from "../services/exporter.js";
 import { WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
+import { ensureThumbnail } from "../services/thumbnails.js";
 
 export const projectsRoutes: FastifyPluginAsync = async (app) => {
   app.get("/", async () => {
@@ -160,6 +161,23 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return reply.send(createReadStream(videoPath));
   });
 
+  app.get("/:id/thumbnail", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { frame, width } = request.query as { frame?: string; width?: string };
+    const project = await readProject(id);
+    if (!project) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+    const targetFrame = frame ? Number(frame) : 0;
+    const targetWidth = width ? Number(width) : 240;
+    try {
+      const thumbPath = await ensureThumbnail(project, targetFrame, targetWidth);
+      return reply.type("image/jpeg").send(createReadStream(thumbPath));
+    } catch (error) {
+      return reply.code(500).send({ error: (error as Error).message });
+    }
+  });
+
   app.post("/:id/assets/:kind/:overlayId", async (request, reply) => {
     const { id, kind, overlayId } = request.params as {
       id: string;
@@ -253,6 +271,45 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       };
     } catch (error) {
       return reply.code(500).send({ error: (error as Error).message });
+    }
+  });
+
+  app.get("/:id/render/stream", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const query = request.query as { presetId?: string; includeSlug?: string; speed?: string };
+    const project = await readProject(id);
+    if (!project) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+
+    const options = {
+      presetId: query.presetId,
+      includeSlug: query.includeSlug === "true",
+      speed: query.speed ? (Number(query.speed) as 1 | 2) : undefined,
+    };
+
+    reply.raw.setHeader("Content-Type", "text/event-stream");
+    reply.raw.setHeader("Cache-Control", "no-cache");
+    reply.raw.setHeader("Connection", "keep-alive");
+    reply.raw.flushHeaders();
+    reply.hijack();
+
+    const send = (event: string, data: RenderProgress | { message: string }) => {
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    send("status", { message: "Render started" });
+
+    try {
+      const result = await renderFinal(project, options, (update) => {
+        send("progress", update);
+      });
+      send("done", { message: result.finalPath });
+    } catch (error) {
+      send("error", { message: (error as Error).message });
+    } finally {
+      reply.raw.end();
     }
   });
 };

@@ -5,11 +5,18 @@ import type { Overlay, Project } from "@content-tools/shared";
 import { DEFAULT_PRESET_ID, EXPORT_PRESETS } from "@content-tools/shared";
 import { FFMPEG_PATH, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
+import { renderProjectAssets } from "./renderer.js";
 
 type ExportRequest = {
   presetId?: string;
   includeSlug?: boolean;
   speed?: 1 | 2;
+};
+
+export type RenderProgress = {
+  stage: string;
+  message?: string;
+  percent?: number;
 };
 
 type ExportManifest = {
@@ -407,12 +414,49 @@ function buildReadme(
   return lines.join("\n");
 }
 
-async function runFfmpeg(args: string[], cwd: string): Promise<void> {
+function parseTimestamp(value: string): number | null {
+  const match = value.match(/(\d+):(\d+):(\d+\.?\d*)/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) {
+    return null;
+  }
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+async function runFfmpeg(
+  args: string[],
+  cwd: string,
+  onProgress?: (update: RenderProgress) => void,
+  durationSec?: number,
+  stage?: string
+): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(FFMPEG_PATH, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
+    let buffer = "";
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      buffer += text;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const timeMatch = trimmed.match(/time=([0-9:.]+)/);
+        if (timeMatch && durationSec) {
+          const seconds = parseTimestamp(timeMatch[1]);
+          if (seconds !== null) {
+            const percent = Math.min(1, Math.max(0, seconds / durationSec));
+            onProgress?.({ stage: stage ?? "ffmpeg", percent, message: trimmed });
+          }
+        } else {
+          onProgress?.({ stage: stage ?? "ffmpeg", message: trimmed });
+        }
+      }
     });
     child.on("error", reject);
     child.on("close", (code) => {
@@ -499,13 +543,17 @@ export async function writeExportBundle(
 
 export async function renderFinal(
   project: Project,
-  options: ExportRequest = {}
+  options: ExportRequest = {},
+  onProgress?: (update: RenderProgress) => void
 ): Promise<{
   exportDir: string;
   exportId: string;
   finalPath: string;
   manifest: ExportManifest;
 }> {
+  onProgress?.({ stage: "assets", message: "Rendering overlay assets" });
+  await renderProjectAssets(project);
+
   const { exportDir, exportId, manifest } = await writeExportBundle(project, options);
   const preset = EXPORT_PRESETS[manifest.presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
 
@@ -545,7 +593,8 @@ export async function renderFinal(
     mainOutputPath
   );
 
-  await runFfmpeg(args, exportDir);
+  const durationSec = (project.video.durationMs / 1000) / (options.speed ?? 1);
+  await runFfmpeg(args, exportDir, onProgress, durationSec, "ffmpeg-main");
 
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const finalPath = path.join(exportDir, "final.mp4");
@@ -583,11 +632,12 @@ export async function renderFinal(
       "yuv420p",
       finalWithSlug,
     ];
-    await runFfmpeg(concatArgs, exportDir);
+    await runFfmpeg(concatArgs, exportDir, onProgress, undefined, "ffmpeg-concat");
     await fs.copyFile(finalWithSlug, finalPath);
   } else {
     await fs.copyFile(mainOutputPath, finalPath);
   }
 
+  onProgress?.({ stage: "done", message: "Render complete", percent: 1 });
   return { exportDir, exportId, finalPath, manifest };
 }
