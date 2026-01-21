@@ -141,12 +141,41 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     const stat = await fs.stat(videoPath);
     const range = request.headers.range;
     if (range) {
-      const match = range.match(/bytes=(\\d+)-(\\d+)?/);
-      if (!match) {
-        return reply.code(416).send();
+      const rangeValue = range.replace("bytes=", "");
+      const firstRange = rangeValue.split(",")[0]?.trim() ?? "";
+      const [startRaw, endRaw] = firstRange.split("-");
+
+      let start: number | null = null;
+      let end: number | null = null;
+
+      if (!startRaw && endRaw) {
+        const suffix = Number(endRaw);
+        if (Number.isFinite(suffix) && suffix > 0) {
+          start = Math.max(0, stat.size - suffix);
+          end = stat.size - 1;
+        }
+      } else if (startRaw) {
+        const parsedStart = Number(startRaw);
+        if (Number.isFinite(parsedStart) && parsedStart >= 0) {
+          start = parsedStart;
+          if (endRaw) {
+            const parsedEnd = Number(endRaw);
+            if (Number.isFinite(parsedEnd) && parsedEnd >= parsedStart) {
+              end = Math.min(parsedEnd, stat.size - 1);
+            }
+          } else {
+            end = stat.size - 1;
+          }
+        }
       }
-      const start = Number(match[1]);
-      const end = match[2] ? Number(match[2]) : stat.size - 1;
+
+      if (start === null || end === null || start >= stat.size) {
+        return reply
+          .code(416)
+          .header("Content-Range", `bytes */${stat.size}`)
+          .send();
+      }
+
       const chunkSize = end - start + 1;
       reply
         .code(206)
@@ -168,12 +197,15 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     if (!project) {
       return reply.code(404).send({ error: "project not found" });
     }
-    const targetFrame = frame ? Number(frame) : 0;
-    const targetWidth = width ? Number(width) : 240;
+    const frameValue = frame ? Number(frame) : 0;
+    const widthValue = width ? Number(width) : 240;
+    const targetFrame = Number.isFinite(frameValue) ? Math.max(0, Math.floor(frameValue)) : 0;
+    const targetWidth = Number.isFinite(widthValue) ? Math.max(80, Math.floor(widthValue)) : 240;
     try {
       const thumbPath = await ensureThumbnail(project, targetFrame, targetWidth);
       return reply.type("image/jpeg").send(createReadStream(thumbPath));
     } catch (error) {
+      request.log.error({ err: error }, "thumbnail generation failed");
       return reply.code(500).send({ error: (error as Error).message });
     }
   });

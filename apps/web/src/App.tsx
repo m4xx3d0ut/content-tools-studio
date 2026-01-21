@@ -65,6 +65,9 @@ export default function App() {
   const [renderOptions, setRenderOptions] = useState({ speed: 1 as 1 | 2, includeSlug: false });
   const [renderProgress, setRenderProgress] = useState<number | null>(null);
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
+  const [thumbnailError, setThumbnailError] = useState<string | null>(null);
+  const seekPauseRef = useRef(false);
+  const isPlayingRef = useRef(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRefs = useRef<Record<string, KonvaGroup>>({});
@@ -116,6 +119,7 @@ export default function App() {
       setProject(null);
       return;
     }
+    setThumbnailError(null);
     getProject(selectedId)
       .then((data: Project) => {
         setProject(data);
@@ -161,7 +165,19 @@ export default function App() {
   useEffect(() => {
     if (!videoRef.current) return;
     videoRef.current.currentTime = currentFrame / fps;
+    if (seekPauseRef.current) {
+      videoRef.current.pause();
+      isPlayingRef.current = false;
+      seekPauseRef.current = false;
+    }
   }, [currentFrame, fps]);
+
+  function seekToFrame(frame: number, pause = true) {
+    if (pause) {
+      seekPauseRef.current = true;
+    }
+    setCurrentFrame(frame);
+  }
 
   async function handleCreate() {
     if (!nameInput.trim()) return;
@@ -661,8 +677,15 @@ export default function App() {
                     setVideoDurationSec((event.target as HTMLVideoElement).duration || 0);
                   }}
                   onTimeUpdate={(event) => {
+                    if (!isPlayingRef.current) return;
                     const time = (event.target as HTMLVideoElement).currentTime;
                     setCurrentFrame(formatFrame(time * fps));
+                  }}
+                  onPlay={() => {
+                    isPlayingRef.current = true;
+                  }}
+                  onPause={() => {
+                    isPlayingRef.current = false;
                   }}
                 />
                 {stageMetrics.width > 0 && (
@@ -696,13 +719,13 @@ export default function App() {
           <div className="playback-bar">
             <button
               className="secondary"
-              onClick={() => setCurrentFrame((prev) => Math.max(0, prev - 1))}
+              onClick={() => seekToFrame(Math.max(0, currentFrame - 1))}
             >
               ◀︎ Frame
             </button>
             <button
               className="secondary"
-              onClick={() => setCurrentFrame((prev) => Math.min(totalFrames - 1, prev + 1))}
+              onClick={() => seekToFrame(Math.min(totalFrames - 1, currentFrame + 1))}
             >
               Frame ▶︎
             </button>
@@ -919,7 +942,7 @@ export default function App() {
             min={0}
             max={Math.max(1, totalFrames - 1)}
             value={currentFrame}
-            onChange={(event) => setCurrentFrame(Number(event.target.value))}
+            onChange={(event) => seekToFrame(Number(event.target.value))}
           />
           <div className="details">
             Frame {currentFrame} / {totalFrames}
@@ -933,10 +956,14 @@ export default function App() {
                 src={thumbnailUrl(project.id, frame, 180)}
                 alt={`Frame ${frame}`}
                 className={frame === currentFrame ? "thumbnail active" : "thumbnail"}
-                onClick={() => setCurrentFrame(frame)}
+                onClick={() => seekToFrame(frame)}
+                onError={() =>
+                  setThumbnailError((prev) => prev ?? `Thumbnail failed at frame ${frame}.`)
+                }
               />
             ))}
         </div>
+        {thumbnailError && <div className="details warning">{thumbnailError}</div>}
         {project && (
           <div className="track-list">
             <div className="track-row">

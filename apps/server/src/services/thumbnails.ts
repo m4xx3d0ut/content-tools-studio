@@ -37,10 +37,11 @@ export async function ensureThumbnail(
   const thumbsDir = path.join(projectRoot, "thumbs");
   await ensureDir(thumbsDir);
 
-  const fps = project.video.fpsDen === 0 ? 30 : project.video.fpsNum / project.video.fpsDen;
-  const time = frame / fps;
-  const safeFrame = Math.max(0, Math.floor(frame));
-  const safeWidth = Math.max(80, Math.floor(width));
+  const rawFps = project.video.fpsDen === 0 ? 30 : project.video.fpsNum / project.video.fpsDen;
+  const fps = Number.isFinite(rawFps) && rawFps > 0 ? rawFps : 30;
+  const safeFrame = Number.isFinite(frame) ? Math.max(0, Math.floor(frame)) : 0;
+  const safeWidth = Number.isFinite(width) ? Math.max(80, Math.floor(width)) : 240;
+  const time = safeFrame / fps;
   const outputPath = path.join(thumbsDir, `frame_${safeFrame}_w${safeWidth}.jpg`);
 
   if (await fileExists(outputPath)) {

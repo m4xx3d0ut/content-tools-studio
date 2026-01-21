@@ -62,6 +62,10 @@ body {
   line-height: 1.5;
 }
 
+.details.warning {
+  color: #fca5a5;
+}
+
 .editor-grid {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr) 320px;
