@@ -126,6 +126,61 @@ button.secondary {
   gap: 12px;
 }
 
+.video-wrapper {
+  position: relative;
+  margin-top: 16px;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.video-preview {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.scrubber {
+  margin-top: 16px;
+}
+
+.overlay-list {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0 0;
+  display: grid;
+  gap: 10px;
+}
+
+.overlay-item {
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(8, 9, 12, 0.6);
+}
+
+.overlay-item.active {
+  border-color: rgba(247, 179, 91, 0.6);
+  background: rgba(247, 179, 91, 0.12);
+}
+
+.overlay-editor {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  display: grid;
+  gap: 10px;
+}
+
 .project-card {
   padding: 12px 16px;
   border-radius: 12px;

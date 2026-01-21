@@ -19,6 +19,52 @@ export type ProjectSummary = {
   video: { width: number; height: number; fpsNum: number; fpsDen: number };
 };
 
+export type Rect = { x: number; y: number; w: number; h: number };
+
+export type Motion = {
+  slideInFrames?: number;
+  displayFrames?: number;
+  slideOutFrames?: number;
+  slideDirection?: "fromLeft" | "fromRight" | "none";
+  visibleStartFrame?: number;
+  visibleEndFrame?: number;
+  pulsePeriodFrames?: number;
+  pulseMinAlpha?: number;
+  pulseMaxAlpha?: number;
+  bouncePx?: number;
+  bouncePeriodFrames?: number;
+  bounceAxis?: "x" | "y";
+};
+
+export type Overlay = {
+  id: string;
+  templateId: string;
+  templateVersion: string;
+  startFrame: number;
+  endFrame: number;
+  rect: Rect;
+  rotationDeg?: number;
+  opacity?: number;
+  zIndex: number;
+  fields: Record<string, string | number | boolean | null>;
+  motion?: Motion;
+};
+
+export type Project = ProjectSummary & {
+  schemaVersion?: number;
+  source: { filename: string; sizeBytes?: number; sha256?: string };
+  video: {
+    width: number;
+    height: number;
+    fpsNum: number;
+    fpsDen: number;
+    durationMs: number;
+  };
+  overlays: Overlay[];
+  exportOptions?: { speed?: 1 | 2; includeSlug?: boolean };
+  slug?: { introPath?: string; outroPath?: string; fps?: number };
+};
+
 export async function listProjects(): Promise<ProjectSummary[]> {
   const data = await request<{ projects: ProjectSummary[] }>("/projects");
   return data.projects;
@@ -41,6 +87,18 @@ export async function importVideo(projectId: string, file: File): Promise<Projec
   });
 }
 
+export async function getProject(projectId: string): Promise<Project> {
+  return request<Project>(`/projects/${projectId}`);
+}
+
+export async function updateProject(projectId: string, project: Project): Promise<Project> {
+  return request<Project>(`/projects/${projectId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(project),
+  });
+}
+
 export type ExportOptions = {
   presetId?: string;
   includeSlug?: boolean;
@@ -53,4 +111,30 @@ export async function exportProject(projectId: string, options: ExportOptions) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
   });
+}
+
+export async function renderProject(projectId: string, options: ExportOptions) {
+  return request(`/projects/${projectId}/render`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(options),
+  });
+}
+
+export async function uploadAsset(
+  projectId: string,
+  kind: "overlays" | "arrows",
+  overlayId: string,
+  blob: Blob
+) {
+  const form = new FormData();
+  form.append("file", blob, `${overlayId}.png`);
+  return request(`/projects/${projectId}/assets/${kind}/${overlayId}`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+export function mediaUrl(projectId: string): string {
+  return `${API_BASE}/projects/${projectId}/media`;
 }
