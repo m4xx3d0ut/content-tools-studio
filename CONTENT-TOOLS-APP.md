@@ -34,18 +34,21 @@ A local-first content creation web app:
 
   * Select overlay card template.
   * Set text fields (including multi-line).
-  * Optional arrow: position, orientation (left/right/45° down-left/45° down-right), and visibility window.
+  * Optional arrow: position, orientation (arbitrary angle), and visibility window.
+  * Card motion: slide-in + slide-out duration, plus display duration.
+  * Arrow motion: transparency pulse speed + visible duration.
 * Preview overlays on top of the video frame in the browser.
 * Export an archive containing:
 
   * Generated overlay PNGs (card + text baked), arrow PNGs (transformed), and any fonts needed.
   * `filter_complex.txt` (or equivalent) for ffmpeg.
   * `README.md`/Markdown with the exact command to run locally.
+  * Final rendered MP4 written into the workspace export folder.
 
 ### Non-goals (MVP)
 
 * No collaborative editing or cloud storage.
-* No final video rendering in-browser.
+* No final video rendering in-browser; the local backend runs FFmpeg and writes final outputs into the workspace.
 * No advanced motion graphics beyond basic fade/pulse (optional future preset support).
 
 ### UX flow
@@ -57,7 +60,7 @@ A local-first content creation web app:
    * Choose overlay card template.
    * Enter text.
    * Place card via drag/resize; snap to grid/quadrant.
-   * Optional arrow: select type (left/right/45° down-left/45° down-right), drag to position, adjust opacity and blink timing.
+   * Optional arrow: select orientation, drag to position, adjust transparency pulse timing.
 4. Preview: overlay the annotation on the current frame.
 5. Export: generate assets + ffmpeg docs into a downloadable archive.
 
@@ -94,7 +97,7 @@ A local-first content creation web app:
   * Concatenate: `intro + main + outro` (single ffmpeg invocation or a second pass).
 * MVP recommendation: **two-pass** (matches your working manual commands and is easiest to debug).
 
-### Per-quadrant card motion: slide-in
+### Per-quadrant card motion: slide-in + slide-out
 
 * Overlay cards/text must **slide in** horizontally:
 
@@ -104,16 +107,17 @@ A local-first content creation web app:
 
   * `slideInFrames` (duration of slide)
   * `displayFrames` (how long it remains visible after slide completes) OR derive from `endFrame`.
+  * `slideOutFrames` (duration of slide-out, default 0)
 
-### Arrow motion: bounce
+### Arrow motion: pulse (alpha) + bounce (optional)
 
-* Arrows must **bounce** while visible.
+* Arrows must **pulse** (alpha) while visible.
 * Each arrow needs:
 
   * `visibleStartFrame/visibleEndFrame` (arrow-only window override)
-  * `bouncePx` (amplitude)
-  * `bouncePeriodFrames` (period/speed)
-  * Optional `bounceAxis` (x or y); for left/right arrows, bouncing on **x** often “reads” better.
+  * `pulsePeriodFrames` (period/speed for alpha pulse)
+  * Optional `pulseMinAlpha/pulseMaxAlpha`
+  * Optional bounce: `bouncePx`, `bouncePeriodFrames`, `bounceAxis`
 
 ---
 
@@ -166,6 +170,7 @@ workspace/<projectId>/
     <timestamp>/
       main_noslug.mp4
       final_with_slug.mp4   # optional
+      final.mp4             # final cut (no slug if includeSlug=false)
       manifest.json
       filter_complex_cards.txt
       filter_complex_cards_arrows.txt
@@ -233,16 +238,22 @@ export const SourceSchema = z.object({
 });
 
 export const MotionSchema = z.object({
-  // Card slide-in
+  // Card slide-in/out
   slideInFrames: z.number().int().nonnegative().optional(),
   displayFrames: z.number().int().nonnegative().optional(),
+  slideOutFrames: z.number().int().nonnegative().optional(),
   slideDirection: z.enum(["fromLeft", "fromRight", "none"]).optional(),
 
   // Visibility override (esp. arrows)
   visibleStartFrame: z.number().int().nonnegative().optional(),
   visibleEndFrame: z.number().int().nonnegative().optional(),
 
-  // Arrow bounce
+  // Arrow pulse
+  pulsePeriodFrames: z.number().int().positive().optional(),
+  pulseMinAlpha: z.number().min(0).max(1).optional(),
+  pulseMaxAlpha: z.number().min(0).max(1).optional(),
+
+  // Arrow bounce (optional)
   bouncePx: z.number().finite().nonnegative().optional(),
   bouncePeriodFrames: z.number().int().positive().optional(),
   bounceAxis: z.enum(["x", "y"]).optional(),
@@ -502,17 +513,17 @@ Use:
 enable='between(t, visStartSec, visEndSec)'
 ```
 
-### Card display time rule (slide + hold)
+### Card display time rule (slide-in + hold + slide-out)
 
 If `displayFrames` is set (and you want end derived):
 
-* `visEndSec = startSec + slideSec + displaySec`
+* `visEndSec = startSec + slideSec + displaySec + slideOutSec`
 
 Else:
 
 * use reminder `endFrame` as authored.
 
-### Slide-in X expression
+### Slide-in + slide-out X expression
 
 Let:
 
@@ -520,15 +531,32 @@ Let:
 * `w = rect.w`
 * `videoW = 1920`
 * `xStart = -w` for fromLeft, `xStart = videoW` for fromRight
+* `xExit = xStart` (slide out to the same edge it came from)
 
 ```text
 x = if(lt(t, startSec), NAN,
      if(lt(t, startSec+slideSec),
         xStart + (xFinal-xStart)*((t-startSec)/slideSec),
-        xFinal))
+        if(lt(t, startSec+slideSec+displaySec),
+           xFinal,
+           xFinal + (xExit-xFinal)*((t-(startSec+slideSec+displaySec))/slideOutSec)
+        )))
 ```
 
-If `slideSec` is 0 or absent, just use `x=xFinal`.
+If `slideSec` is 0 or absent, treat the first segment as `x=xFinal`. If `slideOutSec` is 0, keep `x=xFinal` after the hold.
+
+### Arrow pulse (alpha)
+
+Let:
+
+* `minA = pulseMinAlpha` (default 0.65)
+* `maxA = pulseMaxAlpha` (default 1.0)
+* `periodSec = pulsePeriodFrames/fps`
+* `t0 = visStartSec`
+
+```text
+alpha = alpha(X,Y) * (minA + (maxA-minA)*(0.5+0.5*sin(2*PI*(T-t0)/periodSec)))
+```
 
 ### Arrow bounce (x or y)
 
@@ -810,12 +838,13 @@ ffmpeg -y -i slug/k1s-title-variant3-motion-loop-3s_1080p30.mp4 \
   "motion": {
     "slideInFrames": 15,
     "displayFrames": 285,
+    "slideOutFrames": 15,
     "slideDirection": "fromLeft"
   }
 }
 ```
 
-### Arrow overlay (bounce + shorter visibility)
+### Arrow overlay (pulse + shorter visibility)
 
 ```json
 {
@@ -830,9 +859,9 @@ ffmpeg -y -i slug/k1s-title-variant3-motion-loop-3s_1080p30.mp4 \
   "motion": {
     "visibleStartFrame": 135,
     "visibleEndFrame": 210,
-    "bouncePx": 10,
-    "bouncePeriodFrames": 24,
-    "bounceAxis": "x"
+    "pulsePeriodFrames": 24,
+    "pulseMinAlpha": 0.65,
+    "pulseMaxAlpha": 1.0
   }
 }
 ```
@@ -846,9 +875,9 @@ ffmpeg -y -i slug/k1s-title-variant3-motion-loop-3s_1080p30.mp4 \
 * Create project
 * Import video (upload)
 * Choose preset + speed (1×/2×) + include slug
-* Start export
+* Render final output (server runs ffmpeg)
 * SSE progress + logs
-* Download outputs (main_noslug + final_with_slug if enabled)
+* Download outputs (final.mp4 / final_with_slug if enabled)
 
 ### Editor milestones
 
@@ -870,21 +899,22 @@ ffmpeg -y -i slug/k1s-title-variant3-motion-loop-3s_1080p30.mp4 \
 * Streaming upload
 * ffprobe metadata saved
 
-### M3 — Export Pipeline (CPU)
+### M3 — Export Pipeline + Final Render (CPU)
 
 * Job manager + SSE
 * Export MP4 with static overlays
+* Write final output to workspace exports folder
 
 ### M4 — Template Rendering (Playwright)
 
 * HTML/CSS → PNG
 * Overlay correctness validated
 
-### M5 — Motion (slide + bounce)
+### M5 — Motion (slide-in/out + pulse/bounce)
 
 * Time-based expressions in filter generator
 * Quadrant defaults for slide direction
-* Arrow visibility windows
+* Arrow visibility windows + alpha pulse
 
 ### M6 — Slug concat + 2× speed mode
 
@@ -919,4 +949,3 @@ If you want, next I can also output the **exact TypeScript implementation** for 
 * emits `filter_complex_cards*.txt`,
 * handles escaping automatically,
 * and supports the 2× `setpts` mode in a clean, predictable way.
-

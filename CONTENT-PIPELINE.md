@@ -11,12 +11,15 @@
 - For each annotation:
   - Select overlay card template.
   - Set text fields.
-  - Optional arrow: position, orientation (left/right/45deg), and visibility window.
+  - Optional arrow: position, orientation (arbitrary angle), and visibility window.
+  - Card motion: slide-in + slide-out duration, plus display duration.
+  - Arrow motion: transparency pulse speed + visible duration.
 - Preview overlays on top of the video frame in the browser.
 - Export archive containing:
   - Generated overlay PNGs (card + text baked), arrow PNGs (transformed), and any fonts needed.
   - A filter_complex.txt (or equivalent) for ffmpeg.
   - A README/Markdown with the exact command to run locally.
+  - Final rendered MP4 produced by the system and written into the workspace export folder.
 
 ## Non-goals (MVP)
 - No collaborative editing or cloud storage.
@@ -30,9 +33,10 @@
    - Choose overlay card template.
    - Enter text (supports multi-line).
    - Place card via drag/resize; snap to grid/quadrant.
-   - Optional arrow: select type (left/right/45deg down-left/45deg down-right), drag to position, adjust opacity and blink timing.
+   - Optional arrow: select orientation, drag to position, adjust transparency pulse timing.
 4. Preview: overlay the annotation on the current frame.
 5. Export: generate assets + ffmpeg docs into a downloadable archive.
+6. Render final: run the ffmpeg pipeline server-side and write final output into the workspace export folder.
 
 ## Data Model (Draft)
 - Project
@@ -69,6 +73,7 @@
   - /filters/filter_complex.txt
   - /README.md (ffmpeg command + notes)
   - /project.json (editable spec)
+  - /final.mp4 (system-rendered output)
 - README includes:
   - Input video path
   - Output file name
@@ -85,8 +90,9 @@
 3. **Asset Export**
    - Generate overlay PNGs with text.
    - Generate arrow PNGs with transforms.
-4. **FFmpeg Integration**
+4. **FFmpeg Integration + Final Render**
    - Generate filter_complex and README command.
+   - Run ffmpeg server-side and write final MP4 to workspace exports.
    - Validate output with sample videos.
 5. **Polish**
    - Keyboard shortcuts, grid snapping, template library.
