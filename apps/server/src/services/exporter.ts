@@ -1,9 +1,10 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { spawn } from "node:child_process";
 import type { Overlay, Project } from "@content-tools/shared";
 import { DEFAULT_PRESET_ID, EXPORT_PRESETS } from "@content-tools/shared";
-import { WORKSPACE_ROOT } from "../config.js";
-import { ensureDir } from "../utils/fs.js";
+import { FFMPEG_PATH, WORKSPACE_ROOT } from "../config.js";
+import { ensureDir, fileExists } from "../utils/fs.js";
 
 type ExportRequest = {
   presetId?: string;
@@ -30,6 +31,16 @@ type ExportManifest = {
 type FilterResult = {
   script: string;
   outputLabel: string;
+};
+
+type OverlayTiming = {
+  startSec: number;
+  visStartSec: number;
+  visEndSec: number;
+  slideInSec: number;
+  slideOutSec: number;
+  holdSec: number;
+  secondsPerFrame: number;
 };
 
 type OverlayKind = "card" | "arrow";
@@ -70,6 +81,51 @@ function frameToSeconds(frame: number, fps: number, speed: number): number {
   return (frame / fps) * (1 / speed);
 }
 
+function computeOverlayTiming(
+  overlay: Overlay,
+  fps: number,
+  speed: number
+): OverlayTiming {
+  const motion = overlay.motion ?? {};
+  const startFrame = overlay.startFrame;
+  const slideInFrames = motion.slideInFrames ?? 0;
+  const slideOutFrames = motion.slideOutFrames ?? 0;
+  const displayFrames = motion.displayFrames;
+
+  let derivedEndFrame = overlay.endFrame;
+  if (!isArrowOverlay(overlay) && typeof displayFrames === "number") {
+    derivedEndFrame = startFrame + slideInFrames + displayFrames + slideOutFrames;
+  }
+
+  const visStartFrame = motion.visibleStartFrame ?? startFrame;
+  const visEndFrame = motion.visibleEndFrame ?? derivedEndFrame;
+
+  const totalFrames = Math.max(0, visEndFrame - startFrame);
+  const holdFrames =
+    typeof displayFrames === "number"
+      ? displayFrames
+      : Math.max(0, totalFrames - slideInFrames - slideOutFrames);
+
+  const startSec = frameToSeconds(startFrame, fps, speed);
+  const secondsPerFrame = 1 / fps / speed;
+  const visStartSec = frameToSeconds(visStartFrame, fps, speed);
+  const visEndSec = frameToSeconds(
+    Math.max(visStartFrame, visEndFrame),
+    fps,
+    speed
+  );
+
+  return {
+    startSec,
+    visStartSec,
+    visEndSec,
+    slideInSec: frameToSeconds(slideInFrames, fps, speed),
+    slideOutSec: frameToSeconds(slideOutFrames, fps, speed),
+    holdSec: frameToSeconds(holdFrames, fps, speed),
+    secondsPerFrame,
+  };
+}
+
 function resolveSlideDirection(
   overlay: Overlay,
   videoWidth: number
@@ -91,30 +147,12 @@ function resolveBounceAxis(overlay: Overlay): "x" | "y" {
 
 function buildOverlayExpressions(
   overlay: Overlay,
-  fps: number,
-  speed: number,
+  timing: OverlayTiming,
   videoWidth: number
 ): { xExpr: string; yExpr: string; enableExpr: string } {
   const motion = overlay.motion ?? {};
-  const startFrame = overlay.startFrame;
-  const slideFrames = motion.slideInFrames ?? 0;
-  const displayFrames = motion.displayFrames;
-
-  const slideSec = slideFrames > 0 ? frameToSeconds(slideFrames, fps, speed) : 0;
-  const startSec = frameToSeconds(startFrame, fps, speed);
-
-  let visStartFrame = motion.visibleStartFrame ?? startFrame;
-  let visEndFrame = motion.visibleEndFrame ?? overlay.endFrame;
-
-  if (!isArrowOverlay(overlay) && typeof displayFrames === "number") {
-    visEndFrame = startFrame + slideFrames + displayFrames;
-  }
-
-  const visStartSec = frameToSeconds(visStartFrame, fps, speed);
-  const visEndSec = frameToSeconds(visEndFrame, fps, speed);
-
-  const enableExpr = `between(t,${formatNumber(visStartSec)},${formatNumber(
-    visEndSec
+  const enableExpr = `between(t,${formatNumber(timing.visStartSec)},${formatNumber(
+    timing.visEndSec
   )})`;
 
   const xFinal = overlay.rect.x;
@@ -124,14 +162,14 @@ function buildOverlayExpressions(
     const bouncePx = motion.bouncePx ?? 0;
     const bouncePeriodFrames = motion.bouncePeriodFrames ?? 0;
     const bounceAxis = resolveBounceAxis(overlay);
-    const periodSec =
+    const bouncePeriodSec =
       bouncePx > 0 && bouncePeriodFrames > 0
-        ? frameToSeconds(bouncePeriodFrames, fps, speed)
+        ? bouncePeriodFrames * timing.secondsPerFrame
         : 0;
 
-    if (bouncePx > 0 && periodSec > 0) {
-      const t0 = formatNumber(visStartSec);
-      const period = formatNumber(periodSec);
+    if (bouncePx > 0 && bouncePeriodFrames > 0 && bouncePeriodSec > 0) {
+      const period = formatNumber(bouncePeriodSec);
+      const t0 = formatNumber(timing.visStartSec);
       const bounceExpr = `${formatNumber(bouncePx)}*sin(2*PI*(t-${t0})/${period})`;
       if (bounceAxis === "x") {
         return {
@@ -155,7 +193,11 @@ function buildOverlayExpressions(
   }
 
   const slideDirection = resolveSlideDirection(overlay, videoWidth);
-  if (slideDirection === "none" || slideSec === 0) {
+  const slideInSec = timing.slideInSec;
+  const slideOutSec = timing.slideOutSec;
+  const holdSec = timing.holdSec;
+
+  if (slideDirection === "none" || (slideInSec === 0 && slideOutSec === 0)) {
     return {
       xExpr: formatNumber(xFinal),
       yExpr: formatNumber(yFinal),
@@ -164,18 +206,84 @@ function buildOverlayExpressions(
   }
 
   const xStart = slideDirection === "fromLeft" ? -overlay.rect.w : videoWidth;
-  const slideEndSec = startSec + slideSec;
-  const xExpr = `if(lt(t,${formatNumber(slideEndSec)}),${formatNumber(
-    xStart
-  )}+(${formatNumber(xFinal - xStart)})*((t-${formatNumber(
-    startSec
-  )})/${formatNumber(slideSec)}),${formatNumber(xFinal)})`;
+  const xExit = xStart;
+  const slideInEnd = timing.startSec + slideInSec;
+  const holdEnd = slideInEnd + holdSec;
+
+  const slideInExpr =
+    slideInSec === 0
+      ? formatNumber(xFinal)
+      : `${formatNumber(xStart)}+(${formatNumber(xFinal - xStart)})*((t-${formatNumber(
+          timing.startSec
+        )})/${formatNumber(slideInSec)})`;
+
+  if (slideOutSec === 0) {
+    const xExpr = `if(lt(t,${formatNumber(slideInEnd)}),${slideInExpr},${formatNumber(
+      xFinal
+    )})`;
+    return {
+      xExpr,
+      yExpr: formatNumber(yFinal),
+      enableExpr,
+    };
+  }
+
+  const slideOutExpr = `${formatNumber(xFinal)}+(${formatNumber(
+    xExit - xFinal
+  )})*((t-${formatNumber(holdEnd)})/${formatNumber(slideOutSec)})`;
+
+  const xExpr = `if(lt(t,${formatNumber(slideInEnd)}),${slideInExpr},if(lt(t,${formatNumber(
+    holdEnd
+  )}),${formatNumber(xFinal)},${slideOutExpr}))`;
 
   return {
     xExpr,
     yExpr: formatNumber(yFinal),
     enableExpr,
   };
+}
+
+function buildArrowPulseExpr(
+  timing: OverlayTiming,
+  motion: Overlay["motion"]
+): string | null {
+  if (!motion?.pulsePeriodFrames) return null;
+  const minAlpha = motion.pulseMinAlpha ?? 0.65;
+  const maxAlpha = motion.pulseMaxAlpha ?? 1.0;
+  const periodSec = motion.pulsePeriodFrames * timing.secondsPerFrame;
+  if (periodSec === 0) return null;
+  const t0 = formatNumber(timing.visStartSec);
+  const period = formatNumber(periodSec);
+  const amplitude = formatNumber(maxAlpha - minAlpha);
+  const base = formatNumber(minAlpha);
+  return `alpha(X,Y)*(${base}+(${amplitude})*(0.5+0.5*sin(2*PI*(T-${t0})/${period})))`;
+}
+
+function buildOverlayInputLine(
+  overlay: Overlay,
+  inputIndex: number,
+  timing: OverlayTiming
+): string {
+  const opacity = overlay.opacity;
+  const pulseExpr = isArrowOverlay(overlay)
+    ? buildArrowPulseExpr(timing, overlay.motion)
+    : null;
+
+  const chain: string[] = [`[${inputIndex}:v]format=rgba`];
+
+  if (pulseExpr) {
+    const alphaExpr = escapeFilterExpr(pulseExpr);
+    chain.push(
+      `,geq=r='r(X\\,Y)':g='g(X\\,Y)':b='b(X\\,Y)':a='${alphaExpr}'`
+    );
+  }
+
+  if (typeof opacity === "number") {
+    chain.push(`,colorchannelmixer=aa=${formatNumber(opacity)}`);
+  }
+
+  chain.push(`[ov${inputIndex}]`);
+  return chain.join("");
 }
 
 function buildFilterScript(
@@ -195,19 +303,12 @@ function buildFilterScript(
   overlays.forEach((overlay, index) => {
     const inputIndex = index + 1;
     const ovLabel = `[ov${inputIndex}]`;
-    const opacity = overlay.opacity;
-    const formatParts = [
-      `[${inputIndex}:v]format=rgba`,
-      typeof opacity === "number" ? `,colorchannelmixer=aa=${formatNumber(opacity)}` : "",
-      `${ovLabel}`,
-    ].join("");
-
-    lines.push(formatParts);
+    const timing = computeOverlayTiming(overlay, fps, speed);
+    lines.push(buildOverlayInputLine(overlay, inputIndex, timing));
 
     const { xExpr, yExpr, enableExpr } = buildOverlayExpressions(
       overlay,
-      fps,
-      speed,
+      timing,
       videoWidth
     );
 
@@ -306,6 +407,29 @@ function buildReadme(
   return lines.join("\n");
 }
 
+async function runFfmpeg(args: string[], cwd: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(FFMPEG_PATH, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr || `ffmpeg exited with code ${code}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function resolveProjectPath(projectRoot: string, inputPath?: string): string | null {
+  if (!inputPath) return null;
+  return path.isAbsolute(inputPath) ? inputPath : path.join(projectRoot, inputPath);
+}
+
 export async function writeExportBundle(
   project: Project,
   options: ExportRequest = {}
@@ -371,4 +495,99 @@ export async function writeExportBundle(
   );
 
   return { exportDir, exportId, manifest };
+}
+
+export async function renderFinal(
+  project: Project,
+  options: ExportRequest = {}
+): Promise<{
+  exportDir: string;
+  exportId: string;
+  finalPath: string;
+  manifest: ExportManifest;
+}> {
+  const { exportDir, exportId, manifest } = await writeExportBundle(project, options);
+  const preset = EXPORT_PRESETS[manifest.presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
+
+  const missingInputs = [];
+  for (const input of [...manifest.overlayInputs, ...manifest.arrowInputs]) {
+    if (!(await fileExists(input))) {
+      missingInputs.push(input);
+    }
+  }
+  if (missingInputs.length) {
+    throw new Error(`Missing overlay assets: ${missingInputs.join(", ")}`);
+  }
+
+  const hasArrows = manifest.arrowInputs.length > 0;
+  const filterScript = hasArrows ? manifest.filterCardsArrows : manifest.filterCards;
+  const outputLabel = hasArrows ? manifest.outputLabelCardsArrows : manifest.outputLabelCards;
+  const mainOutputName = hasArrows ? "main_noslug_arrows.mp4" : "main_noslug.mp4";
+  const mainOutputPath = path.join(exportDir, mainOutputName);
+
+  const args = ["-y", "-i", manifest.source];
+  for (const input of manifest.overlayInputs) {
+    args.push("-loop", "1", "-i", input);
+  }
+  for (const input of manifest.arrowInputs) {
+    args.push("-loop", "1", "-i", input);
+  }
+  args.push(
+    "-filter_complex_script",
+    filterScript,
+    "-map",
+    outputLabel,
+    "-c:v",
+    preset.codec,
+    ...preset.args,
+    "-pix_fmt",
+    "yuv420p",
+    mainOutputPath
+  );
+
+  await runFfmpeg(args, exportDir);
+
+  const projectRoot = path.join(WORKSPACE_ROOT, project.id);
+  const finalPath = path.join(exportDir, "final.mp4");
+
+  if (manifest.includeSlug) {
+    const introPath = resolveProjectPath(projectRoot, project.slug?.introPath);
+    const outroPath = resolveProjectPath(projectRoot, project.slug?.outroPath);
+    if (!introPath || !outroPath) {
+      throw new Error("Slug intro/outro paths are required for includeSlug");
+    }
+    const slugFps = project.slug?.fps ?? project.video.fpsNum / project.video.fpsDen;
+    const concatFilter = [
+      `[0:v]fps=${slugFps},setsar=1[v0]`,
+      `[1:v]fps=${slugFps},setsar=1[v1]`,
+      `[2:v]fps=${slugFps},setsar=1[v2]`,
+      "[v0][v1][v2]concat=n=3:v=1:a=0[v]",
+    ].join(";");
+    const finalWithSlug = path.join(exportDir, "final_with_slug.mp4");
+    const concatArgs = [
+      "-y",
+      "-i",
+      introPath,
+      "-i",
+      mainOutputPath,
+      "-i",
+      outroPath,
+      "-filter_complex",
+      concatFilter,
+      "-map",
+      "[v]",
+      "-c:v",
+      preset.codec,
+      ...preset.args,
+      "-pix_fmt",
+      "yuv420p",
+      finalWithSlug,
+    ];
+    await runFfmpeg(concatArgs, exportDir);
+    await fs.copyFile(finalWithSlug, finalPath);
+  } else {
+    await fs.copyFile(mainOutputPath, finalPath);
+  }
+
+  return { exportDir, exportId, finalPath, manifest };
 }
