@@ -121,6 +121,17 @@ export async function renderProject(projectId: string, options: ExportOptions) {
   });
 }
 
+export function renderStreamUrl(projectId: string, options: ExportOptions): string {
+  const params = new URLSearchParams();
+  if (options.presetId) params.set("presetId", options.presetId);
+  if (typeof options.includeSlug === "boolean") {
+    params.set("includeSlug", String(options.includeSlug));
+  }
+  if (options.speed) params.set("speed", String(options.speed));
+  const query = params.toString();
+  return `${API_BASE}/projects/${projectId}/render/stream${query ? `?${query}` : ""}`;
+}
+
 export async function uploadAsset(
   projectId: string,
   kind: "overlays" | "arrows",
@@ -137,4 +148,9 @@ export async function uploadAsset(
 
 export function mediaUrl(projectId: string): string {
   return `${API_BASE}/projects/${projectId}/media`;
+}
+
+export function thumbnailUrl(projectId: string, frame: number, width = 240): string {
+  const params = new URLSearchParams({ frame: String(frame), width: String(width) });
+  return `${API_BASE}/projects/${projectId}/thumbnail?${params.toString()}`;
 }

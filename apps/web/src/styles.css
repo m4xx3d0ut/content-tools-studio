@@ -141,12 +141,12 @@ button.secondary {
   height: auto;
 }
 
-.overlay-canvas {
+.overlay-stage {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 .scrubber {
@@ -179,6 +179,42 @@ button.secondary {
   border-top: 1px solid rgba(255, 255, 255, 0.12);
   display: grid;
   gap: 10px;
+}
+
+.thumbnail-strip {
+  display: grid;
+  grid-auto-flow: column;
+  gap: 8px;
+  margin-top: 12px;
+  overflow-x: auto;
+}
+
+.thumbnail {
+  width: 120px;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  cursor: pointer;
+}
+
+.thumbnail.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(247, 179, 91, 0.3);
+}
+
+.progress {
+  margin-top: 12px;
+  height: 8px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.2s ease;
 }
 
 .project-card {

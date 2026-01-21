@@ -1,13 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import Konva from "konva";
+import type { Group as KonvaGroup } from "konva/lib/Group";
+import type { Transformer as KonvaTransformer } from "konva/lib/shapes/Transformer";
+import { Arrow, Group, Layer, Rect, Stage, Text, Transformer } from "react-konva";
 import {
   createProject,
   getProject,
   importVideo,
   listProjects,
   mediaUrl,
-  renderProject,
+  renderStreamUrl,
+  thumbnailUrl,
   updateProject,
-  uploadAsset,
   type Overlay,
   type Project,
   type ProjectSummary,
@@ -15,6 +19,19 @@ import {
 
 const DEFAULT_CARD_SIZE = { w: 720, h: 160 };
 const DEFAULT_ARROW_SIZE = { w: 128, h: 128 };
+
+const CARD_TEMPLATES = [
+  { id: "card-lower-third-left", label: "Lower Third Left" },
+  { id: "card-lower-third-right", label: "Lower Third Right" },
+  { id: "card-lower-third-center", label: "Lower Third Center" },
+  { id: "card-top-third-left", label: "Top Third Left" },
+  { id: "card-top-third-right", label: "Top Third Right" },
+  { id: "card-title-top", label: "Title Top" },
+  { id: "card-callout-right", label: "Callout Right" },
+  { id: "card-chapter-center", label: "Chapter Center" },
+  { id: "card-corner-tag-top-right", label: "Corner Tag Top Right" },
+  { id: "card-bug-bottom-right", label: "Bug Bottom Right" },
+];
 
 function isArrow(overlay: Overlay) {
   return overlay.templateId.startsWith("arrow");
@@ -29,152 +46,12 @@ function formatFrame(frame: number) {
   return Math.max(0, Math.floor(frame));
 }
 
-function renderCardCanvas(overlay: Overlay): HTMLCanvasElement {
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.floor(overlay.rect.w));
-  canvas.height = Math.max(1, Math.floor(overlay.rect.h));
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return canvas;
-
-  const radius = Math.min(24, canvas.height / 2);
-  ctx.fillStyle = "rgba(15, 19, 24, 0.85)";
-  ctx.strokeStyle = "rgba(247, 179, 91, 0.6)";
-  ctx.lineWidth = 2;
-
-  ctx.beginPath();
-  ctx.moveTo(radius, 0);
-  ctx.lineTo(canvas.width - radius, 0);
-  ctx.quadraticCurveTo(canvas.width, 0, canvas.width, radius);
-  ctx.lineTo(canvas.width, canvas.height - radius);
-  ctx.quadraticCurveTo(canvas.width, canvas.height, canvas.width - radius, canvas.height);
-  ctx.lineTo(radius, canvas.height);
-  ctx.quadraticCurveTo(0, canvas.height, 0, canvas.height - radius);
-  ctx.lineTo(0, radius);
-  ctx.quadraticCurveTo(0, 0, radius, 0);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-
-  const title = String(overlay.fields.title ?? "Title");
-  const subtitle = String(overlay.fields.subtitle ?? "Subtitle");
-
-  ctx.fillStyle = "#f5f2ea";
-  ctx.font = "bold 32px Trebuchet MS";
-  ctx.fillText(title, 24, 48);
-  ctx.fillStyle = "#d1c7b8";
-  ctx.font = "20px Trebuchet MS";
-  ctx.fillText(subtitle, 24, 88);
-
-  return canvas;
-}
-
-function renderArrowCanvas(overlay: Overlay): HTMLCanvasElement {
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.floor(overlay.rect.w));
-  canvas.height = Math.max(1, Math.floor(overlay.rect.h));
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return canvas;
-
-  const w = canvas.width;
-  const h = canvas.height;
-  const angle = ((overlay.rotationDeg ?? 0) * Math.PI) / 180;
-
-  ctx.translate(w / 2, h / 2);
-  ctx.rotate(angle);
-  ctx.translate(-w / 2, -h / 2);
-
-  ctx.fillStyle = "rgba(247, 179, 91, 0.95)";
-  ctx.beginPath();
-  ctx.moveTo(w * 0.1, h * 0.3);
-  ctx.lineTo(w * 0.7, h * 0.3);
-  ctx.lineTo(w * 0.7, h * 0.15);
-  ctx.lineTo(w * 0.95, h * 0.5);
-  ctx.lineTo(w * 0.7, h * 0.85);
-  ctx.lineTo(w * 0.7, h * 0.7);
-  ctx.lineTo(w * 0.1, h * 0.7);
-  ctx.closePath();
-  ctx.fill();
-
-  return canvas;
-}
-
-function drawOverlayPreview(
-  ctx: CanvasRenderingContext2D,
-  overlay: Overlay,
-  currentFrame: number,
-  fps: number,
-  videoWidth: number
-) {
-  const motion = overlay.motion ?? {};
-  const slideInFrames = motion.slideInFrames ?? 0;
-  const slideOutFrames = motion.slideOutFrames ?? 0;
-  const displayFrames = motion.displayFrames;
-  const startFrame = overlay.startFrame;
-  const derivedEnd =
-    typeof displayFrames === "number"
-      ? startFrame + slideInFrames + displayFrames + slideOutFrames
-      : overlay.endFrame;
-  const visStart = motion.visibleStartFrame ?? startFrame;
-  const visEnd = motion.visibleEndFrame ?? derivedEnd;
-
-  if (currentFrame < visStart || currentFrame > visEnd) return;
-
-  let x = overlay.rect.x;
-  let y = overlay.rect.y;
-
-  if (!isArrow(overlay)) {
-    const slideDir =
-      motion.slideDirection ??
-      overlay.rect.x + overlay.rect.w / 2 < videoWidth / 2
-        ? "fromLeft"
-        : "fromRight";
-    const xStart = slideDir === "fromLeft" ? -overlay.rect.w : videoWidth;
-    const xExit = xStart;
-    const holdFrames =
-      typeof displayFrames === "number"
-        ? displayFrames
-        : Math.max(0, visEnd - startFrame - slideInFrames - slideOutFrames);
-    const slideInEnd = startFrame + slideInFrames;
-    const holdEnd = slideInEnd + holdFrames;
-
-    if (slideInFrames > 0 && currentFrame < slideInEnd) {
-      const t = (currentFrame - startFrame) / slideInFrames;
-      x = xStart + (overlay.rect.x - xStart) * Math.min(Math.max(t, 0), 1);
-    } else if (slideOutFrames > 0 && currentFrame > holdEnd) {
-      const t = (currentFrame - holdEnd) / slideOutFrames;
-      x = overlay.rect.x + (xExit - overlay.rect.x) * Math.min(Math.max(t, 0), 1);
-    }
-  }
-
-  const opacity = overlay.opacity ?? 1;
-  let alpha = opacity;
-  if (isArrow(overlay) && motion.pulsePeriodFrames) {
-    const period = motion.pulsePeriodFrames;
-    const minA = motion.pulseMinAlpha ?? 0.65;
-    const maxA = motion.pulseMaxAlpha ?? 1.0;
-    const phase = ((currentFrame - visStart) / period) * Math.PI * 2;
-    alpha = minA + (maxA - minA) * (0.5 + 0.5 * Math.sin(phase));
-  }
-
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.translate(x, y);
-  if (overlay.rotationDeg) {
-    ctx.translate(overlay.rect.w / 2, overlay.rect.h / 2);
-    ctx.rotate((overlay.rotationDeg * Math.PI) / 180);
-    ctx.translate(-overlay.rect.w / 2, -overlay.rect.h / 2);
-  }
-
-  if (isArrow(overlay)) {
-    const arrowCanvas = renderArrowCanvas(overlay);
-    ctx.drawImage(arrowCanvas, 0, 0, overlay.rect.w, overlay.rect.h);
-  } else {
-    const cardCanvas = renderCardCanvas(overlay);
-    ctx.drawImage(cardCanvas, 0, 0, overlay.rect.w, overlay.rect.h);
-  }
-
-  ctx.restore();
-}
+type StageMetrics = {
+  width: number;
+  height: number;
+  scaleX: number;
+  scaleY: number;
+};
 
 export default function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -186,9 +63,17 @@ export default function App() {
   const [videoDurationSec, setVideoDurationSec] = useState(0);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [renderOptions, setRenderOptions] = useState({ speed: 1 as 1 | 2, includeSlug: false });
+  const [renderProgress, setRenderProgress] = useState<number | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayRefs = useRef<Record<string, KonvaGroup>>({});
+  const transformerRef = useRef<KonvaTransformer | null>(null);
+  const [stageMetrics, setStageMetrics] = useState<StageMetrics>({
+    width: 0,
+    height: 0,
+    scaleX: 1,
+    scaleY: 1,
+  });
 
   const fps = useMemo(() => getFps(project), [project]);
   const totalFrames = useMemo(() => {
@@ -200,6 +85,13 @@ export default function App() {
 
   const selectedOverlay =
     project?.overlays.find((overlay) => overlay.id === selectedOverlayId) ?? null;
+
+  const thumbnailFrames = useMemo(() => {
+    const count = 8;
+    return Array.from({ length: count }, (_: unknown, index: number) =>
+      Math.floor((index / Math.max(1, count - 1)) * (totalFrames - 1))
+    );
+  }, [totalFrames]);
 
   async function refreshProjects(nextSelectedId?: string) {
     const list = await listProjects();
@@ -223,28 +115,46 @@ export default function App() {
       return;
     }
     getProject(selectedId)
-      .then((data) => {
+      .then((data: Project) => {
         setProject(data);
         if (!selectedOverlayId && data.overlays.length) {
           setSelectedOverlayId(data.overlays[0].id);
         }
       })
-      .catch((error) => setStatus((error as Error).message));
+      .catch((error: unknown) => setStatus((error as Error).message));
   }, [selectedId]);
 
+  useLayoutEffect(() => {
+    if (!project || !videoRef.current) return;
+    const element = videoRef.current;
+
+    const update = () => {
+      const rect = element.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const scaleX = rect.width / project.video.width;
+      const scaleY = rect.height / project.video.height;
+      setStageMetrics({ width: rect.width, height: rect.height, scaleX, scaleY });
+    };
+
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [project]);
+
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !project) return;
-    canvas.width = project.video.width;
-    canvas.height = project.video.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const overlays = [...project.overlays].sort((a, b) => a.zIndex - b.zIndex);
-    overlays.forEach((overlay) => {
-      drawOverlayPreview(ctx, overlay, currentFrame, fps, project.video.width);
-    });
-  }, [project, currentFrame, fps]);
+    if (!transformerRef.current) return;
+    if (!selectedOverlayId || !selectedOverlay || isArrow(selectedOverlay)) {
+      transformerRef.current.nodes([]);
+      transformerRef.current.getLayer()?.batchDraw();
+      return;
+    }
+    const node = overlayRefs.current[selectedOverlayId];
+    if (node) {
+      transformerRef.current.nodes([node]);
+      transformerRef.current.getLayer()?.batchDraw();
+    }
+  }, [selectedOverlayId, selectedOverlay, stageMetrics]);
 
   useEffect(() => {
     if (!videoRef.current) return;
@@ -290,7 +200,7 @@ export default function App() {
 
   function updateOverlay(id: string, patch: Partial<Overlay>) {
     if (!project) return;
-    const overlays = project.overlays.map((overlay) =>
+    const overlays = project.overlays.map((overlay: Overlay) =>
       overlay.id === id ? { ...overlay, ...patch } : overlay
     );
     updateProjectState({ ...project, overlays });
@@ -298,7 +208,7 @@ export default function App() {
 
   function updateOverlayMotion(id: string, patch: Partial<Overlay["motion"]>) {
     if (!project) return;
-    const overlays = project.overlays.map((overlay) => {
+    const overlays = project.overlays.map((overlay: Overlay) => {
       if (overlay.id !== id) return overlay;
       return { ...overlay, motion: { ...overlay.motion, ...patch } };
     });
@@ -312,7 +222,7 @@ export default function App() {
     const end = start + Math.floor(fps * 5);
     const overlay: Overlay = {
       id,
-      templateId: "card-basic",
+      templateId: "card-lower-third-left",
       templateVersion: "1",
       startFrame: start,
       endFrame: end,
@@ -383,31 +293,150 @@ export default function App() {
     }
   }
 
-  async function renderAssetsForProject(current: Project) {
-    for (const overlay of current.overlays) {
-      const canvas = isArrow(overlay) ? renderArrowCanvas(overlay) : renderCardCanvas(overlay);
-      const blob = await new Promise<Blob | null>((resolve) => {
-        canvas.toBlob((result) => resolve(result), "image/png");
-      });
-      if (!blob) {
-        throw new Error(`Failed to render asset for ${overlay.id}`);
-      }
-      await uploadAsset(current.id, isArrow(overlay) ? "arrows" : "overlays", overlay.id, blob);
-    }
-  }
-
   async function handleRenderFinal() {
     if (!project || !selectedId) return;
-    setStatus("Rendering assets...");
+    setStatus("Starting render...");
+    setRenderProgress(0);
     try {
       await handleSaveProject();
-      await renderAssetsForProject(project);
-      setStatus("Running FFmpeg render...");
-      const result = await renderProject(selectedId, renderOptions);
-      setStatus(`Render complete: ${JSON.stringify(result)}`);
+      const es = new EventSource(renderStreamUrl(selectedId, renderOptions));
+      es.addEventListener("progress", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as {
+          stage: string;
+          message?: string;
+          percent?: number;
+        };
+        if (typeof data.percent === "number") {
+          setRenderProgress(data.percent);
+        }
+        if (data.message) {
+          setStatus(`[${data.stage}] ${data.message}`);
+        }
+      });
+      es.addEventListener("done", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as { message: string };
+        setStatus(`Render complete: ${data.message}`);
+        setRenderProgress(1);
+        es.close();
+      });
+      es.addEventListener("error", (event) => {
+        setStatus(`Render error: ${(event as MessageEvent).data || "unknown"}`);
+        es.close();
+      });
     } catch (error) {
       setStatus((error as Error).message);
     }
+  }
+
+  function renderCardShape(overlay: Overlay) {
+    const scaleX = stageMetrics.scaleX;
+    const scaleY = stageMetrics.scaleY;
+    const width = overlay.rect.w * scaleX;
+    const height = overlay.rect.h * scaleY;
+    const x = overlay.rect.x * scaleX;
+    const y = overlay.rect.y * scaleY;
+
+    return (
+      <Group
+        key={overlay.id}
+        ref={(node) => {
+          if (node) overlayRefs.current[overlay.id] = node;
+        }}
+        x={x}
+        y={y}
+        draggable
+        onClick={() => setSelectedOverlayId(overlay.id)}
+        onTap={() => setSelectedOverlayId(overlay.id)}
+        onDragEnd={(event) => {
+          const node = event.target;
+          updateOverlay(overlay.id, {
+            rect: {
+              ...overlay.rect,
+              x: node.x() / scaleX,
+              y: node.y() / scaleY,
+            },
+          });
+        }}
+        onTransformEnd={(event) => {
+          const node = event.target;
+          const scaleXNode = node.scaleX();
+          const scaleYNode = node.scaleY();
+          const newWidth = Math.max(20, overlay.rect.w * scaleXNode);
+          const newHeight = Math.max(20, overlay.rect.h * scaleYNode);
+          node.scaleX(1);
+          node.scaleY(1);
+          updateOverlay(overlay.id, {
+            rect: {
+              x: node.x() / scaleX,
+              y: node.y() / scaleY,
+              w: newWidth,
+              h: newHeight,
+            },
+          });
+        }}
+      >
+        <Rect
+          width={width}
+          height={height}
+          fill="rgba(15, 19, 24, 0.65)"
+          stroke={overlay.id === selectedOverlayId ? "#f7b35b" : "rgba(255,255,255,0.2)"}
+          cornerRadius={12}
+        />
+        <Text
+          text={String(overlay.fields.title ?? "")}
+          fontSize={Math.max(14, height * 0.3)}
+          fill="#f5f2ea"
+          x={16}
+          y={Math.max(8, height * 0.18)}
+          width={width - 24}
+        />
+        <Text
+          text={String(overlay.fields.subtitle ?? "")}
+          fontSize={Math.max(12, height * 0.18)}
+          fill="#d1c7b8"
+          x={16}
+          y={Math.max(8, height * 0.55)}
+          width={width - 24}
+        />
+      </Group>
+    );
+  }
+
+  function renderArrowShape(overlay: Overlay) {
+    const scaleX = stageMetrics.scaleX;
+    const scaleY = stageMetrics.scaleY;
+    const width = overlay.rect.w * scaleX;
+    const height = overlay.rect.h * scaleY;
+    const centerX = overlay.rect.x * scaleX + width / 2;
+    const centerY = overlay.rect.y * scaleY + height / 2;
+    const pointerLength = Math.min(width * 0.3, 48);
+    const pointerWidth = Math.min(height * 0.6, 48);
+
+    return (
+      <Arrow
+        key={overlay.id}
+        x={centerX}
+        y={centerY}
+        points={[-width / 2, 0, width / 2, 0]}
+        pointerLength={pointerLength}
+        pointerWidth={pointerWidth}
+        fill="rgba(247, 179, 91, 0.8)"
+        stroke="rgba(247, 179, 91, 0.9)"
+        strokeWidth={Math.max(2, height * 0.15)}
+        rotation={overlay.rotationDeg ?? 0}
+        draggable
+        onClick={() => setSelectedOverlayId(overlay.id)}
+        onTap={() => setSelectedOverlayId(overlay.id)}
+        onDragEnd={(event) => {
+          const node = event.target;
+          const newX = (node.x() - width / 2) / scaleX;
+          const newY = (node.y() - height / 2) / scaleY;
+          updateOverlay(overlay.id, {
+            rect: { ...overlay.rect, x: newX, y: newY },
+          });
+        }}
+      />
+    );
   }
 
   return (
@@ -486,7 +515,24 @@ export default function App() {
                   setCurrentFrame(formatFrame(time * fps));
                 }}
               />
-              <canvas ref={canvasRef} className="overlay-canvas" />
+              {stageMetrics.width > 0 && (
+                <Stage width={stageMetrics.width} height={stageMetrics.height} className="overlay-stage">
+                  <Layer>
+                    {project.overlays.map((overlay: Overlay) =>
+                      isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
+                    )}
+                    <Transformer
+                      ref={transformerRef}
+                      rotateEnabled={false}
+                      keepRatio={false}
+                      boundBoxFunc={(oldBox, newBox) => {
+                        if (newBox.width < 40 || newBox.height < 20) return oldBox;
+                        return newBox;
+                      }}
+                    />
+                  </Layer>
+                </Stage>
+              )}
             </div>
           )}
           {project && (
@@ -502,6 +548,18 @@ export default function App() {
               />
               <div className="details">
                 Frame {currentFrame} / {totalFrames}
+              </div>
+              <div className="thumbnail-strip">
+                {project &&
+                  thumbnailFrames.map((frame: number) => (
+                    <img
+                      key={frame}
+                      src={thumbnailUrl(project.id, frame, 180)}
+                      alt={`Frame ${frame}`}
+                      className={frame === currentFrame ? "thumbnail active" : "thumbnail"}
+                      onClick={() => setCurrentFrame(frame)}
+                    />
+                  ))}
               </div>
             </div>
           )}
@@ -523,7 +581,7 @@ export default function App() {
 
           {project && (
             <ul className="overlay-list">
-              {project.overlays.map((overlay) => (
+              {project.overlays.map((overlay: Overlay) => (
                 <li
                   key={overlay.id}
                   className={overlay.id === selectedOverlayId ? "overlay-item active" : "overlay-item"}
@@ -582,52 +640,21 @@ export default function App() {
                 </button>
               </div>
 
-              <label>Position (x, y)</label>
-              <div className="actions">
-                <input
-                  type="number"
-                  value={selectedOverlay.rect.x}
-                  onChange={(event) =>
-                    updateOverlay(selectedOverlay.id, {
-                      rect: { ...selectedOverlay.rect, x: Number(event.target.value) },
-                    })
-                  }
-                />
-                <input
-                  type="number"
-                  value={selectedOverlay.rect.y}
-                  onChange={(event) =>
-                    updateOverlay(selectedOverlay.id, {
-                      rect: { ...selectedOverlay.rect, y: Number(event.target.value) },
-                    })
-                  }
-                />
-              </div>
-
-              <label>Size (w, h)</label>
-              <div className="actions">
-                <input
-                  type="number"
-                  value={selectedOverlay.rect.w}
-                  onChange={(event) =>
-                    updateOverlay(selectedOverlay.id, {
-                      rect: { ...selectedOverlay.rect, w: Number(event.target.value) },
-                    })
-                  }
-                />
-                <input
-                  type="number"
-                  value={selectedOverlay.rect.h}
-                  onChange={(event) =>
-                    updateOverlay(selectedOverlay.id, {
-                      rect: { ...selectedOverlay.rect, h: Number(event.target.value) },
-                    })
-                  }
-                />
-              </div>
-
               {!isArrow(selectedOverlay) && (
                 <>
+                  <label>Template</label>
+                  <select
+                    value={selectedOverlay.templateId}
+                    onChange={(event) =>
+                      updateOverlay(selectedOverlay.id, { templateId: event.target.value })
+                    }
+                  >
+                    {CARD_TEMPLATES.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.label}
+                      </option>
+                    ))}
+                  </select>
                   <label>Title</label>
                   <input
                     type="text"
@@ -768,6 +795,12 @@ export default function App() {
               Render final output
             </button>
           </div>
+
+          {renderProgress !== null && (
+            <div className="progress">
+              <div className="progress-bar" style={{ width: `${renderProgress * 100}%` }} />
+            </div>
+          )}
         </section>
       </div>
 
