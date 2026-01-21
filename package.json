@@ -1,0 +1,14 @@
+{
+  "name": "content-tools-app",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev -w @content-tools/server",
+    "dev:web": "npm run dev -w @content-tools/web",
+    "build": "npm run build -w @content-tools/shared && npm run build -w @content-tools/server && npm run build -w @content-tools/web",
+    "lint": "echo \"no lint configured\""
+  }
+}

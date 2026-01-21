@@ -1,0 +1,2 @@
+View the events and logs from the deployed
+example manifest

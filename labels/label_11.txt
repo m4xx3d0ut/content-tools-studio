@@ -1,0 +1,3 @@
+Control replica scaling and canary rollout
+policy of the example deployment, scale to
+2

@@ -1,0 +1,38 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Build output
+/dist/
+/build/
+/coverage/
+/.vite/
+
+# Local workspace/output
+/workspace/
+/exports/
+/render/
+/tmp/
+
+# Media assets
+*.mp4
+*.mov
+*.mkv
+*.webm
+/frames/
+/frames-*/
+/frames*/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

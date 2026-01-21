@@ -1,0 +1,3 @@
+Click on the deployement app cards in the
+Dashboard's left fly-out or System Graph
+to focus

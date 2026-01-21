@@ -1,0 +1,1 @@
+Scale the deployment to 3 replicas
