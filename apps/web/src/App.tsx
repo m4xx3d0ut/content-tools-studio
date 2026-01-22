@@ -1249,7 +1249,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <h1>Content Tools Studio</h1>
+          <h1>C&amp;M Content Tools</h1>
           <div className="subtitle">
             Editing workspace · {project ? project.name : "Select a project"} · Frame {currentFrame}
           </div>

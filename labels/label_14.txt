@@ -1,2 +1,0 @@
-Adjust the rollout and increase the canary
-weights

@@ -1,2 +1,0 @@
-Watch the Helm app deployment come up in
-the Dashboard

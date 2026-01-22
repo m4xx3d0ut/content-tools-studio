@@ -1,3 +1,0 @@
-From the Playground page, enable
-controlled actions, select use token, then
-start session

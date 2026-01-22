@@ -30,6 +30,9 @@ coverage/
 /frames/
 /frames-*/
 /frames*/
+/overlays/
+/labels/
+/labels_5s/
 
 # Logs
 *.log

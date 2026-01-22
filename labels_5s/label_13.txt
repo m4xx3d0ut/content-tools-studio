@@ -1,1 +1,0 @@
-Set rollout policy to "canary" at 10%
