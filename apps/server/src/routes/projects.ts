@@ -200,6 +200,93 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return reply.send(createReadStream(videoPath));
   });
 
+  app.get("/:id/exports/latest", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const project = await readProject(id);
+    if (!project) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+
+    const exportsRoot = path.join(WORKSPACE_ROOT, id, "exports");
+    if (!(await fileExists(exportsRoot))) {
+      return reply.code(404).send({ error: "no exports found" });
+    }
+
+    const entries = await fs.readdir(exportsRoot, { withFileTypes: true });
+    const dirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    if (!dirs.length) {
+      return reply.code(404).send({ error: "no exports found" });
+    }
+
+    const latestExportId = dirs.sort().at(-1);
+    if (!latestExportId) {
+      return reply.code(404).send({ error: "no exports found" });
+    }
+
+    const finalPath = path.join(exportsRoot, latestExportId, "final.mp4");
+    if (!(await fileExists(finalPath))) {
+      return reply.code(404).send({ error: "final output not found" });
+    }
+
+    const stat = await fs.stat(finalPath);
+    const range = request.headers.range;
+    const safeName = project.name.replace(/[^a-z0-9-_]+/gi, "_");
+    const filename = `${safeName || "export"}-${latestExportId}.mp4`;
+
+    const origin = request.headers.origin ?? "*";
+    reply.raw.setHeader("Access-Control-Allow-Origin", origin);
+    reply.header("Accept-Ranges", "bytes");
+    reply.header("Content-Disposition", `attachment; filename="${filename}"`);
+
+    if (range) {
+      const rangeValue = range.replace("bytes=", "");
+      const firstRange = rangeValue.split(",")[0]?.trim() ?? "";
+      const [startRaw, endRaw] = firstRange.split("-");
+
+      let start: number | null = null;
+      let end: number | null = null;
+
+      if (!startRaw && endRaw) {
+        const suffix = Number(endRaw);
+        if (Number.isFinite(suffix) && suffix > 0) {
+          start = Math.max(0, stat.size - suffix);
+          end = stat.size - 1;
+        }
+      } else if (startRaw) {
+        const parsedStart = Number(startRaw);
+        if (Number.isFinite(parsedStart) && parsedStart >= 0) {
+          start = parsedStart;
+          if (endRaw) {
+            const parsedEnd = Number(endRaw);
+            if (Number.isFinite(parsedEnd) && parsedEnd >= parsedStart) {
+              end = Math.min(parsedEnd, stat.size - 1);
+            }
+          } else {
+            end = stat.size - 1;
+          }
+        }
+      }
+
+      if (start === null || end === null || start >= stat.size) {
+        return reply
+          .code(416)
+          .header("Content-Range", `bytes */${stat.size}`)
+          .send();
+      }
+
+      const chunkSize = end - start + 1;
+      reply
+        .code(206)
+        .header("Content-Range", `bytes ${start}-${end}/${stat.size}`)
+        .header("Content-Length", chunkSize)
+        .type("video/mp4");
+      return reply.send(createReadStream(finalPath, { start, end }));
+    }
+
+    reply.header("Content-Length", stat.size).type("video/mp4");
+    return reply.send(createReadStream(finalPath));
+  });
+
   app.get("/:id/thumbnail", async (request, reply) => {
     const { id } = request.params as { id: string };
     const { frame, width } = request.query as { frame?: string; width?: string };

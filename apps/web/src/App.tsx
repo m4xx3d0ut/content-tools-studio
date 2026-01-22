@@ -7,6 +7,7 @@ import {
   assetUrl,
   createProject,
   deleteProject,
+  exportLatestUrl,
   getProject,
   importVideo,
   listProjects,
@@ -89,11 +90,115 @@ function parseTimecode(value: string): number | null {
 }
 
 const TIMECODE_COMPLETE_REGEX = /^\d{2,}:\d{2}:\d{2}(?:\.\d{1,3})?$/;
+const TEXT_ALIGNMENTS = ["left", "center", "right"] as const;
+type TextAlignment = (typeof TEXT_ALIGNMENTS)[number];
+
+const DEFAULT_TITLE_SCALE = 0.95;
+const DEFAULT_TEXT_SCALE = 1;
+const BASE_TITLE_OFFSET = -13;
+const BASE_TEXT_OFFSET = -27;
+const OFFSET_MODE_KEY = "offsetMode";
+const OFFSET_MODE_DELTA = "delta-v1";
+
+const TEMPLATE_ALIGNMENTS: Record<string, TextAlignment> = {
+  "card-lower-third-left": "left",
+  "card-top-third-left": "left",
+  "card-lower-third-right": "right",
+  "card-top-third-right": "right",
+  "card-callout-right": "right",
+  "card-corner-tag-top-right": "right",
+  "card-bug-bottom-right": "right",
+  "card-lower-third-center": "center",
+  "card-title-top": "center",
+  "card-chapter-center": "center",
+};
 
 function parseCompleteTimecode(value: string): number | null {
   const trimmed = value.trim();
   if (!TIMECODE_COMPLETE_REGEX.test(trimmed)) return null;
   return parseTimecode(trimmed);
+}
+
+function resolveTextAlign(value: unknown, fallback: TextAlignment): TextAlignment {
+  if (typeof value === "string" && (TEXT_ALIGNMENTS as readonly string[]).includes(value)) {
+    return value as TextAlignment;
+  }
+  return fallback;
+}
+
+function resolveTemplateAlign(templateId: string, template?: TemplateInfo | null): TextAlignment {
+  if (template?.align) return template.align;
+  const fallback = TEMPLATE_ALIGNMENTS[templateId];
+  if (fallback) return fallback;
+  if (templateId.includes("center")) return "center";
+  if (templateId.includes("right")) return "right";
+  return "left";
+}
+
+function getDefaultTextMargins(align: TextAlignment) {
+  if (align === "left") {
+    return { left: 34, right: 150 };
+  }
+  if (align === "right") {
+    return { left: 150, right: 34 };
+  }
+  return { left: 34, right: 34 };
+}
+
+function resolveTextScale(value: unknown, fallback = 1) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.min(2, Math.max(0.5, numeric));
+}
+
+function resolveTextMargin(value: unknown, fallback = 0) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(400, numeric));
+}
+
+function resolveTextOffset(value: unknown, fallback = 0) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(-400, Math.min(400, numeric));
+}
+
+function coerceOffsetDelta(value: unknown, base: number) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+  return resolveTextOffset(numeric - base, 0);
+}
+
+function normalizeOverlayOffsets(overlays: Overlay[]): Overlay[] {
+  let updated = false;
+  const next = overlays.map((overlay) => {
+    if (isArrow(overlay)) return overlay;
+    const fields = overlay.fields ?? {};
+    if (fields[OFFSET_MODE_KEY] === OFFSET_MODE_DELTA) {
+      return overlay;
+    }
+    const titleDelta = coerceOffsetDelta(fields.titleOffsetY, BASE_TITLE_OFFSET);
+    const textDelta = coerceOffsetDelta(fields.textOffsetY, BASE_TEXT_OFFSET);
+    updated = true;
+    return {
+      ...overlay,
+      fields: {
+        ...fields,
+        titleOffsetY: titleDelta,
+        textOffsetY: textDelta,
+        [OFFSET_MODE_KEY]: OFFSET_MODE_DELTA,
+      },
+    };
+  });
+  return updated ? next : overlays;
 }
 
 function cloneProjectState(value: Project): Project {
@@ -133,6 +238,7 @@ export default function App() {
   const [renderProgress, setRenderProgress] = useState<number | null>(null);
   const [renderLogs, setRenderLogs] = useState<string[]>([]);
   const [renderActive, setRenderActive] = useState(false);
+  const [renderReady, setRenderReady] = useState(false);
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
   const [thumbnailError, setThumbnailError] = useState<string | null>(null);
   const [templateLibrary, setTemplateLibrary] = useState<TemplateInfo[]>([]);
@@ -202,6 +308,35 @@ export default function App() {
   }, [templateLibrary]);
   const templateOptions = templateLibrary.length ? templateLibrary : FALLBACK_TEMPLATES;
   const arrowTemplate = arrowLibrary[0] ?? null;
+  const isArrowSelected = selectedOverlay ? isArrow(selectedOverlay) : false;
+  const selectedTemplate = selectedOverlay ? templateMap[selectedOverlay.templateId] : null;
+  const selectedTemplateAlign = selectedOverlay
+    ? resolveTemplateAlign(selectedOverlay.templateId, selectedTemplate)
+    : "left";
+  const selectedTextAlign = selectedOverlay
+    ? resolveTextAlign(selectedOverlay.fields.textAlign, selectedTemplateAlign)
+    : "left";
+  const selectedTextScale = selectedOverlay
+    ? resolveTextScale(selectedOverlay.fields.textScale, DEFAULT_TEXT_SCALE)
+    : DEFAULT_TEXT_SCALE;
+  const selectedTextScalePercent = Math.round(selectedTextScale * 100);
+  const selectedTitleScale = selectedOverlay
+    ? resolveTextScale(selectedOverlay.fields.titleScale, DEFAULT_TITLE_SCALE)
+    : DEFAULT_TITLE_SCALE;
+  const selectedTitleScalePercent = Math.round(selectedTitleScale * 100);
+  const selectedTitleOffset = selectedOverlay
+    ? resolveTextOffset(selectedOverlay.fields.titleOffsetY, 0)
+    : 0;
+  const selectedTextMargins = getDefaultTextMargins(selectedTemplateAlign);
+  const selectedTextMarginLeft = selectedOverlay
+    ? resolveTextMargin(selectedOverlay.fields.textMarginLeft, selectedTextMargins.left)
+    : selectedTextMargins.left;
+  const selectedTextMarginRight = selectedOverlay
+    ? resolveTextMargin(selectedOverlay.fields.textMarginRight, selectedTextMargins.right)
+    : selectedTextMargins.right;
+  const selectedTextOffset = selectedOverlay
+    ? resolveTextOffset(selectedOverlay.fields.textOffsetY, 0)
+    : 0;
 
   const thumbnailFrames = useMemo(() => {
     const count = 8;
@@ -209,6 +344,8 @@ export default function App() {
       Math.floor((index / Math.max(1, count - 1)) * (totalFrames - 1))
     );
   }, [totalFrames]);
+
+  const downloadUrl = selectedId ? exportLatestUrl(selectedId) : "";
 
   async function refreshProjects(nextSelectedId?: string) {
     const list = await listProjects();
@@ -245,11 +382,18 @@ export default function App() {
     setThumbnailError(null);
     getProject(selectedId)
       .then((data: Project) => {
-        setProject(data);
-        setSelectedOverlayId(data.overlays[0]?.id ?? null);
+        const normalizedOverlays = normalizeOverlayOffsets(data.overlays);
+        const normalizedProject =
+          normalizedOverlays === data.overlays ? data : { ...data, overlays: normalizedOverlays };
+        setProject(normalizedProject);
+        setSelectedOverlayId(normalizedProject.overlays[0]?.id ?? null);
         historyRef.current = { past: [], future: [] };
       })
       .catch((error: unknown) => setStatus((error as Error).message));
+  }, [selectedId]);
+
+  useEffect(() => {
+    setRenderReady(false);
   }, [selectedId]);
 
   useEffect(() => {
@@ -318,16 +462,14 @@ export default function App() {
 
   useEffect(() => {
     if (!transformerRef.current) return;
-    if (!selectedOverlayId || !selectedOverlay || isArrow(selectedOverlay)) {
+    if (!selectedOverlayId || !selectedOverlay) {
       transformerRef.current.nodes([]);
       transformerRef.current.getLayer()?.batchDraw();
       return;
     }
     const node = overlayRefs.current[selectedOverlayId];
-    if (node) {
-      transformerRef.current.nodes([node]);
-      transformerRef.current.getLayer()?.batchDraw();
-    }
+    transformerRef.current.nodes(node ? [node] : []);
+    transformerRef.current.getLayer()?.batchDraw();
   }, [selectedOverlayId, selectedOverlay, stageMetrics]);
 
   useEffect(() => {
@@ -585,6 +727,19 @@ export default function App() {
     updateProjectState({ ...project, overlays });
   }
 
+  function normalizeRotation(value: number) {
+    const next = value % 360;
+    return next < 0 ? next + 360 : next;
+  }
+
+  function rotateOverlay(id: string, delta: number) {
+    if (!project) return;
+    const overlay = project.overlays.find((item) => item.id === id);
+    if (!overlay) return;
+    const nextRotation = normalizeRotation((overlay.rotationDeg ?? 0) + delta);
+    updateOverlay(id, { rotationDeg: nextRotation });
+  }
+
   function isOverlayAnchoredAtFrame(overlay: Overlay, frame: number) {
     return formatFrame(overlay.startFrame) === frame;
   }
@@ -695,6 +850,9 @@ export default function App() {
     const id = crypto.randomUUID();
     const start = currentFrame;
     const end = start + Math.floor(fps * 5);
+    const template = templateMap[templateId];
+    const templateAlign = resolveTemplateAlign(templateId, template);
+    const defaultMargins = getDefaultTextMargins(templateAlign);
     const baseRect = getTemplateRect(templateId);
     const rectX = typeof x === "number" ? Math.max(0, x) : baseRect.x;
     const rectY = typeof y === "number" ? Math.max(0, y) : baseRect.y;
@@ -713,7 +871,17 @@ export default function App() {
       rotationDeg: 0,
       opacity: 1,
       zIndex: project.overlays.length,
-      fields: { title: "Title", text: "Text" },
+      fields: {
+        title: "",
+        text: "",
+        titleScale: DEFAULT_TITLE_SCALE,
+        textScale: DEFAULT_TEXT_SCALE,
+        titleOffsetY: 0,
+        textOffsetY: 0,
+        [OFFSET_MODE_KEY]: OFFSET_MODE_DELTA,
+        textMarginLeft: defaultMargins.left,
+        textMarginRight: defaultMargins.right,
+      },
       motion: {
         slideInFrames: 12,
         displayFrames: Math.floor(fps * 3),
@@ -788,6 +956,7 @@ export default function App() {
     setRenderProgress(0);
     setRenderLogs([]);
     setRenderActive(true);
+    setRenderReady(false);
     try {
       await handleSaveProject();
       const es = new EventSource(renderStreamUrl(selectedId, renderOptions));
@@ -837,6 +1006,7 @@ export default function App() {
         setRenderProgress(1);
         pushRenderLog(`Render complete: ${data.message ?? "Done"}`);
         setRenderActive(false);
+        setRenderReady(true);
         es.close();
       });
       es.addEventListener("error", (event) => {
@@ -900,7 +1070,17 @@ export default function App() {
     const y = overlay.rect.y * scaleY;
     const template = templateMap[overlay.templateId];
     const templateImage = template ? templateImages[template.id] : undefined;
-    const textAlign = template?.align ?? "left";
+    const templateAlign = resolveTemplateAlign(overlay.templateId, template);
+    const textAlign = resolveTextAlign(overlay.fields.textAlign, templateAlign);
+    const textScale = resolveTextScale(overlay.fields.textScale, DEFAULT_TEXT_SCALE);
+    const titleScale = resolveTextScale(overlay.fields.titleScale, DEFAULT_TITLE_SCALE);
+    const titleOffset = BASE_TITLE_OFFSET + resolveTextOffset(overlay.fields.titleOffsetY, 0);
+    const textOffset = BASE_TEXT_OFFSET + resolveTextOffset(overlay.fields.textOffsetY, 0);
+    const baseMargins = getDefaultTextMargins(templateAlign);
+    const marginLeft = resolveTextMargin(overlay.fields.textMarginLeft, baseMargins.left) * scaleX;
+    const marginRight = resolveTextMargin(overlay.fields.textMarginRight, baseMargins.right) * scaleX;
+    const textWidth = Math.max(40, width - marginLeft - marginRight);
+    const textX = marginLeft;
     const textValue = String(overlay.fields.text ?? overlay.fields.subtitle ?? "");
     const crop = template
       ? {
@@ -965,20 +1145,20 @@ export default function App() {
         />
         <Text
           text={String(overlay.fields.title ?? "")}
-          fontSize={Math.max(14, height * 0.3)}
+          fontSize={Math.max(14, height * 0.3 * titleScale)}
           fill="#f5f2ea"
-          x={16}
-          y={Math.max(8, height * 0.18)}
-          width={width - 24}
-          align={textAlign}
+          x={textX}
+          y={Math.max(8, height * 0.18) + titleOffset * scaleY}
+          width={textWidth}
+          align="center"
         />
         <Text
           text={textValue}
-          fontSize={Math.max(12, height * 0.18)}
+          fontSize={Math.max(12, height * 0.18 * textScale)}
           fill="#d1c7b8"
-          x={16}
-          y={Math.max(8, height * 0.55)}
-          width={width - 24}
+          x={textX}
+          y={Math.max(8, height * 0.55) + textOffset * scaleY}
+          width={textWidth}
           align={textAlign}
         />
       </Group>
@@ -998,6 +1178,9 @@ export default function App() {
     return (
       <Group
         key={overlay.id}
+        ref={(node) => {
+          if (node) overlayRefs.current[overlay.id] = node;
+        }}
         x={centerX}
         y={centerY}
         offsetX={width / 2}
@@ -1012,6 +1195,26 @@ export default function App() {
           const newY = (node.y() - height / 2) / scaleY;
           updateOverlay(overlay.id, {
             rect: { ...overlay.rect, x: newX, y: newY },
+          });
+        }}
+        onTransformEnd={(event) => {
+          const node = event.target;
+          const nextScaleX = node.scaleX();
+          const nextScaleY = node.scaleY();
+          const nextWidth = Math.max(16, overlay.rect.w * nextScaleX);
+          const nextHeight = Math.max(16, overlay.rect.h * nextScaleY);
+          node.scaleX(1);
+          node.scaleY(1);
+          const centerX = node.x() / scaleX;
+          const centerY = node.y() / scaleY;
+          updateOverlay(overlay.id, {
+            rotationDeg: normalizeRotation(node.rotation()),
+            rect: {
+              x: centerX - nextWidth / 2,
+              y: centerY - nextHeight / 2,
+              w: nextWidth,
+              h: nextHeight,
+            },
           });
         }}
       >
@@ -1244,8 +1447,9 @@ export default function App() {
                         )}
                       <Transformer
                         ref={transformerRef}
-                        rotateEnabled={false}
-                        keepRatio={false}
+                        rotateEnabled={isArrowSelected}
+                        keepRatio={isArrowSelected}
+                        enabledAnchors={isArrowSelected ? [] : undefined}
                         boundBoxFunc={(oldBox, newBox) => {
                           if (newBox.width < 40 || newBox.height < 20) return oldBox;
                           return newBox;
@@ -1356,22 +1560,228 @@ export default function App() {
                     <input
                       type="text"
                       value={String(selectedOverlay.fields.title ?? "")}
+                      placeholder="Title"
                       onChange={(event) =>
                         updateOverlay(selectedOverlay.id, {
                           fields: { ...selectedOverlay.fields, title: event.target.value },
                         })
                       }
                     />
+                    <label>Title size (%)</label>
+                    <input
+                      type="number"
+                      min={50}
+                      max={200}
+                      step={5}
+                      value={selectedTitleScalePercent}
+                      onChange={(event) => {
+                        const nextValue = Number(event.target.value);
+                        if (!Number.isFinite(nextValue)) return;
+                        const clamped = Math.min(200, Math.max(50, nextValue));
+                        updateOverlay(selectedOverlay.id, {
+                          fields: { ...selectedOverlay.fields, titleScale: clamped / 100 },
+                        });
+                      }}
+                    />
+                    <div className="text-offset-row">
+                      <label>Title vertical offset (px)</label>
+                      <div className="text-offset-controls">
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() =>
+                            updateOverlay(selectedOverlay.id, {
+                              fields: {
+                                ...selectedOverlay.fields,
+                                titleOffsetY: selectedTitleOffset + 1,
+                              },
+                            })
+                          }
+                        >
+                          -1
+                        </button>
+                        <input
+                          type="number"
+                          min={-400}
+                          max={400}
+                          step={1}
+                          value={selectedTitleOffset}
+                          onChange={(event) => {
+                            const nextValue = Number(event.target.value);
+                            if (!Number.isFinite(nextValue)) return;
+                            const clamped = Math.min(400, Math.max(-400, nextValue));
+                            updateOverlay(selectedOverlay.id, {
+                              fields: {
+                                ...selectedOverlay.fields,
+                                titleOffsetY: clamped,
+                              },
+                            });
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() =>
+                            updateOverlay(selectedOverlay.id, {
+                              fields: {
+                                ...selectedOverlay.fields,
+                                titleOffsetY: selectedTitleOffset - 1,
+                              },
+                            })
+                          }
+                        >
+                          +1
+                        </button>
+                      </div>
+                    </div>
                     <label>Text</label>
                     <textarea
                       rows={4}
                       value={String(selectedOverlay.fields.text ?? selectedOverlay.fields.subtitle ?? "")}
+                      placeholder="Text"
                       onChange={(event) =>
                         updateOverlay(selectedOverlay.id, {
                           fields: { ...selectedOverlay.fields, text: event.target.value },
                         })
                       }
                     />
+                    <div className="text-controls">
+                      <div>
+                        <label>Text alignment</label>
+                        <div className="segmented">
+                          {TEXT_ALIGNMENTS.map((align) => (
+                            <button
+                              key={align}
+                              type="button"
+                              className={selectedTextAlign === align ? "secondary active" : "secondary"}
+                              onClick={() =>
+                                updateOverlay(selectedOverlay.id, {
+                                  fields: { ...selectedOverlay.fields, textAlign: align },
+                                })
+                              }
+                            >
+                              {align}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <div>
+                        <label>Text size (%)</label>
+                        <input
+                          type="number"
+                          min={50}
+                          max={200}
+                          step={5}
+                          value={selectedTextScalePercent}
+                          onChange={(event) => {
+                            const nextValue = Number(event.target.value);
+                            if (!Number.isFinite(nextValue)) return;
+                            const clamped = Math.min(200, Math.max(50, nextValue));
+                            updateOverlay(selectedOverlay.id, {
+                              fields: {
+                                ...selectedOverlay.fields,
+                                textScale: clamped / 100,
+                              },
+                            });
+                          }}
+                        />
+                      </div>
+                      <div className="text-margin-grid">
+                        <div>
+                          <label>Text margin left (px)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            max={400}
+                            step={2}
+                            value={selectedTextMarginLeft}
+                            onChange={(event) => {
+                              const nextValue = Number(event.target.value);
+                              if (!Number.isFinite(nextValue)) return;
+                              const clamped = Math.min(400, Math.max(0, nextValue));
+                              updateOverlay(selectedOverlay.id, {
+                                fields: {
+                                  ...selectedOverlay.fields,
+                                  textMarginLeft: clamped,
+                                },
+                              });
+                            }}
+                          />
+                        </div>
+                        <div>
+                          <label>Text margin right (px)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            max={400}
+                            step={2}
+                            value={selectedTextMarginRight}
+                            onChange={(event) => {
+                              const nextValue = Number(event.target.value);
+                              if (!Number.isFinite(nextValue)) return;
+                              const clamped = Math.min(400, Math.max(0, nextValue));
+                              updateOverlay(selectedOverlay.id, {
+                                fields: {
+                                  ...selectedOverlay.fields,
+                                  textMarginRight: clamped,
+                                },
+                              });
+                            }}
+                          />
+                        </div>
+                      </div>
+                      <div className="text-offset-row">
+                        <label>Text vertical offset (px)</label>
+                        <div className="text-offset-controls">
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() =>
+                              updateOverlay(selectedOverlay.id, {
+                                fields: {
+                                  ...selectedOverlay.fields,
+                                  textOffsetY: selectedTextOffset + 1,
+                                },
+                              })
+                            }
+                          >
+                            -1
+                          </button>
+                          <input
+                            type="number"
+                            min={-400}
+                            max={400}
+                            step={1}
+                            value={selectedTextOffset}
+                            onChange={(event) => {
+                              const nextValue = Number(event.target.value);
+                              if (!Number.isFinite(nextValue)) return;
+                              const clamped = Math.min(400, Math.max(-400, nextValue));
+                              updateOverlay(selectedOverlay.id, {
+                                fields: {
+                                  ...selectedOverlay.fields,
+                                  textOffsetY: clamped,
+                                },
+                              });
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() =>
+                              updateOverlay(selectedOverlay.id, {
+                                fields: {
+                                  ...selectedOverlay.fields,
+                                  textOffsetY: selectedTextOffset - 1,
+                                },
+                              })
+                            }
+                          >
+                            +1
+                          </button>
+                        </div>
+                      </div>
+                    </div>
                     <label>Slide-in frames</label>
                     <input
                       type="number"
@@ -1417,6 +1827,22 @@ export default function App() {
                         })
                       }
                     />
+                    <div className="rotation-controls">
+                      <button
+                        className="secondary"
+                        type="button"
+                        onClick={() => rotateOverlay(selectedOverlay.id, -45)}
+                      >
+                        -45°
+                      </button>
+                      <button
+                        className="secondary"
+                        type="button"
+                        onClick={() => rotateOverlay(selectedOverlay.id, 45)}
+                      >
+                        +45°
+                      </button>
+                    </div>
                     <label>Pulse period (frames)</label>
                     <input
                       type="number"
@@ -1603,6 +2029,16 @@ export default function App() {
             <button onClick={handleRenderFinal} disabled={!project}>
               Render final
             </button>
+            {renderReady && downloadUrl && (
+              <a
+                className="button-link"
+                href={downloadUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Download final
+              </a>
+            )}
           </div>
           {renderProgress !== null && (
             <div className="progress slim">

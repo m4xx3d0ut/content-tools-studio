@@ -225,3 +225,7 @@ export function thumbnailUrl(projectId: string, frame: number, width = 240): str
   const params = new URLSearchParams({ frame: String(frame), width: String(width) });
   return `${API_BASE}/projects/${projectId}/thumbnail?${params.toString()}`;
 }
+
+export function exportLatestUrl(projectId: string): string {
+  return `${API_BASE}/projects/${projectId}/exports/latest`;
+}

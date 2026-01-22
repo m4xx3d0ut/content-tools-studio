@@ -12,6 +12,57 @@ const ARROW_BASE_PATH = path.join(
   "arrow-right-128x128.png"
 );
 
+const TEXT_ALIGNMENTS = new Set(["left", "center", "right"]);
+const DEFAULT_TITLE_SCALE = 0.95;
+const DEFAULT_TEXT_SCALE = 1;
+const BASE_TITLE_OFFSET = -13;
+const BASE_TEXT_OFFSET = -27;
+const OFFSET_MODE_KEY = "offsetMode";
+const OFFSET_MODE_DELTA = "delta-v1";
+
+function resolveTextAlign(value: unknown, fallback: "left" | "center" | "right") {
+  if (typeof value === "string" && TEXT_ALIGNMENTS.has(value)) {
+    return value as "left" | "center" | "right";
+  }
+  return fallback;
+}
+
+function getDefaultTextMargins(align: "left" | "center" | "right") {
+  if (align === "left") {
+    return { left: 34, right: 150 };
+  }
+  if (align === "right") {
+    return { left: 150, right: 34 };
+  }
+  return { left: 34, right: 34 };
+}
+
+function resolveTextScale(value: unknown, fallback = 1) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.min(2, Math.max(0.5, numeric));
+}
+
+function resolveTextMargin(value: unknown, fallback: number, width: number) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  const clamped = Math.max(0, Math.min(width * 0.5, numeric));
+  return clamped;
+}
+
+function resolveTextOffset(value: unknown, fallback: number, height: number) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  const limit = height * 0.5;
+  return Math.max(-limit, Math.min(limit, numeric));
+}
+
 function escapeXml(text: string): string {
   return text
     .replace(/&/g, "&amp;")
@@ -26,21 +77,37 @@ function buildTextSvg(
   height: number,
   title: string,
   subtitle: string | null,
-  align: "left" | "center" | "right",
+  subtitleAlign: "left" | "center" | "right",
   layout: {
     title: { xPct: number; yPct: number; sizePct: number; color: string };
     subtitle?: { xPct: number; yPct: number; sizePct: number; color: string };
-  }
+  },
+  margins?: { left: number; right: number },
+  offsets?: { titleY?: number; subtitleY?: number }
 ): string {
-  const anchor = align === "center" ? "middle" : align === "right" ? "end" : "start";
+  const subtitleAnchor =
+    subtitleAlign === "center" ? "middle" : subtitleAlign === "right" ? "end" : "start";
+  const titleAnchor = "middle";
   const fontFamily = "Trebuchet MS, Segoe UI, Arial, sans-serif";
 
-  const titleX = layout.title.xPct * width;
-  const titleY = layout.title.yPct * height;
+  const marginLeft = margins?.left ?? 0;
+  const marginRight = margins?.right ?? 0;
+  const textAreaWidth = Math.max(1, width - marginLeft - marginRight);
+
+  const titleX = marginLeft + textAreaWidth / 2;
+  const titleY = layout.title.yPct * height + (offsets?.titleY ?? 0);
   const titleSize = Math.max(14, layout.title.sizePct * height);
 
-  const subtitleX = layout.subtitle ? layout.subtitle.xPct * width : 0;
-  const subtitleY = layout.subtitle ? layout.subtitle.yPct * height : 0;
+  const subtitleX = layout.subtitle
+    ? subtitleAlign === "left"
+      ? marginLeft
+      : subtitleAlign === "right"
+        ? width - marginRight
+        : marginLeft + textAreaWidth / 2
+    : 0;
+  const subtitleY = layout.subtitle
+    ? layout.subtitle.yPct * height + (offsets?.subtitleY ?? 0)
+    : 0;
   const subtitleSize = layout.subtitle ? Math.max(12, layout.subtitle.sizePct * height) : 0;
 
   const titleLines = escapeXml(title).split("\n");
@@ -66,11 +133,11 @@ function buildTextSvg(
       .title { font-family: ${fontFamily}; font-weight: 700; }
       .subtitle { font-family: ${fontFamily}; font-weight: 500; }
     </style>
-    <text x="${titleX}" y="${titleY}" text-anchor="${anchor}" fill="${layout.title.color}" font-size="${titleSize}" dominant-baseline="hanging" class="title">
+    <text x="${titleX}" y="${titleY}" text-anchor="${titleAnchor}" fill="${layout.title.color}" font-size="${titleSize}" dominant-baseline="hanging" class="title">
       ${titleTspans}
     </text>
     ${layout.subtitle && subtitle ? `
-    <text x="${subtitleX}" y="${subtitleY}" text-anchor="${anchor}" fill="${layout.subtitle.color}" font-size="${subtitleSize}" dominant-baseline="hanging" class="subtitle">
+    <text x="${subtitleX}" y="${subtitleY}" text-anchor="${subtitleAnchor}" fill="${layout.subtitle.color}" font-size="${subtitleSize}" dominant-baseline="hanging" class="subtitle">
       ${subtitleTspans}
     </text>` : ""}
   </svg>`;
@@ -114,11 +181,43 @@ export async function renderOverlayAsset(
   const title = String(overlay.fields.title ?? "");
   const rawText = overlay.fields.text ?? overlay.fields.subtitle ?? "";
   const subtitle = rawText ? String(rawText) : "";
+  const textAlign = resolveTextAlign(overlay.fields.textAlign, template.align);
+  const textScale = resolveTextScale(overlay.fields.textScale, DEFAULT_TEXT_SCALE);
+  const titleScale = resolveTextScale(overlay.fields.titleScale, DEFAULT_TITLE_SCALE);
+  const defaultMargins = getDefaultTextMargins(template.align);
+  const marginLeft = resolveTextMargin(overlay.fields.textMarginLeft, defaultMargins.left, width);
+  const marginRight = resolveTextMargin(overlay.fields.textMarginRight, defaultMargins.right, width);
+  const usesDelta = overlay.fields[OFFSET_MODE_KEY] === OFFSET_MODE_DELTA;
+  const rawTextOffset = resolveTextOffset(
+    overlay.fields.textOffsetY,
+    usesDelta ? 0 : BASE_TEXT_OFFSET,
+    height
+  );
+  const rawTitleOffset = resolveTextOffset(
+    overlay.fields.titleOffsetY,
+    usesDelta ? 0 : BASE_TITLE_OFFSET,
+    height
+  );
+  const textOffsetY = usesDelta ? BASE_TEXT_OFFSET + rawTextOffset : rawTextOffset;
+  const titleOffsetY = usesDelta ? BASE_TITLE_OFFSET + rawTitleOffset : rawTitleOffset;
+  const titleLayout = { ...template.title, sizePct: template.title.sizePct * titleScale };
+  const subtitleLayout = template.subtitle
+    ? { ...template.subtitle, sizePct: template.subtitle.sizePct * textScale }
+    : undefined;
 
-  const svg = buildTextSvg(width, height, title, subtitle, template.align, {
-    title: template.title,
-    subtitle: template.subtitle,
-  });
+  const svg = buildTextSvg(
+    width,
+    height,
+    title,
+    subtitle,
+    textAlign,
+    {
+      title: titleLayout,
+      subtitle: subtitleLayout,
+    },
+    { left: marginLeft, right: marginRight },
+    { titleY: titleOffsetY, subtitleY: textOffsetY }
+  );
 
   await sharp(buffer)
     .resize(width, height)
