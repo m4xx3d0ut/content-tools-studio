@@ -239,6 +239,7 @@ export default function App() {
   const [renderLogs, setRenderLogs] = useState<string[]>([]);
   const [renderActive, setRenderActive] = useState(false);
   const [renderReady, setRenderReady] = useState(false);
+  const [renderFinalPath, setRenderFinalPath] = useState("");
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
   const [thumbnailError, setThumbnailError] = useState<string | null>(null);
   const [templateLibrary, setTemplateLibrary] = useState<TemplateInfo[]>([]);
@@ -394,6 +395,7 @@ export default function App() {
 
   useEffect(() => {
     setRenderReady(false);
+    setRenderFinalPath("");
   }, [selectedId]);
 
   useEffect(() => {
@@ -957,6 +959,7 @@ export default function App() {
     setRenderLogs([]);
     setRenderActive(true);
     setRenderReady(false);
+    setRenderFinalPath("");
     try {
       await handleSaveProject();
       const es = new EventSource(renderStreamUrl(selectedId, renderOptions));
@@ -1007,6 +1010,9 @@ export default function App() {
         pushRenderLog(`Render complete: ${data.message ?? "Done"}`);
         setRenderActive(false);
         setRenderReady(true);
+        if (data.message) {
+          setRenderFinalPath(data.message);
+        }
         es.close();
       });
       es.addEventListener("error", (event) => {
@@ -1020,6 +1026,16 @@ export default function App() {
     } catch (error) {
       setStatus((error as Error).message);
       setRenderActive(false);
+    }
+  }
+
+  async function handleCopyFinalPath() {
+    if (!renderFinalPath) return;
+    try {
+      await navigator.clipboard.writeText(renderFinalPath);
+      setStatus("Copied final path to clipboard.");
+    } catch (error) {
+      setStatus((error as Error).message);
     }
   }
 
@@ -2038,6 +2054,11 @@ export default function App() {
               >
                 Download final
               </a>
+            )}
+            {renderReady && renderFinalPath && (
+              <button className="secondary" onClick={handleCopyFinalPath}>
+                Copy final path
+              </button>
             )}
           </div>
           {renderProgress !== null && (
