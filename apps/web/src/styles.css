@@ -609,6 +609,29 @@ button.danger:hover {
   pointer-events: none;
 }
 
+.track-trim {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  border-radius: 8px;
+  background: rgba(225, 85, 85, 0.35);
+  border: 1px solid rgba(225, 85, 85, 0.55);
+  z-index: 1;
+  pointer-events: none;
+}
+
+.track-playhead {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.45);
+  transform: translateX(-1px);
+  z-index: 3;
+  pointer-events: none;
+}
+
 .progress {
   margin-top: 12px;
   height: 8px;

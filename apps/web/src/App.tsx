@@ -61,13 +61,14 @@ function formatFrame(frame: number) {
 }
 
 function formatTimecode(frames: number, fps: number) {
-  if (!Number.isFinite(fps) || fps <= 0) return "00:00:00";
-  const totalSeconds = Math.max(0, Math.floor(frames / fps));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+  if (!Number.isFinite(fps) || fps <= 0) return "00:00:00.000";
+  const totalMillis = Math.max(0, Math.round((frames / fps) * 1000));
+  const hours = Math.floor(totalMillis / 3600000);
+  const minutes = Math.floor((totalMillis % 3600000) / 60000);
+  const seconds = Math.floor((totalMillis % 60000) / 1000);
+  const millis = totalMillis % 1000;
+  const pad = (value: number, size = 2) => String(value).padStart(size, "0");
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}.${pad(millis, 3)}`;
 }
 
 function parseTimecode(value: string): number | null {
@@ -85,6 +86,14 @@ function parseTimecode(value: string): number | null {
     return parts[0] * 3600 + parts[1] * 60 + parts[2];
   }
   return null;
+}
+
+const TIMECODE_COMPLETE_REGEX = /^\d{2,}:\d{2}:\d{2}(?:\.\d{1,3})?$/;
+
+function parseCompleteTimecode(value: string): number | null {
+  const trimmed = value.trim();
+  if (!TIMECODE_COMPLETE_REGEX.test(trimmed)) return null;
+  return parseTimecode(trimmed);
 }
 
 function cloneProjectState(value: Project): Project {
@@ -131,8 +140,8 @@ export default function App() {
   const [templateImages, setTemplateImages] = useState<Record<string, HTMLImageElement>>({});
   const [arrowImage, setArrowImage] = useState<HTMLImageElement | null>(null);
   const [showHotkeys, setShowHotkeys] = useState(false);
-  const [trimStartTime, setTrimStartTime] = useState("00:00:00");
-  const [trimEndTime, setTrimEndTime] = useState("00:00:00");
+  const [trimStartTime, setTrimStartTime] = useState("00:00:00.000");
+  const [trimEndTime, setTrimEndTime] = useState("00:00:00.000");
   const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
   const historyRef = useRef<{ past: HistoryEntry[]; future: HistoryEntry[] }>({
@@ -169,6 +178,24 @@ export default function App() {
   const selectedSlugOption =
     SLUG_OPTIONS.find((option) => option.path === selectedSlugPath) ?? null;
   const edits = project?.edits ?? { trimStartFrames: 0, trimEndFrames: 0, cuts: [] };
+  const trimRange = useMemo(() => {
+    const start = edits.trimStartFrames ?? 0;
+    const end = totalFrames - (edits.trimEndFrames ?? 0);
+    return clampTrimRange(start, end);
+  }, [edits.trimStartFrames, edits.trimEndFrames, totalFrames]);
+  const fullDurationTime = useMemo(
+    () => formatTimecode(totalFrames, fps),
+    [totalFrames, fps]
+  );
+  const parsedTrimStart = useMemo(
+    () => parseCompleteTimecode(trimStartTime),
+    [trimStartTime]
+  );
+  const parsedTrimEnd = useMemo(() => parseCompleteTimecode(trimEndTime), [trimEndTime]);
+  const trimInvalid =
+    parsedTrimStart !== null &&
+    parsedTrimEnd !== null &&
+    parsedTrimEnd <= parsedTrimStart;
   const templateMap = useMemo(() => {
     const entries = templateLibrary.map((template) => [template.id, template] as const);
     return Object.fromEntries(entries);
@@ -241,9 +268,9 @@ export default function App() {
 
   useEffect(() => {
     if (!project) return;
-    setTrimStartTime(formatTimecode(edits.trimStartFrames ?? 0, fps));
-    setTrimEndTime(formatTimecode(edits.trimEndFrames ?? 0, fps));
-  }, [project?.id, edits.trimStartFrames, edits.trimEndFrames, fps]);
+    setTrimStartTime(formatTimecode(trimRange.start, fps));
+    setTrimEndTime(formatTimecode(trimRange.end, fps));
+  }, [project?.id, trimRange.start, trimRange.end, fps]);
 
   useEffect(() => {
     if (!templateLibrary.length) return;
@@ -412,26 +439,29 @@ export default function App() {
     updateProjectState({ ...project, edits: nextEdits }, undefined, { pushHistory: false });
   }
 
-  function clampTrimValues(nextStart: number, nextEnd: number) {
+  function clampTrimRange(nextStart: number, nextEnd: number) {
     const total = Math.max(1, totalFrames);
     const start = Math.max(0, Math.min(Math.floor(nextStart), total - 1));
-    const maxEnd = Math.max(0, total - 1 - start);
-    const end = Math.max(0, Math.min(Math.floor(nextEnd), maxEnd));
+    const end = Math.max(start + 1, Math.min(Math.floor(nextEnd), total));
     return { start, end };
   }
 
   function setTrimStartFrames(nextStart: number) {
-    const currentEnd = edits.trimEndFrames ?? 0;
-    const clamped = clampTrimValues(nextStart, currentEnd);
-    updateEdits({ trimStartFrames: clamped.start, trimEndFrames: clamped.end });
+    const clamped = clampTrimRange(nextStart, trimRange.end);
+    updateEdits({
+      trimStartFrames: clamped.start,
+      trimEndFrames: Math.max(0, totalFrames - clamped.end),
+    });
     setTrimStartTime(formatTimecode(clamped.start, fps));
     setTrimEndTime(formatTimecode(clamped.end, fps));
   }
 
   function setTrimEndFrames(nextEnd: number) {
-    const currentStart = edits.trimStartFrames ?? 0;
-    const clamped = clampTrimValues(currentStart, nextEnd);
-    updateEdits({ trimStartFrames: clamped.start, trimEndFrames: clamped.end });
+    const clamped = clampTrimRange(trimRange.start, nextEnd);
+    updateEdits({
+      trimStartFrames: clamped.start,
+      trimEndFrames: Math.max(0, totalFrames - clamped.end),
+    });
     setTrimStartTime(formatTimecode(clamped.start, fps));
     setTrimEndTime(formatTimecode(clamped.end, fps));
   }
@@ -1463,6 +1493,33 @@ export default function App() {
               <div className="track-label">Video</div>
               <div className="track-lane">
                 <div className="track-clip full">Source</div>
+                <div
+                  className="track-playhead"
+                  style={{ left: `${(currentFrame / totalFrames) * 100}%` }}
+                />
+                {trimRange.start > 0 && (
+                  <div
+                    className="track-trim"
+                    style={{
+                      left: "0%",
+                      width: `${Math.max(0.5, (trimRange.start / totalFrames) * 100)}%`,
+                    }}
+                    title={`Trimmed start 0 → ${trimRange.start}`}
+                  />
+                )}
+                {trimRange.end < totalFrames && (
+                  <div
+                    className="track-trim"
+                    style={{
+                      left: `${(trimRange.end / totalFrames) * 100}%`,
+                      width: `${Math.max(
+                        0.5,
+                        ((totalFrames - trimRange.end) / totalFrames) * 100
+                      )}%`,
+                    }}
+                    title={`Trimmed end ${trimRange.end} → ${totalFrames}`}
+                  />
+                )}
                 {(edits.cuts ?? []).map((cut) => {
                   const length = Math.max(1, cut.endFrame - cut.startFrame + 1);
                   const left = (cut.startFrame / totalFrames) * 100;
@@ -1479,11 +1536,15 @@ export default function App() {
               </div>
             </div>
               <div className="track-row">
-                <div className="track-label">Cards</div>
-                <div className="track-lane">
-                  {project.overlays
-                    .filter((overlay) => !isArrow(overlay))
-                    .map((overlay) => {
+              <div className="track-label">Cards</div>
+              <div className="track-lane">
+                <div
+                  className="track-playhead"
+                  style={{ left: `${(currentFrame / totalFrames) * 100}%` }}
+                />
+                {project.overlays
+                  .filter((overlay) => !isArrow(overlay))
+                  .map((overlay) => {
                       const left = (overlay.startFrame / totalFrames) * 100;
                       const width =
                         ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
@@ -1501,11 +1562,15 @@ export default function App() {
                 </div>
               </div>
               <div className="track-row">
-                <div className="track-label">Arrows</div>
-                <div className="track-lane">
-                  {project.overlays
-                    .filter((overlay) => isArrow(overlay))
-                    .map((overlay) => {
+              <div className="track-label">Arrows</div>
+              <div className="track-lane">
+                <div
+                  className="track-playhead"
+                  style={{ left: `${(currentFrame / totalFrames) * 100}%` }}
+                />
+                {project.overlays
+                  .filter((overlay) => isArrow(overlay))
+                  .map((overlay) => {
                       const left = (overlay.startFrame / totalFrames) * 100;
                       const width =
                         ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
@@ -1608,61 +1673,67 @@ export default function App() {
         </div>
         <div className="render-divider" />
         <div className="trim-section">
-          <h3>Trim & cuts</h3>
+          <h3>Trim a clip</h3>
           <div className="trim-grid">
             <div className="trim-block">
-              <label>Trim start</label>
+              <label>Trim start time</label>
               <div className="trim-row">
-                <input
-                  type="number"
-                  min={0}
-                  disabled={!hasMedia}
-                  value={edits.trimStartFrames ?? 0}
-                  onChange={(event) => setTrimStartFrames(Number(event.target.value))}
-                />
                 <input
                   type="text"
                   disabled={!hasMedia}
                   value={trimStartTime}
                   onChange={(event) => {
-                    setTrimStartTime(event.target.value);
-                    const seconds = parseTimecode(event.target.value);
+                    const nextValue = event.target.value;
+                    setTrimStartTime(nextValue);
+                    const seconds = parseCompleteTimecode(nextValue);
                     if (seconds !== null) {
                       setTrimStartFrames(Math.round(seconds * fps));
                     }
                   }}
-                  onBlur={() => setTrimStartTime(formatTimecode(edits.trimStartFrames ?? 0, fps))}
+                  onBlur={() => {
+                    const seconds = parseCompleteTimecode(trimStartTime);
+                    if (seconds !== null) {
+                      setTrimStartFrames(Math.round(seconds * fps));
+                      return;
+                    }
+                    setTrimStartTime(formatTimecode(trimRange.start, fps));
+                  }}
                 />
               </div>
-              <div className="details">Frames / HH:MM:SS</div>
+              <div className="details">HH:MM:SS.SSS</div>
             </div>
             <div className="trim-block">
-              <label>Trim end</label>
+              <label>Trim end time</label>
               <div className="trim-row">
-                <input
-                  type="number"
-                  min={0}
-                  disabled={!hasMedia}
-                  value={edits.trimEndFrames ?? 0}
-                  onChange={(event) => setTrimEndFrames(Number(event.target.value))}
-                />
                 <input
                   type="text"
                   disabled={!hasMedia}
                   value={trimEndTime}
+                  placeholder={fullDurationTime}
                   onChange={(event) => {
-                    setTrimEndTime(event.target.value);
-                    const seconds = parseTimecode(event.target.value);
+                    const nextValue = event.target.value;
+                    setTrimEndTime(nextValue);
+                    const seconds = parseCompleteTimecode(nextValue);
                     if (seconds !== null) {
                       setTrimEndFrames(Math.round(seconds * fps));
                     }
                   }}
-                  onBlur={() => setTrimEndTime(formatTimecode(edits.trimEndFrames ?? 0, fps))}
+                  onBlur={() => {
+                    const seconds = parseCompleteTimecode(trimEndTime);
+                    if (seconds !== null) {
+                      setTrimEndFrames(Math.round(seconds * fps));
+                      return;
+                    }
+                    setTrimEndTime(formatTimecode(trimRange.end, fps));
+                  }}
                 />
               </div>
-              <div className="details">Frames / HH:MM:SS</div>
+              <div className="details">HH:MM:SS.SSS</div>
             </div>
           </div>
+          {trimInvalid && (
+            <div className="details warning">Trim end must be after trim start.</div>
+          )}
           <div className="cut-header">
             <h4>Cut sections</h4>
             <button className="secondary" onClick={addCut} disabled={!hasMedia}>
