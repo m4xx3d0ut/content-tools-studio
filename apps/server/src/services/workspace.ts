@@ -53,6 +53,14 @@ export async function writeProject(project: Project): Promise<void> {
   await fs.writeFile(projectFilePath(project.id), payload, "utf-8");
 }
 
+export async function deleteProject(id: string): Promise<boolean> {
+  const dir = projectDir(id);
+  const filePath = projectFilePath(id);
+  if (!(await fileExists(filePath))) return false;
+  await fs.rm(dir, { recursive: true, force: true });
+  return true;
+}
+
 function defaultVideoInfo(): VideoInfo {
   return {
     width: 1920,

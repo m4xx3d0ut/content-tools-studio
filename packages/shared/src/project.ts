@@ -95,6 +95,30 @@ export const ExportOptionsSchema = z
   .object({
     speed: z.union([z.literal(1), z.literal(2)]).default(1),
     includeSlug: z.boolean().default(false),
+    includeSlugStart: z.boolean().default(false),
+    includeSlugEnd: z.boolean().default(false),
+  })
+  .optional();
+
+const TransitionSchema = z
+  .object({
+    type: z.enum(["cut", "crossfade"]).default("cut"),
+    durationFrames: z.number().int().nonnegative().default(0),
+  })
+  .optional();
+
+const CutSchema = z.object({
+  id: z.string().min(1),
+  startFrame: z.number().int().nonnegative(),
+  endFrame: z.number().int().nonnegative(),
+  transition: TransitionSchema,
+});
+
+const TimelineEditsSchema = z
+  .object({
+    trimStartFrames: z.number().int().nonnegative().default(0),
+    trimEndFrames: z.number().int().nonnegative().default(0),
+    cuts: z.array(CutSchema).default([]),
   })
   .optional();
 
@@ -113,6 +137,7 @@ export const ProjectSchema = z.object({
 
   slug: SlugSchema,
   exportOptions: ExportOptionsSchema,
+  edits: TimelineEditsSchema,
 
   lastExportPresetId: z.string().optional(),
   renderCache: RenderCacheSchema.default({ overlayAssetHash: {} }),

@@ -13,6 +13,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export function assetUrl(path: string): string {
+  if (path.startsWith("http://") || path.startsWith("https://")) {
+    return path;
+  }
+  return `${API_BASE}${path}`;
+}
+
 export type ProjectSummary = {
   id: string;
   name: string;
@@ -53,6 +60,33 @@ export type Overlay = {
   motion?: Motion;
 };
 
+export type TemplateTextLayout = {
+  xPct: number;
+  yPct: number;
+  sizePct: number;
+  color: string;
+};
+
+export type TemplateInfo = {
+  id: string;
+  label: string;
+  imagePath: string;
+  bounds: { left: number; top: number; width: number; height: number };
+  sourceWidth: number;
+  sourceHeight: number;
+  align: "left" | "center" | "right";
+  title: TemplateTextLayout;
+  subtitle: TemplateTextLayout | null;
+};
+
+export type ArrowInfo = {
+  id: string;
+  label: string;
+  imagePath: string;
+  sourceWidth: number;
+  sourceHeight: number;
+};
+
 export type Project = ProjectSummary & {
   schemaVersion?: number;
   source: { filename: string; sizeBytes?: number; sha256?: string };
@@ -64,7 +98,22 @@ export type Project = ProjectSummary & {
     durationMs: number;
   };
   overlays: Overlay[];
-  exportOptions?: { speed?: 1 | 2; includeSlug?: boolean };
+  exportOptions?: {
+    speed?: 1 | 2;
+    includeSlug?: boolean;
+    includeSlugStart?: boolean;
+    includeSlugEnd?: boolean;
+  };
+  edits?: {
+    trimStartFrames?: number;
+    trimEndFrames?: number;
+    cuts?: Array<{
+      id: string;
+      startFrame: number;
+      endFrame: number;
+      transition?: { type?: "cut" | "crossfade"; durationFrames?: number };
+    }>;
+  };
   slug?: { introPath?: string; outroPath?: string; fps?: number };
 };
 
@@ -73,12 +122,23 @@ export async function listProjects(): Promise<ProjectSummary[]> {
   return data.projects;
 }
 
+export async function listTemplates(): Promise<{
+  templates: TemplateInfo[];
+  arrows: ArrowInfo[];
+}> {
+  return request("/templates");
+}
+
 export async function createProject(name: string): Promise<ProjectSummary> {
   return request<ProjectSummary>("/projects", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
+}
+
+export async function deleteProject(projectId: string): Promise<{ ok: boolean }> {
+  return request(`/projects/${projectId}`, { method: "DELETE" });
 }
 
 export async function importVideo(projectId: string, file: File): Promise<ProjectSummary> {
@@ -105,6 +165,8 @@ export async function updateProject(projectId: string, project: Project): Promis
 export type ExportOptions = {
   presetId?: string;
   includeSlug?: boolean;
+  includeSlugStart?: boolean;
+  includeSlugEnd?: boolean;
   speed?: 1 | 2;
 };
 
@@ -129,6 +191,12 @@ export function renderStreamUrl(projectId: string, options: ExportOptions): stri
   if (options.presetId) params.set("presetId", options.presetId);
   if (typeof options.includeSlug === "boolean") {
     params.set("includeSlug", String(options.includeSlug));
+  }
+  if (typeof options.includeSlugStart === "boolean") {
+    params.set("includeSlugStart", String(options.includeSlugStart));
+  }
+  if (typeof options.includeSlugEnd === "boolean") {
+    params.set("includeSlugEnd", String(options.includeSlugEnd));
   }
   if (options.speed) params.set("speed", String(options.speed));
   const query = params.toString();

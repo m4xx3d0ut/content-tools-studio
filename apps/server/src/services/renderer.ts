@@ -1,32 +1,16 @@
 import path from "node:path";
-import { promises as fs } from "node:fs";
 import sharp from "sharp";
 import type { Overlay, Project } from "@content-tools/shared";
 import { REPO_ROOT, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir } from "../utils/fs.js";
 import { DEFAULT_TEMPLATE_ID, getTemplateById } from "./templates.js";
+import { getTemplateCrop } from "./template-assets.js";
 
 const ARROW_BASE_PATH = path.join(
   REPO_ROOT,
   "k1s-directional-arrows",
   "arrow-right-128x128.png"
 );
-
-type CropBounds = {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-};
-
-type CropCache = {
-  bounds: CropBounds;
-  buffer: Buffer;
-  width: number;
-  height: number;
-};
-
-const cropCache = new Map<string, CropCache>();
 
 function escapeXml(text: string): string {
   return text
@@ -35,65 +19,6 @@ function escapeXml(text: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
-}
-
-async function loadTemplateCrop(templatePath: string): Promise<CropCache> {
-  const cached = cropCache.get(templatePath);
-  if (cached) return cached;
-
-  const image = sharp(templatePath).ensureAlpha();
-  const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
-  if (!info.width || !info.height) {
-    throw new Error(`Unable to read template dimensions for ${templatePath}`);
-  }
-
-  let minX = info.width;
-  let minY = info.height;
-  let maxX = 0;
-  let maxY = 0;
-  let found = false;
-
-  for (let y = 0; y < info.height; y += 1) {
-    for (let x = 0; x < info.width; x += 1) {
-      const idx = (y * info.width + x) * 4 + 3;
-      if (data[idx] > 0) {
-        found = true;
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-      }
-    }
-  }
-
-  if (!found) {
-    minX = 0;
-    minY = 0;
-    maxX = info.width - 1;
-    maxY = info.height - 1;
-  }
-
-  const bounds = {
-    left: minX,
-    top: minY,
-    width: maxX - minX + 1,
-    height: maxY - minY + 1,
-  };
-
-  const cropped = await sharp(templatePath)
-    .extract(bounds)
-    .png()
-    .toBuffer({ resolveWithObject: true });
-
-  const cacheValue: CropCache = {
-    bounds,
-    buffer: cropped.data,
-    width: cropped.info.width ?? bounds.width,
-    height: cropped.info.height ?? bounds.height,
-  };
-
-  cropCache.set(templatePath, cacheValue);
-  return cacheValue;
 }
 
 function buildTextSvg(
@@ -185,9 +110,10 @@ export async function renderOverlayAsset(
     throw new Error("No card template available");
   }
 
-  const { buffer } = await loadTemplateCrop(template.filePath);
+  const { buffer } = await getTemplateCrop(template.filePath);
   const title = String(overlay.fields.title ?? "");
-  const subtitle = overlay.fields.subtitle ? String(overlay.fields.subtitle) : "";
+  const rawText = overlay.fields.text ?? overlay.fields.subtitle ?? "";
+  const subtitle = rawText ? String(rawText) : "";
 
   const svg = buildTextSvg(width, height, title, subtitle, template.align, {
     title: template.title,

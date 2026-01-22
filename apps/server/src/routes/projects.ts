@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import {
   createProject,
+  deleteProject,
   listProjects,
   readProject,
   writeProject,
@@ -50,6 +51,15 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(404).send({ error: "project not found" });
     }
     return project;
+  });
+
+  app.delete("/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const deleted = await deleteProject(id);
+    if (!deleted) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+    return { ok: true };
   });
 
   app.put("/:id", async (request, reply) => {
@@ -246,10 +256,26 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(404).send({ error: "project not found" });
     }
 
-    const body = request.body as { presetId?: string; includeSlug?: boolean; speed?: 1 | 2 };
+    const body = request.body as {
+      presetId?: string;
+      includeSlug?: boolean;
+      includeSlugStart?: boolean;
+      includeSlugEnd?: boolean;
+      speed?: 1 | 2;
+    };
     const result = await writeExportBundle(project, body ?? {});
 
     const now = new Date().toISOString();
+    const includeSlug =
+      typeof body?.includeSlug === "boolean" ? body.includeSlug : project.exportOptions?.includeSlug;
+    const includeSlugStart =
+      typeof body?.includeSlugStart === "boolean"
+        ? body.includeSlugStart
+        : includeSlug ?? project.exportOptions?.includeSlugStart ?? false;
+    const includeSlugEnd =
+      typeof body?.includeSlugEnd === "boolean"
+        ? body.includeSlugEnd
+        : includeSlug ?? project.exportOptions?.includeSlugEnd ?? false;
     const updatedProject = ProjectSchema.parse({
       ...project,
       updatedAt: now,
@@ -257,7 +283,9 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       exportOptions: body
         ? {
             speed: body.speed ?? project.exportOptions?.speed ?? 1,
-            includeSlug: body.includeSlug ?? project.exportOptions?.includeSlug ?? false,
+            includeSlug: includeSlugStart && includeSlugEnd,
+            includeSlugStart,
+            includeSlugEnd,
           }
         : project.exportOptions,
     });
@@ -278,10 +306,26 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(404).send({ error: "project not found" });
     }
 
-    const body = request.body as { presetId?: string; includeSlug?: boolean; speed?: 1 | 2 };
+    const body = request.body as {
+      presetId?: string;
+      includeSlug?: boolean;
+      includeSlugStart?: boolean;
+      includeSlugEnd?: boolean;
+      speed?: 1 | 2;
+    };
     try {
       const result = await renderFinal(project, body ?? {});
       const now = new Date().toISOString();
+      const includeSlug =
+        typeof body?.includeSlug === "boolean" ? body.includeSlug : project.exportOptions?.includeSlug;
+      const includeSlugStart =
+        typeof body?.includeSlugStart === "boolean"
+          ? body.includeSlugStart
+          : includeSlug ?? project.exportOptions?.includeSlugStart ?? false;
+      const includeSlugEnd =
+        typeof body?.includeSlugEnd === "boolean"
+          ? body.includeSlugEnd
+          : includeSlug ?? project.exportOptions?.includeSlugEnd ?? false;
       const updatedProject = ProjectSchema.parse({
         ...project,
         updatedAt: now,
@@ -289,7 +333,9 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
         exportOptions: body
           ? {
               speed: body.speed ?? project.exportOptions?.speed ?? 1,
-              includeSlug: body.includeSlug ?? project.exportOptions?.includeSlug ?? false,
+              includeSlug: includeSlugStart && includeSlugEnd,
+              includeSlugStart,
+              includeSlugEnd,
             }
           : project.exportOptions,
       });
@@ -308,18 +354,34 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
 
   app.get("/:id/render/stream", async (request, reply) => {
     const { id } = request.params as { id: string };
-    const query = request.query as { presetId?: string; includeSlug?: string; speed?: string };
+    const query = request.query as {
+      presetId?: string;
+      includeSlug?: string;
+      includeSlugStart?: string;
+      includeSlugEnd?: string;
+      speed?: string;
+    };
     const project = await readProject(id);
     if (!project) {
       return reply.code(404).send({ error: "project not found" });
     }
 
+    const includeSlug = query.includeSlug === "true";
+    const includeSlugStart =
+      query.includeSlugStart === "true" || (includeSlug && query.includeSlugStart == null);
+    const includeSlugEnd =
+      query.includeSlugEnd === "true" || (includeSlug && query.includeSlugEnd == null);
+
     const options = {
       presetId: query.presetId,
-      includeSlug: query.includeSlug === "true",
+      includeSlug,
+      includeSlugStart,
+      includeSlugEnd,
       speed: query.speed ? (Number(query.speed) as 1 | 2) : undefined,
     };
 
+    const origin = request.headers.origin ?? "*";
+    reply.raw.setHeader("Access-Control-Allow-Origin", origin);
     reply.raw.setHeader("Content-Type", "text/event-stream");
     reply.raw.setHeader("Cache-Control", "no-cache");
     reply.raw.setHeader("Connection", "keep-alive");

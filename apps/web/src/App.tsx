@@ -1,26 +1,40 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import type { Group as KonvaGroup } from "konva/lib/Group";
 import type { Transformer as KonvaTransformer } from "konva/lib/shapes/Transformer";
-import { Arrow, Group, Layer, Rect, Stage, Text, Transformer } from "react-konva";
+import { Arrow, Group, Image as KonvaImage, Layer, Rect, Stage, Text, Transformer } from "react-konva";
 import {
+  assetUrl,
   createProject,
+  deleteProject,
   getProject,
   importVideo,
   listProjects,
+  listTemplates,
   mediaUrl,
   renderStreamUrl,
   thumbnailUrl,
   updateProject,
+  type ArrowInfo,
   type Overlay,
   type Project,
   type ProjectSummary,
+  type TemplateInfo,
 } from "./api";
 
-const DEFAULT_CARD_SIZE = { w: 720, h: 160 };
+const DEFAULT_CARD_SIZE = { w: 1100, h: 180 };
 const DEFAULT_ARROW_SIZE = { w: 128, h: 128 };
 
-const CARD_TEMPLATES = [
+const SLUG_OPTIONS = [
+  {
+    id: "k1s-title-variant3",
+    label: "K1s Title Variant 3 (3s)",
+    path: "slug/k1s-title-variant3-motion-loop-3s_1080p30.mp4",
+    fps: 30,
+  },
+];
+
+const FALLBACK_TEMPLATES = [
   { id: "card-lower-third-left", label: "Lower Third Left" },
   { id: "card-lower-third-right", label: "Lower Third Right" },
   { id: "card-lower-third-center", label: "Lower Third Center" },
@@ -46,11 +60,51 @@ function formatFrame(frame: number) {
   return Math.max(0, Math.floor(frame));
 }
 
+function formatTimecode(frames: number, fps: number) {
+  if (!Number.isFinite(fps) || fps <= 0) return "00:00:00";
+  const totalSeconds = Math.max(0, Math.floor(frames / fps));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+}
+
+function parseTimecode(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(":").map((part) => Number(part));
+  if (parts.some((part) => Number.isNaN(part))) return null;
+  if (parts.length === 1) {
+    return parts[0];
+  }
+  if (parts.length === 2) {
+    return parts[0] * 60 + parts[1];
+  }
+  if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  return null;
+}
+
+function cloneProjectState(value: Project): Project {
+  if (typeof structuredClone === "function") {
+    return structuredClone(value);
+  }
+  return JSON.parse(JSON.stringify(value)) as Project;
+}
+
 type StageMetrics = {
   width: number;
   height: number;
   scaleX: number;
   scaleY: number;
+};
+
+type HistoryEntry = {
+  project: Project;
+  selectedOverlayId: string | null;
+  currentFrame: number;
 };
 
 export default function App() {
@@ -62,12 +116,29 @@ export default function App() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [videoDurationSec, setVideoDurationSec] = useState(0);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
-  const [renderOptions, setRenderOptions] = useState({ speed: 1 as 1 | 2, includeSlug: false });
+  const [renderOptions, setRenderOptions] = useState({
+    speed: 1 as 1 | 2,
+    includeSlugStart: false,
+    includeSlugEnd: false,
+  });
   const [renderProgress, setRenderProgress] = useState<number | null>(null);
+  const [renderLogs, setRenderLogs] = useState<string[]>([]);
+  const [renderActive, setRenderActive] = useState(false);
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
   const [thumbnailError, setThumbnailError] = useState<string | null>(null);
+  const [templateLibrary, setTemplateLibrary] = useState<TemplateInfo[]>([]);
+  const [arrowLibrary, setArrowLibrary] = useState<ArrowInfo[]>([]);
+  const [templateImages, setTemplateImages] = useState<Record<string, HTMLImageElement>>({});
+  const [arrowImage, setArrowImage] = useState<HTMLImageElement | null>(null);
+  const [showHotkeys, setShowHotkeys] = useState(false);
+  const [trimStartTime, setTrimStartTime] = useState("00:00:00");
+  const [trimEndTime, setTrimEndTime] = useState("00:00:00");
   const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
+  const historyRef = useRef<{ past: HistoryEntry[]; future: HistoryEntry[] }>({
+    past: [],
+    future: [],
+  });
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRefs = useRef<Record<string, KonvaGroup>>({});
@@ -81,15 +152,29 @@ export default function App() {
   });
 
   const fps = useMemo(() => getFps(project), [project]);
+  const hasMedia = useMemo(() => {
+    if (!project) return false;
+    return project.video.durationMs > 0 && Boolean(project.source?.filename);
+  }, [project]);
   const totalFrames = useMemo(() => {
-    if (project?.video.durationMs) {
+    if (project?.video.durationMs && hasMedia) {
       return Math.max(1, Math.floor((project.video.durationMs / 1000) * fps));
     }
     return Math.max(1, Math.floor(videoDurationSec * fps));
-  }, [project, fps, videoDurationSec]);
+  }, [project, fps, videoDurationSec, hasMedia]);
 
   const selectedOverlay =
     project?.overlays.find((overlay) => overlay.id === selectedOverlayId) ?? null;
+  const selectedSlugPath = project?.slug?.introPath ?? project?.slug?.outroPath ?? "";
+  const selectedSlugOption =
+    SLUG_OPTIONS.find((option) => option.path === selectedSlugPath) ?? null;
+  const edits = project?.edits ?? { trimStartFrames: 0, trimEndFrames: 0, cuts: [] };
+  const templateMap = useMemo(() => {
+    const entries = templateLibrary.map((template) => [template.id, template] as const);
+    return Object.fromEntries(entries);
+  }, [templateLibrary]);
+  const templateOptions = templateLibrary.length ? templateLibrary : FALLBACK_TEMPLATES;
+  const arrowTemplate = arrowLibrary[0] ?? null;
 
   const thumbnailFrames = useMemo(() => {
     const count = 8;
@@ -115,20 +200,76 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    listTemplates()
+      .then((data) => {
+        setTemplateLibrary(data.templates);
+        setArrowLibrary(data.arrows);
+      })
+      .catch((error: unknown) => setStatus((error as Error).message));
+  }, []);
+
+  useEffect(() => {
     if (!selectedId) {
       setProject(null);
+      setSelectedOverlayId(null);
+      historyRef.current = { past: [], future: [] };
       return;
     }
     setThumbnailError(null);
     getProject(selectedId)
       .then((data: Project) => {
         setProject(data);
-        if (!selectedOverlayId && data.overlays.length) {
-          setSelectedOverlayId(data.overlays[0].id);
-        }
+        setSelectedOverlayId(data.overlays[0]?.id ?? null);
+        historyRef.current = { past: [], future: [] };
       })
       .catch((error: unknown) => setStatus((error as Error).message));
   }, [selectedId]);
+
+  useEffect(() => {
+    if (!project) return;
+    const includeSlugStart =
+      project.exportOptions?.includeSlugStart ?? project.exportOptions?.includeSlug ?? false;
+    const includeSlugEnd =
+      project.exportOptions?.includeSlugEnd ?? project.exportOptions?.includeSlug ?? false;
+    setRenderOptions((prev) => ({
+      ...prev,
+      speed: project.exportOptions?.speed ?? prev.speed,
+      includeSlugStart,
+      includeSlugEnd,
+    }));
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (!project) return;
+    setTrimStartTime(formatTimecode(edits.trimStartFrames ?? 0, fps));
+    setTrimEndTime(formatTimecode(edits.trimEndFrames ?? 0, fps));
+  }, [project?.id, edits.trimStartFrames, edits.trimEndFrames, fps]);
+
+  useEffect(() => {
+    if (!templateLibrary.length) return;
+    templateLibrary.forEach((template) => {
+      if (templateImages[template.id]) return;
+      const image = new window.Image();
+      image.src = assetUrl(template.imagePath);
+      image.onload = () => {
+        setTemplateImages((prev) => {
+          if (prev[template.id]) return prev;
+          return { ...prev, [template.id]: image };
+        });
+      };
+    });
+  }, [templateLibrary, templateImages]);
+
+  useEffect(() => {
+    if (!arrowTemplate) return;
+    const nextUrl = assetUrl(arrowTemplate.imagePath);
+    if (arrowImage?.src === nextUrl) return;
+    const image = new window.Image();
+    image.src = nextUrl;
+    image.onload = () => {
+      setArrowImage(image);
+    };
+  }, [arrowTemplate, arrowImage]);
 
   useLayoutEffect(() => {
     if (!project || !videoRef.current) return;
@@ -192,6 +333,25 @@ export default function App() {
     }
   }
 
+  async function handleDeleteProject(id: string, name: string) {
+    const confirmed = window.confirm(`Delete project "${name}"? This removes its workspace data.`);
+    if (!confirmed) return;
+    setStatus("Deleting project...");
+    try {
+      await deleteProject(id);
+      if (selectedId === id) {
+        setSelectedId(null);
+        setProject(null);
+        setSelectedOverlayId(null);
+        historyRef.current = { past: [], future: [] };
+      }
+      await refreshProjects();
+      setStatus(`Deleted ${name}.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    }
+  }
+
   async function handleImport(file: File) {
     if (!selectedId) {
       setStatus("Select a project first.");
@@ -203,18 +363,180 @@ export default function App() {
       await refreshProjects(selectedId);
       const updated = await getProject(selectedId);
       setProject(updated);
+      setSelectedOverlayId(updated.overlays[0]?.id ?? null);
+      historyRef.current = { past: [], future: [] };
       setStatus(`Imported ${file.name}.`);
     } catch (error) {
       setStatus((error as Error).message);
     }
   }
 
-  function updateProjectState(next: Project) {
+  function updateProjectState(
+    next: Project,
+    nextSelectedId?: string | null,
+    options: { pushHistory?: boolean } = {}
+  ) {
+    const shouldPush = options.pushHistory ?? true;
+    if (shouldPush && project) {
+      historyRef.current.past.push({
+        project: cloneProjectState(project),
+        selectedOverlayId,
+        currentFrame,
+      });
+      if (historyRef.current.past.length > 200) {
+        historyRef.current.past.shift();
+      }
+      historyRef.current.future = [];
+    }
     setProject(next);
+    if (typeof nextSelectedId !== "undefined") {
+      setSelectedOverlayId(nextSelectedId);
+      return;
+    }
     if (!selectedOverlayId && next.overlays.length) {
       setSelectedOverlayId(next.overlays[0].id);
     }
   }
+
+  function updateProjectExportOptions(patch: Partial<Project["exportOptions"]>) {
+    if (!project) return;
+    const nextExportOptions = { ...project.exportOptions, ...patch };
+    updateProjectState({ ...project, exportOptions: nextExportOptions }, undefined, {
+      pushHistory: false,
+    });
+  }
+
+  function updateEdits(patch: Partial<NonNullable<Project["edits"]>>) {
+    if (!project) return;
+    const nextEdits = { ...project.edits, ...patch };
+    updateProjectState({ ...project, edits: nextEdits }, undefined, { pushHistory: false });
+  }
+
+  function clampTrimValues(nextStart: number, nextEnd: number) {
+    const total = Math.max(1, totalFrames);
+    const start = Math.max(0, Math.min(Math.floor(nextStart), total - 1));
+    const maxEnd = Math.max(0, total - 1 - start);
+    const end = Math.max(0, Math.min(Math.floor(nextEnd), maxEnd));
+    return { start, end };
+  }
+
+  function setTrimStartFrames(nextStart: number) {
+    const currentEnd = edits.trimEndFrames ?? 0;
+    const clamped = clampTrimValues(nextStart, currentEnd);
+    updateEdits({ trimStartFrames: clamped.start, trimEndFrames: clamped.end });
+    setTrimStartTime(formatTimecode(clamped.start, fps));
+    setTrimEndTime(formatTimecode(clamped.end, fps));
+  }
+
+  function setTrimEndFrames(nextEnd: number) {
+    const currentStart = edits.trimStartFrames ?? 0;
+    const clamped = clampTrimValues(currentStart, nextEnd);
+    updateEdits({ trimStartFrames: clamped.start, trimEndFrames: clamped.end });
+    setTrimStartTime(formatTimecode(clamped.start, fps));
+    setTrimEndTime(formatTimecode(clamped.end, fps));
+  }
+
+  function addCut() {
+    if (!project) return;
+    const cut = {
+      id: crypto.randomUUID(),
+      startFrame: currentFrame,
+      endFrame: Math.min(currentFrame + Math.floor(fps), totalFrames - 1),
+      transition: { type: "cut" as const, durationFrames: 0 },
+    };
+    updateEdits({ cuts: [...(edits.cuts ?? []), cut] });
+  }
+
+  function updateCut(id: string, patch: Partial<(NonNullable<Project["edits"]>["cuts"])[number]>) {
+    if (!project) return;
+    const nextCuts = (edits.cuts ?? []).map((cut) => {
+      if (cut.id !== id) return cut;
+      return { ...cut, ...patch };
+    });
+    updateEdits({ cuts: nextCuts });
+  }
+
+  function removeCut(id: string) {
+    if (!project) return;
+    updateEdits({ cuts: (edits.cuts ?? []).filter((cut) => cut.id !== id) });
+  }
+
+  function applySlugSelection(slugId: string) {
+    if (!project) return;
+    const slugOption = SLUG_OPTIONS.find((option) => option.id === slugId) ?? null;
+    if (!slugOption) {
+      setRenderOptions((prev) => ({
+        ...prev,
+        includeSlugStart: false,
+        includeSlugEnd: false,
+      }));
+      updateProjectState(
+        {
+          ...project,
+          slug: undefined,
+          exportOptions: {
+            ...project.exportOptions,
+            includeSlug: false,
+            includeSlugStart: false,
+            includeSlugEnd: false,
+          },
+        },
+        undefined,
+        { pushHistory: false }
+      );
+      return;
+    }
+
+    updateProjectState(
+      {
+        ...project,
+        slug: { introPath: slugOption.path, outroPath: slugOption.path, fps: slugOption.fps },
+      },
+      undefined,
+      { pushHistory: false }
+    );
+  }
+
+  function applySlugFlags(includeSlugStart: boolean, includeSlugEnd: boolean) {
+    setRenderOptions((prev) => ({
+      ...prev,
+      includeSlugStart,
+      includeSlugEnd,
+    }));
+    updateProjectExportOptions({
+      includeSlugStart,
+      includeSlugEnd,
+      includeSlug: includeSlugStart && includeSlugEnd,
+    });
+  }
+
+  const undo = useCallback(() => {
+    const history = historyRef.current;
+    const previous = history.past.pop();
+    if (!previous || !project) return;
+    history.future.push({
+      project: cloneProjectState(project),
+      selectedOverlayId,
+      currentFrame,
+    });
+    setProject(previous.project);
+    setSelectedOverlayId(previous.selectedOverlayId);
+    setCurrentFrame(previous.currentFrame);
+  }, [project, selectedOverlayId, currentFrame]);
+
+  const redo = useCallback(() => {
+    const history = historyRef.current;
+    const next = history.future.pop();
+    if (!next || !project) return;
+    history.past.push({
+      project: cloneProjectState(project),
+      selectedOverlayId,
+      currentFrame,
+    });
+    setProject(next.project);
+    setSelectedOverlayId(next.selectedOverlayId);
+    setCurrentFrame(next.currentFrame);
+  }, [project, selectedOverlayId, currentFrame]);
 
   function updateOverlay(id: string, patch: Partial<Overlay>) {
     if (!project) return;
@@ -233,11 +555,119 @@ export default function App() {
     updateProjectState({ ...project, overlays });
   }
 
-  function createCardOverlay(templateId: string, x: number, y: number) {
+  function isOverlayAnchoredAtFrame(overlay: Overlay, frame: number) {
+    return formatFrame(overlay.startFrame) === frame;
+  }
+
+  function selectOverlayById(id: string, seek = true) {
+    setSelectedOverlayId(id);
+    if (!seek || !project) return;
+    const overlay = project.overlays.find((item) => item.id === id);
+    if (overlay) {
+      seekToFrame(formatFrame(overlay.startFrame));
+    }
+  }
+
+  function getTemplateRect(templateId: string) {
+    const fallback = { x: 80, y: 80, w: DEFAULT_CARD_SIZE.w, h: DEFAULT_CARD_SIZE.h };
+    if (!project) return fallback;
+    const template = templateMap[templateId];
+    if (!template) return fallback;
+    const scaleX = project.video.width / template.sourceWidth;
+    const scaleY = project.video.height / template.sourceHeight;
+    return {
+      x: template.bounds.left * scaleX,
+      y: template.bounds.top * scaleY,
+      w: template.bounds.width * scaleX,
+      h: template.bounds.height * scaleY,
+    };
+  }
+
+  function getArrowSize() {
+    if (arrowTemplate) {
+      return { w: arrowTemplate.sourceWidth, h: arrowTemplate.sourceHeight };
+    }
+    return DEFAULT_ARROW_SIZE;
+  }
+
+  const removeOverlay = useCallback(
+    (id: string) => {
+      if (!project) return;
+      const index = project.overlays.findIndex((overlay) => overlay.id === id);
+      if (index === -1) return;
+      const remaining = project.overlays
+        .filter((overlay) => overlay.id !== id)
+        .map((overlay, nextIndex) => ({ ...overlay, zIndex: nextIndex }));
+      const nextSelected =
+        remaining.length > 0 ? remaining[Math.min(index, remaining.length - 1)].id : null;
+      updateProjectState({ ...project, overlays: remaining }, nextSelected);
+    },
+    [project]
+  );
+
+  useEffect(() => {
+    function isEditableTarget(target: EventTarget | null) {
+      if (!(target instanceof HTMLElement)) return false;
+      if (target.isContentEditable) return true;
+      const tag = target.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      const isModifier = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+
+      if (isModifier && (key === "/" || event.code === "Slash")) {
+        event.preventDefault();
+        setShowHotkeys((prev) => !prev);
+        return;
+      }
+
+      if (event.key === "Escape") {
+        if (showHotkeys) {
+          event.preventDefault();
+          setShowHotkeys(false);
+        }
+        return;
+      }
+
+      if (isModifier && key === "z") {
+        if (isEditableTarget(event.target)) return;
+        event.preventDefault();
+        if (event.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+        return;
+      }
+
+      if (isModifier && key === "y") {
+        if (isEditableTarget(event.target)) return;
+        event.preventDefault();
+        redo();
+        return;
+      }
+
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      if (!selectedOverlayId) return;
+      if (isEditableTarget(event.target)) return;
+      event.preventDefault();
+      removeOverlay(selectedOverlayId);
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedOverlayId, removeOverlay, undo, redo, showHotkeys]);
+
+  function createCardOverlay(templateId: string, x?: number, y?: number) {
     if (!project) return;
     const id = crypto.randomUUID();
     const start = currentFrame;
     const end = start + Math.floor(fps * 5);
+    const baseRect = getTemplateRect(templateId);
+    const rectX = typeof x === "number" ? Math.max(0, x) : baseRect.x;
+    const rectY = typeof y === "number" ? Math.max(0, y) : baseRect.y;
     const overlay: Overlay = {
       id,
       templateId,
@@ -245,15 +675,15 @@ export default function App() {
       startFrame: start,
       endFrame: end,
       rect: {
-        x,
-        y,
-        w: DEFAULT_CARD_SIZE.w,
-        h: DEFAULT_CARD_SIZE.h,
+        x: rectX,
+        y: rectY,
+        w: baseRect.w,
+        h: baseRect.h,
       },
       rotationDeg: 0,
       opacity: 1,
       zIndex: project.overlays.length,
-      fields: { title: "Title", subtitle: "Subtitle" },
+      fields: { title: "Title", text: "Text" },
       motion: {
         slideInFrames: 12,
         displayFrames: Math.floor(fps * 3),
@@ -265,22 +695,25 @@ export default function App() {
     setSelectedOverlayId(id);
   }
 
-  function createArrowOverlay(x: number, y: number) {
+  function createArrowOverlay(x?: number, y?: number) {
     if (!project) return;
     const id = crypto.randomUUID();
     const start = currentFrame;
     const end = start + Math.floor(fps * 2);
+    const size = getArrowSize();
+    const fallbackX = project ? project.video.width / 2 - size.w / 2 : 320;
+    const fallbackY = project ? project.video.height / 2 - size.h / 2 : 240;
     const overlay: Overlay = {
       id,
-      templateId: "arrow-basic",
+      templateId: arrowTemplate?.id ?? "arrow-right",
       templateVersion: "1",
       startFrame: start,
       endFrame: end,
       rect: {
-        x,
-        y,
-        w: DEFAULT_ARROW_SIZE.w,
-        h: DEFAULT_ARROW_SIZE.h,
+        x: typeof x === "number" ? Math.max(0, x) : fallbackX,
+        y: typeof y === "number" ? Math.max(0, y) : fallbackY,
+        w: size.w,
+        h: size.h,
       },
       rotationDeg: 0,
       opacity: 1,
@@ -299,11 +732,11 @@ export default function App() {
   }
 
   function addOverlayCard() {
-    createCardOverlay("card-lower-third-left", 80, 80);
+    createCardOverlay("card-lower-third-left");
   }
 
   function addOverlayArrow() {
-    createArrowOverlay(320, 240);
+    createArrowOverlay();
   }
 
   async function handleSaveProject() {
@@ -311,7 +744,7 @@ export default function App() {
     setStatus("Saving project...");
     try {
       const saved = await updateProject(selectedId, project);
-      updateProjectState(saved);
+      updateProjectState(saved, undefined, { pushHistory: false });
       await refreshProjects(selectedId);
       setStatus("Project saved.");
     } catch (error) {
@@ -323,34 +756,70 @@ export default function App() {
     if (!project || !selectedId) return;
     setStatus("Starting render...");
     setRenderProgress(0);
+    setRenderLogs([]);
+    setRenderActive(true);
     try {
       await handleSaveProject();
       const es = new EventSource(renderStreamUrl(selectedId, renderOptions));
-      es.addEventListener("progress", (event) => {
-        const data = JSON.parse((event as MessageEvent).data) as {
-          stage: string;
-          message?: string;
-          percent?: number;
-        };
+      const parsePayload = (event: Event) => {
+        if ("data" in event) {
+          const raw = (event as MessageEvent).data;
+          if (typeof raw === "string" && raw.length) {
+            try {
+              return JSON.parse(raw) as { stage?: string; message?: string; percent?: number };
+            } catch {
+              return { message: raw };
+            }
+          }
+        }
+        return {};
+      };
+
+      const pushRenderLog = (line: string) => {
+        if (!line) return;
+        setRenderLogs((prev) => {
+          const next = [...prev, line];
+          return next.length > 200 ? next.slice(next.length - 200) : next;
+        });
+      };
+
+      const applyUpdate = (data: { stage?: string; message?: string; percent?: number }) => {
         if (typeof data.percent === "number") {
           setRenderProgress(data.percent);
         }
         if (data.message) {
-          setStatus(`[${data.stage}] ${data.message}`);
+          const stageLabel = data.stage ? `[${data.stage}] ` : "";
+          const line = `${stageLabel}${data.message}`;
+          setStatus(line);
+          pushRenderLog(line);
         }
+      };
+
+      es.addEventListener("status", (event) => {
+        applyUpdate(parsePayload(event));
+      });
+      es.addEventListener("progress", (event) => {
+        applyUpdate(parsePayload(event));
       });
       es.addEventListener("done", (event) => {
-        const data = JSON.parse((event as MessageEvent).data) as { message: string };
-        setStatus(`Render complete: ${data.message}`);
+        const data = parsePayload(event);
+        setStatus(`Render complete: ${data.message ?? "Done"}`);
         setRenderProgress(1);
+        pushRenderLog(`Render complete: ${data.message ?? "Done"}`);
+        setRenderActive(false);
         es.close();
       });
       es.addEventListener("error", (event) => {
-        setStatus(`Render error: ${(event as MessageEvent).data || "unknown"}`);
+        const data = parsePayload(event);
+        const message = `Render error: ${data.message ?? "unknown"}`;
+        setStatus(message);
+        pushRenderLog(message);
+        setRenderActive(false);
         es.close();
       });
     } catch (error) {
       setStatus((error as Error).message);
+      setRenderActive(false);
     }
   }
 
@@ -375,13 +844,16 @@ export default function App() {
       const rect = videoWrapperRef.current.getBoundingClientRect();
       const dropX = event.clientX - rect.left;
       const dropY = event.clientY - rect.top;
-      const x = dropX / stageMetrics.scaleX - DEFAULT_CARD_SIZE.w / 2;
-      const y = dropY / stageMetrics.scaleY - DEFAULT_CARD_SIZE.h / 2;
       if (data.type === "card") {
-        createCardOverlay(data.templateId ?? "card-lower-third-left", Math.max(0, x), Math.max(0, y));
+        const templateId = data.templateId ?? "card-lower-third-left";
+        const baseRect = getTemplateRect(templateId);
+        const x = dropX / stageMetrics.scaleX - baseRect.w / 2;
+        const y = dropY / stageMetrics.scaleY - baseRect.h / 2;
+        createCardOverlay(templateId, Math.max(0, x), Math.max(0, y));
       } else {
-        const arrowX = dropX / stageMetrics.scaleX - DEFAULT_ARROW_SIZE.w / 2;
-        const arrowY = dropY / stageMetrics.scaleY - DEFAULT_ARROW_SIZE.h / 2;
+        const size = getArrowSize();
+        const arrowX = dropX / stageMetrics.scaleX - size.w / 2;
+        const arrowY = dropY / stageMetrics.scaleY - size.h / 2;
         createArrowOverlay(Math.max(0, arrowX), Math.max(0, arrowY));
       }
     } catch {
@@ -396,6 +868,19 @@ export default function App() {
     const height = overlay.rect.h * scaleY;
     const x = overlay.rect.x * scaleX;
     const y = overlay.rect.y * scaleY;
+    const template = templateMap[overlay.templateId];
+    const templateImage = template ? templateImages[template.id] : undefined;
+    const textAlign = template?.align ?? "left";
+    const textValue = String(overlay.fields.text ?? overlay.fields.subtitle ?? "");
+    const crop = template
+      ? {
+          x: template.bounds.left,
+          y: template.bounds.top,
+          width: template.bounds.width,
+          height: template.bounds.height,
+        }
+      : undefined;
+    const isSelected = overlay.id === selectedOverlayId;
 
     return (
       <Group
@@ -406,8 +891,8 @@ export default function App() {
         x={x}
         y={y}
         draggable
-        onClick={() => setSelectedOverlayId(overlay.id)}
-        onTap={() => setSelectedOverlayId(overlay.id)}
+        onClick={() => selectOverlayById(overlay.id, false)}
+        onTap={() => selectOverlayById(overlay.id, false)}
         onDragEnd={(event) => {
           const node = event.target;
           updateOverlay(overlay.id, {
@@ -436,11 +921,16 @@ export default function App() {
           });
         }}
       >
+        {templateImage ? (
+          <KonvaImage image={templateImage} width={width} height={height} crop={crop} />
+        ) : (
+          <Rect width={width} height={height} fill="rgba(15, 19, 24, 0.65)" cornerRadius={12} />
+        )}
         <Rect
           width={width}
           height={height}
-          fill="rgba(15, 19, 24, 0.65)"
-          stroke={overlay.id === selectedOverlayId ? "#f7b35b" : "rgba(255,255,255,0.2)"}
+          fill="rgba(0,0,0,0)"
+          stroke={isSelected ? "#f7b35b" : "rgba(255,255,255,0.2)"}
           cornerRadius={12}
         />
         <Text
@@ -450,14 +940,16 @@ export default function App() {
           x={16}
           y={Math.max(8, height * 0.18)}
           width={width - 24}
+          align={textAlign}
         />
         <Text
-          text={String(overlay.fields.subtitle ?? "")}
+          text={textValue}
           fontSize={Math.max(12, height * 0.18)}
           fill="#d1c7b8"
           x={16}
           y={Math.max(8, height * 0.55)}
           width={width - 24}
+          align={textAlign}
         />
       </Group>
     );
@@ -470,24 +962,20 @@ export default function App() {
     const height = overlay.rect.h * scaleY;
     const centerX = overlay.rect.x * scaleX + width / 2;
     const centerY = overlay.rect.y * scaleY + height / 2;
-    const pointerLength = Math.min(width * 0.3, 48);
-    const pointerWidth = Math.min(height * 0.6, 48);
+    const arrowImg = arrowImage;
+    const isSelected = overlay.id === selectedOverlayId;
 
     return (
-      <Arrow
+      <Group
         key={overlay.id}
         x={centerX}
         y={centerY}
-        points={[-width / 2, 0, width / 2, 0]}
-        pointerLength={pointerLength}
-        pointerWidth={pointerWidth}
-        fill="rgba(247, 179, 91, 0.8)"
-        stroke="rgba(247, 179, 91, 0.9)"
-        strokeWidth={Math.max(2, height * 0.15)}
+        offsetX={width / 2}
+        offsetY={height / 2}
         rotation={overlay.rotationDeg ?? 0}
         draggable
-        onClick={() => setSelectedOverlayId(overlay.id)}
-        onTap={() => setSelectedOverlayId(overlay.id)}
+        onClick={() => selectOverlayById(overlay.id, false)}
+        onTap={() => selectOverlayById(overlay.id, false)}
         onDragEnd={(event) => {
           const node = event.target;
           const newX = (node.x() - width / 2) / scaleX;
@@ -496,7 +984,31 @@ export default function App() {
             rect: { ...overlay.rect, x: newX, y: newY },
           });
         }}
-      />
+      >
+        {arrowImg ? (
+          <KonvaImage image={arrowImg} width={width} height={height} />
+        ) : (
+          <Arrow
+            x={width / 2}
+            y={height / 2}
+            points={[-width / 2, 0, width / 2, 0]}
+            pointerLength={Math.min(width * 0.3, 48)}
+            pointerWidth={Math.min(height * 0.6, 48)}
+            fill="rgba(247, 179, 91, 0.8)"
+            stroke="rgba(247, 179, 91, 0.9)"
+            strokeWidth={Math.max(2, height * 0.15)}
+          />
+        )}
+        {isSelected && (
+          <Rect
+            width={width}
+            height={height}
+            stroke="rgba(247, 179, 91, 0.8)"
+            strokeWidth={2}
+            dash={[6, 4]}
+          />
+        )}
+      </Group>
     );
   }
 
@@ -508,19 +1020,6 @@ export default function App() {
           <div className="subtitle">
             Editing workspace · {project ? project.name : "Select a project"} · Frame {currentFrame}
           </div>
-        </div>
-        <div className="topbar-actions">
-          <button className="secondary" onClick={handleSaveProject} disabled={!project}>
-            Save
-          </button>
-          <button onClick={handleRenderFinal} disabled={!project}>
-            Render final
-          </button>
-          {renderProgress !== null && (
-            <div className="progress slim">
-              <div className="progress-bar" style={{ width: `${renderProgress * 100}%` }} />
-            </div>
-          )}
         </div>
       </header>
 
@@ -564,7 +1063,15 @@ export default function App() {
                         <strong>{proj.name}</strong>
                         <div className="details">{proj.id}</div>
                       </div>
-                      <button onClick={() => setSelectedId(proj.id)}>Select</button>
+                      <div className="project-actions">
+                        <button onClick={() => setSelectedId(proj.id)}>Select</button>
+                        <button
+                          className="danger"
+                          onClick={() => handleDeleteProject(proj.id, proj.name)}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -592,13 +1099,13 @@ export default function App() {
               <div className="asset-section">
                 <h3>Card templates</h3>
                 <div className="asset-grid">
-                  {CARD_TEMPLATES.map((template) => (
+                  {templateOptions.map((template) => (
                     <div
                       key={template.id}
                       className="asset-card"
                       draggable
                       onDragStart={handleDragStart("card", template.id)}
-                      onClick={() => createCardOverlay(template.id, 120, 120)}
+                      onClick={() => createCardOverlay(template.id)}
                     >
                       {template.label}
                     </div>
@@ -609,9 +1116,9 @@ export default function App() {
                   className="asset-card"
                   draggable
                   onDragStart={handleDragStart("arrow")}
-                  onClick={() => createArrowOverlay(320, 240)}
+                  onClick={() => createArrowOverlay()}
                 >
-                  Directional Arrow
+                  {arrowTemplate?.label ?? "Directional Arrow"}
                 </div>
               </div>
             </div>
@@ -634,9 +1141,14 @@ export default function App() {
                       key={overlay.id}
                       className={overlay.id === selectedOverlayId ? "overlay-item active" : "overlay-item"}
                     >
-                      <button className="secondary" onClick={() => setSelectedOverlayId(overlay.id)}>
-                        {overlay.templateId}
-                      </button>
+                      <div className="overlay-item-row">
+                        <button className="secondary" onClick={() => selectOverlayById(overlay.id)}>
+                          {overlay.templateId}
+                        </button>
+                        <button className="danger" onClick={() => removeOverlay(overlay.id)}>
+                          Delete
+                        </button>
+                      </div>
                       <div className="details">
                         {overlay.startFrame} → {overlay.endFrame}
                       </div>
@@ -666,7 +1178,7 @@ export default function App() {
             onDragOver={handleDragOver}
             onDrop={handleDrop}
           >
-            {project && project.source.filename ? (
+            {project && hasMedia ? (
               <>
                 <video
                   ref={videoRef}
@@ -695,9 +1207,11 @@ export default function App() {
                     className="overlay-stage"
                   >
                     <Layer>
-                      {project.overlays.map((overlay: Overlay) =>
-                        isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
-                      )}
+                      {project.overlays
+                        .filter((overlay: Overlay) => isOverlayAnchoredAtFrame(overlay, currentFrame))
+                        .map((overlay: Overlay) =>
+                          isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
+                        )}
                       <Transformer
                         ref={transformerRef}
                         rotateEnabled={false}
@@ -712,19 +1226,25 @@ export default function App() {
                 )}
               </>
             ) : (
-              <div className="preview-placeholder">Import a video to start editing</div>
+              <div className="preview-placeholder">
+                {project
+                  ? "Import a video to start editing."
+                  : "Select a project to start editing."}
+              </div>
             )}
           </div>
 
           <div className="playback-bar">
             <button
               className="secondary"
+              disabled={!hasMedia}
               onClick={() => seekToFrame(Math.max(0, currentFrame - 1))}
             >
               ◀︎ Frame
             </button>
             <button
               className="secondary"
+              disabled={!hasMedia}
               onClick={() => seekToFrame(Math.min(totalFrames - 1, currentFrame + 1))}
             >
               Frame ▶︎
@@ -740,6 +1260,11 @@ export default function App() {
             <h3>Inspector</h3>
             {project && selectedOverlay && (
               <>
+                <div className="actions">
+                  <button className="danger" onClick={() => removeOverlay(selectedOverlay.id)}>
+                    Delete overlay
+                  </button>
+                </div>
                 <label>Start frame</label>
                 <div className="actions">
                   <input
@@ -791,7 +1316,7 @@ export default function App() {
                         updateOverlay(selectedOverlay.id, { templateId: event.target.value })
                       }
                     >
-                      {CARD_TEMPLATES.map((template) => (
+                      {templateOptions.map((template) => (
                         <option key={template.id} value={template.id}>
                           {template.label}
                         </option>
@@ -807,13 +1332,13 @@ export default function App() {
                         })
                       }
                     />
-                    <label>Subtitle</label>
-                    <input
-                      type="text"
-                      value={String(selectedOverlay.fields.subtitle ?? "")}
+                    <label>Text</label>
+                    <textarea
+                      rows={4}
+                      value={String(selectedOverlay.fields.text ?? selectedOverlay.fields.subtitle ?? "")}
                       onChange={(event) =>
                         updateOverlay(selectedOverlay.id, {
-                          fields: { ...selectedOverlay.fields, subtitle: event.target.value },
+                          fields: { ...selectedOverlay.fields, text: event.target.value },
                         })
                       }
                     />
@@ -899,126 +1424,374 @@ export default function App() {
             {!selectedOverlay && <div className="details">Select an overlay to edit.</div>}
           </div>
 
-          <div className="panel-block">
-            <h3>Render settings</h3>
-            <label htmlFor="speed">Speed</label>
-            <select
-              id="speed"
-              value={renderOptions.speed}
-              onChange={(event) =>
-                setRenderOptions((prev) => ({
-                  ...prev,
-                  speed: Number(event.target.value) as 1 | 2,
-                }))
-              }
-            >
-              <option value={1}>1× (normal)</option>
-              <option value={2}>2× (fast)</option>
-            </select>
-
-            <label htmlFor="slug">Include slug intro/outro</label>
-            <select
-              id="slug"
-              value={renderOptions.includeSlug ? "yes" : "no"}
-              onChange={(event) =>
-                setRenderOptions((prev) => ({
-                  ...prev,
-                  includeSlug: event.target.value === "yes",
-                }))
-              }
-            >
-              <option value="no">No slug</option>
-              <option value="yes">Include slug</option>
-            </select>
-          </div>
         </aside>
       </div>
 
       <section className="timeline">
-        <div className="scrubber">
-          <input
-            id="frame"
-            type="range"
-            min={0}
-            max={Math.max(1, totalFrames - 1)}
-            value={currentFrame}
-            onChange={(event) => seekToFrame(Number(event.target.value))}
-          />
-          <div className="details">
-            Frame {currentFrame} / {totalFrames}
-          </div>
-        </div>
-        <div className="thumbnail-strip">
-          {project &&
-            thumbnailFrames.map((frame: number) => (
-              <img
-                key={frame}
-                src={thumbnailUrl(project.id, frame, 180)}
-                alt={`Frame ${frame}`}
-                className={frame === currentFrame ? "thumbnail active" : "thumbnail"}
-                onClick={() => seekToFrame(frame)}
-                onError={() =>
-                  setThumbnailError((prev) => prev ?? `Thumbnail failed at frame ${frame}.`)
-                }
+        {project && hasMedia ? (
+          <>
+            <div className="scrubber">
+              <input
+                id="frame"
+                type="range"
+                min={0}
+                max={Math.max(1, totalFrames - 1)}
+                value={currentFrame}
+                onChange={(event) => seekToFrame(Number(event.target.value))}
               />
-            ))}
-        </div>
-        {thumbnailError && <div className="details warning">{thumbnailError}</div>}
-        {project && (
-          <div className="track-list">
+              <div className="details">
+                Frame {currentFrame} / {totalFrames}
+              </div>
+            </div>
+            <div className="thumbnail-strip">
+              {thumbnailFrames.map((frame: number, index: number) => (
+                <img
+                  key={`${frame}-${index}`}
+                  src={thumbnailUrl(project.id, frame, 180)}
+                  alt={`Frame ${frame}`}
+                  className={frame === currentFrame ? "thumbnail active" : "thumbnail"}
+                  onClick={() => seekToFrame(frame)}
+                  onError={() =>
+                    setThumbnailError((prev) => prev ?? `Thumbnail failed at frame ${frame}.`)
+                  }
+                />
+              ))}
+            </div>
+            {thumbnailError && <div className="details warning">{thumbnailError}</div>}
+            <div className="track-list">
             <div className="track-row">
               <div className="track-label">Video</div>
               <div className="track-lane">
                 <div className="track-clip full">Source</div>
+                {(edits.cuts ?? []).map((cut) => {
+                  const length = Math.max(1, cut.endFrame - cut.startFrame + 1);
+                  const left = (cut.startFrame / totalFrames) * 100;
+                  const width = (length / totalFrames) * 100;
+                  return (
+                    <div
+                      key={cut.id}
+                      className="track-cut"
+                      style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%` }}
+                      title={`Cut ${cut.startFrame} → ${cut.endFrame}`}
+                    />
+                  );
+                })}
               </div>
             </div>
-            <div className="track-row">
-              <div className="track-label">Cards</div>
-              <div className="track-lane">
-                {project.overlays
-                  .filter((overlay) => !isArrow(overlay))
-                  .map((overlay) => {
-                    const left = (overlay.startFrame / totalFrames) * 100;
-                    const width = ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
-                    return (
-                      <div
-                        key={overlay.id}
-                        className="track-clip card"
-                        style={{ left: `${left}%`, width: `${Math.max(2, width)}%` }}
-                        onClick={() => setSelectedOverlayId(overlay.id)}
-                      >
-                        {overlay.templateId}
-                      </div>
-                    );
-                  })}
+              <div className="track-row">
+                <div className="track-label">Cards</div>
+                <div className="track-lane">
+                  {project.overlays
+                    .filter((overlay) => !isArrow(overlay))
+                    .map((overlay) => {
+                      const left = (overlay.startFrame / totalFrames) * 100;
+                      const width =
+                        ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
+                      return (
+                        <div
+                          key={overlay.id}
+                          className="track-clip card"
+                          style={{ left: `${left}%`, width: `${Math.max(2, width)}%` }}
+                          onClick={() => selectOverlayById(overlay.id)}
+                        >
+                          {overlay.templateId}
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+              <div className="track-row">
+                <div className="track-label">Arrows</div>
+                <div className="track-lane">
+                  {project.overlays
+                    .filter((overlay) => isArrow(overlay))
+                    .map((overlay) => {
+                      const left = (overlay.startFrame / totalFrames) * 100;
+                      const width =
+                        ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
+                      return (
+                        <div
+                          key={overlay.id}
+                          className="track-clip arrow"
+                          style={{ left: `${left}%`, width: `${Math.max(2, width)}%` }}
+                          onClick={() => selectOverlayById(overlay.id)}
+                        >
+                          Arrow
+                        </div>
+                      );
+                    })}
+                </div>
               </div>
             </div>
-            <div className="track-row">
-              <div className="track-label">Arrows</div>
-              <div className="track-lane">
-                {project.overlays
-                  .filter((overlay) => isArrow(overlay))
-                  .map((overlay) => {
-                    const left = (overlay.startFrame / totalFrames) * 100;
-                    const width = ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
-                    return (
-                      <div
-                        key={overlay.id}
-                        className="track-clip arrow"
-                        style={{ left: `${left}%`, width: `${Math.max(2, width)}%` }}
-                        onClick={() => setSelectedOverlayId(overlay.id)}
-                      >
-                        Arrow
-                      </div>
-                    );
-                  })}
-              </div>
-            </div>
-          </div>
+          </>
+        ) : (
+          <div className="details warning">Import a video to enable the scrubber.</div>
         )}
       </section>
 
+      <section className="render-dock">
+        <div className="render-dock-actions">
+          <div className="render-buttons">
+            <button className="secondary" onClick={handleSaveProject} disabled={!project}>
+              Save
+            </button>
+            <button onClick={handleRenderFinal} disabled={!project}>
+              Render final
+            </button>
+          </div>
+          {renderProgress !== null && (
+            <div className="progress slim">
+              <div className="progress-bar" style={{ width: `${renderProgress * 100}%` }} />
+            </div>
+          )}
+        </div>
+        <div className="render-settings-grid">
+          <div className="render-setting">
+            <label htmlFor="speed">Speed</label>
+            <select
+              id="speed"
+              value={renderOptions.speed}
+              disabled={!project}
+              onChange={(event) => {
+                const nextSpeed = Number(event.target.value) as 1 | 2;
+                setRenderOptions((prev) => ({ ...prev, speed: nextSpeed }));
+                updateProjectExportOptions({ speed: nextSpeed });
+              }}
+            >
+              <option value={1}>1× (normal)</option>
+              <option value={2}>2× (fast)</option>
+            </select>
+          </div>
+          <div className="render-setting">
+            <label htmlFor="slug-select">Slug video</label>
+            <select
+              id="slug-select"
+              value={selectedSlugOption?.id ?? ""}
+              disabled={!project}
+              onChange={(event) => applySlugSelection(event.target.value)}
+            >
+              <option value="">No slug</option>
+              {SLUG_OPTIONS.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="render-setting">
+            <label>Include slug</label>
+            <div className="slug-flags">
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  disabled={!selectedSlugOption || !project}
+                  checked={renderOptions.includeSlugStart}
+                  onChange={(event) =>
+                    applySlugFlags(event.target.checked, renderOptions.includeSlugEnd)
+                  }
+                />
+                Start
+              </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  disabled={!selectedSlugOption || !project}
+                  checked={renderOptions.includeSlugEnd}
+                  onChange={(event) =>
+                    applySlugFlags(renderOptions.includeSlugStart, event.target.checked)
+                  }
+                />
+                End
+              </label>
+            </div>
+          </div>
+        </div>
+        <div className="render-divider" />
+        <div className="trim-section">
+          <h3>Trim & cuts</h3>
+          <div className="trim-grid">
+            <div className="trim-block">
+              <label>Trim start</label>
+              <div className="trim-row">
+                <input
+                  type="number"
+                  min={0}
+                  disabled={!hasMedia}
+                  value={edits.trimStartFrames ?? 0}
+                  onChange={(event) => setTrimStartFrames(Number(event.target.value))}
+                />
+                <input
+                  type="text"
+                  disabled={!hasMedia}
+                  value={trimStartTime}
+                  onChange={(event) => {
+                    setTrimStartTime(event.target.value);
+                    const seconds = parseTimecode(event.target.value);
+                    if (seconds !== null) {
+                      setTrimStartFrames(Math.round(seconds * fps));
+                    }
+                  }}
+                  onBlur={() => setTrimStartTime(formatTimecode(edits.trimStartFrames ?? 0, fps))}
+                />
+              </div>
+              <div className="details">Frames / HH:MM:SS</div>
+            </div>
+            <div className="trim-block">
+              <label>Trim end</label>
+              <div className="trim-row">
+                <input
+                  type="number"
+                  min={0}
+                  disabled={!hasMedia}
+                  value={edits.trimEndFrames ?? 0}
+                  onChange={(event) => setTrimEndFrames(Number(event.target.value))}
+                />
+                <input
+                  type="text"
+                  disabled={!hasMedia}
+                  value={trimEndTime}
+                  onChange={(event) => {
+                    setTrimEndTime(event.target.value);
+                    const seconds = parseTimecode(event.target.value);
+                    if (seconds !== null) {
+                      setTrimEndFrames(Math.round(seconds * fps));
+                    }
+                  }}
+                  onBlur={() => setTrimEndTime(formatTimecode(edits.trimEndFrames ?? 0, fps))}
+                />
+              </div>
+              <div className="details">Frames / HH:MM:SS</div>
+            </div>
+          </div>
+          <div className="cut-header">
+            <h4>Cut sections</h4>
+            <button className="secondary" onClick={addCut} disabled={!hasMedia}>
+              Add cut
+            </button>
+          </div>
+          <div className="cut-list">
+            {(edits.cuts ?? []).map((cut) => (
+              <div key={cut.id} className="cut-card">
+                <div className="cut-row">
+                  <label>Start</label>
+                  <input
+                    type="number"
+                    min={0}
+                    disabled={!hasMedia}
+                    value={cut.startFrame}
+                    onChange={(event) =>
+                      updateCut(cut.id, { startFrame: Number(event.target.value) })
+                    }
+                  />
+                  <button
+                    className="secondary"
+                    disabled={!hasMedia}
+                    onClick={() => updateCut(cut.id, { startFrame: currentFrame })}
+                  >
+                    Use playhead
+                  </button>
+                </div>
+                <div className="cut-row">
+                  <label>End</label>
+                  <input
+                    type="number"
+                    min={0}
+                    disabled={!hasMedia}
+                    value={cut.endFrame}
+                    onChange={(event) =>
+                      updateCut(cut.id, { endFrame: Number(event.target.value) })
+                    }
+                  />
+                  <button
+                    className="secondary"
+                    disabled={!hasMedia}
+                    onClick={() => updateCut(cut.id, { endFrame: currentFrame })}
+                  >
+                    Use playhead
+                  </button>
+                </div>
+                <div className="cut-row">
+                  <label>Transition</label>
+                  <select
+                    value={cut.transition?.type ?? "cut"}
+                    disabled={!hasMedia}
+                    onChange={(event) =>
+                      updateCut(cut.id, {
+                        transition: {
+                          type: event.target.value as "cut" | "crossfade",
+                          durationFrames: cut.transition?.durationFrames ?? 12,
+                        },
+                      })
+                    }
+                  >
+                    <option value="cut">Hard cut</option>
+                    <option value="crossfade">Crossfade</option>
+                  </select>
+                  <input
+                    type="number"
+                    min={0}
+                    value={cut.transition?.durationFrames ?? 12}
+                    disabled={!hasMedia || cut.transition?.type !== "crossfade"}
+                    onChange={(event) =>
+                      updateCut(cut.id, {
+                        transition: {
+                          type: "crossfade",
+                          durationFrames: Number(event.target.value),
+                        },
+                      })
+                    }
+                  />
+                </div>
+                <div className="cut-actions">
+                  <button className="danger" onClick={() => removeCut(cut.id)}>
+                    Remove cut
+                  </button>
+                </div>
+              </div>
+            ))}
+            {!edits.cuts?.length && (
+              <div className="details">No cuts yet. Use “Add cut” to remove a section.</div>
+            )}
+          </div>
+        </div>
+        <div className="render-log-header">FFmpeg status</div>
+        <div className="render-log" aria-live="polite">
+          {renderLogs.length ? (
+            renderLogs.map((line, index) => <div key={`${index}-${line}`}>{line}</div>)
+          ) : (
+            <div className="details">{renderActive ? "Waiting for output..." : "No renders yet."}</div>
+          )}
+        </div>
+      </section>
+
       {status && <div className="status">{status}</div>}
+      {showHotkeys && (
+        <div className="hotkey-overlay" onClick={() => setShowHotkeys(false)}>
+          <div className="hotkey-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Hotkeys</h3>
+            <div className="hotkey-row">
+              <span className="keys">Ctrl + Z</span>
+              <span>Undo</span>
+            </div>
+            <div className="hotkey-row">
+              <span className="keys">Ctrl + Y</span>
+              <span>Redo</span>
+            </div>
+            <div className="hotkey-row">
+              <span className="keys">Ctrl + /</span>
+              <span>Toggle hotkeys</span>
+            </div>
+            <div className="hotkey-row">
+              <span className="keys">Esc</span>
+              <span>Close</span>
+            </div>
+            <div className="hotkey-row">
+              <span className="keys">Delete</span>
+              <span>Remove selected overlay</span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

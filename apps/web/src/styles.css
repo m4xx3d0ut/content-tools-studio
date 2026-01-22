@@ -162,6 +162,7 @@ label {
 
 input[type="text"],
 input[type="number"],
+textarea,
 select {
   width: 100%;
   padding: 10px 12px;
@@ -169,6 +170,11 @@ select {
   border: 1px solid rgba(255, 255, 255, 0.2);
   background: rgba(15, 17, 20, 0.7);
   color: var(--ink);
+}
+
+textarea {
+  resize: vertical;
+  min-height: 96px;
 }
 
 input[type="file"] {
@@ -196,6 +202,60 @@ button.secondary {
   background: transparent;
   border: 1px solid var(--panel-strong);
   color: var(--ink);
+}
+
+button.danger {
+  background: rgba(228, 88, 88, 0.15);
+  border: 1px solid rgba(228, 88, 88, 0.5);
+  color: #f3b1b1;
+}
+
+button.danger:hover {
+  box-shadow: 0 10px 20px rgba(228, 88, 88, 0.25);
+}
+
+.hotkey-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 8, 12, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+  backdrop-filter: blur(6px);
+}
+
+.hotkey-card {
+  width: min(420px, 92vw);
+  background: rgba(20, 24, 30, 0.96);
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  padding: 20px 22px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+}
+
+.hotkey-card h3 {
+  margin: 0 0 12px;
+  font-size: 1.1rem;
+}
+
+.hotkey-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 0.95rem;
+}
+
+.hotkey-row:last-child {
+  border-bottom: none;
+}
+
+.hotkey-row .keys {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #f7b35b;
 }
 
 .actions {
@@ -227,6 +287,7 @@ button.secondary {
   border: 1px dashed rgba(247, 179, 91, 0.5);
   background: rgba(247, 179, 91, 0.08);
   cursor: grab;
+  margin-right: 6px;
 }
 
 .asset-card:active {
@@ -248,6 +309,12 @@ button.secondary {
   background: rgba(12, 14, 18, 0.7);
   display: flex;
   justify-content: space-between;
+  align-items: center;
+}
+
+.project-actions {
+  display: flex;
+  gap: 8px;
   align-items: center;
 }
 
@@ -276,6 +343,35 @@ button.secondary {
   background: rgba(247, 179, 91, 0.12);
 }
 
+.overlay-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.render-log-header {
+  margin-top: 14px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.render-log {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(8, 10, 14, 0.6);
+  max-height: 260px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.75rem;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+
 .video-preview {
   display: block;
   width: 100%;
@@ -296,6 +392,128 @@ button.secondary {
   gap: 8px;
   margin-top: 12px;
   overflow-x: auto;
+}
+
+.render-dock {
+  margin-top: 16px;
+  padding: 16px 20px;
+  border-radius: 18px;
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 16px 30px rgba(0, 0, 0, 0.25);
+  display: grid;
+  gap: 12px;
+}
+
+.render-dock-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.render-buttons {
+  display: flex;
+  gap: 10px;
+}
+
+.render-settings-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.render-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 4px 0;
+}
+
+.trim-section h3 {
+  margin: 0 0 12px;
+}
+
+.trim-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.trim-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.trim-block .details {
+  margin-top: 6px;
+}
+
+.cut-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16px;
+  gap: 12px;
+}
+
+.cut-header h4 {
+  margin: 0;
+}
+
+.cut-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.cut-card {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(8, 10, 14, 0.5);
+  display: grid;
+  gap: 10px;
+}
+
+.cut-row {
+  display: grid;
+  grid-template-columns: 90px 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.cut-row select,
+.cut-row input[type="number"] {
+  width: 100%;
+}
+
+.cut-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.render-setting label {
+  margin-bottom: 6px;
+}
+
+.slug-flags {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+
+.checkbox input {
+  accent-color: var(--accent);
 }
 
 .thumbnail {
@@ -378,6 +596,17 @@ button.secondary {
 
 .track-clip.arrow {
   background: rgba(125, 211, 252, 0.8);
+}
+
+.track-cut {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  border-radius: 8px;
+  background: rgba(225, 85, 85, 0.55);
+  border: 1px solid rgba(225, 85, 85, 0.8);
+  z-index: 2;
+  pointer-events: none;
 }
 
 .progress {

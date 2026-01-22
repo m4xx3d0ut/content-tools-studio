@@ -33,6 +33,20 @@ const DEFAULT_SUBTITLE: TemplateTextLayout = {
   color: "#d1c7b8",
 };
 
+const RIGHT_TITLE: TemplateTextLayout = {
+  xPct: 0.92,
+  yPct: 0.38,
+  sizePct: 0.32,
+  color: "#f5f2ea",
+};
+
+const RIGHT_SUBTITLE: TemplateTextLayout = {
+  xPct: 0.92,
+  yPct: 0.68,
+  sizePct: 0.2,
+  color: "#d1c7b8",
+};
+
 const CENTER_TITLE: TemplateTextLayout = {
   xPct: 0.5,
   yPct: 0.42,
@@ -60,9 +74,9 @@ const TEMPLATES: TemplateDefinition[] = [
     id: "card-lower-third-right",
     label: "Lower Third Right",
     filePath: path.join(TEMPLATE_ROOT, "card-lower-third-right-1920x1080.png"),
-    align: "left",
-    title: DEFAULT_TITLE,
-    subtitle: DEFAULT_SUBTITLE,
+    align: "right",
+    title: RIGHT_TITLE,
+    subtitle: RIGHT_SUBTITLE,
   },
   {
     id: "card-lower-third-center",
@@ -84,9 +98,9 @@ const TEMPLATES: TemplateDefinition[] = [
     id: "card-top-third-right",
     label: "Top Third Right",
     filePath: path.join(TEMPLATE_ROOT, "card-top-third-right-1920x1080.png"),
-    align: "left",
-    title: DEFAULT_TITLE,
-    subtitle: DEFAULT_SUBTITLE,
+    align: "right",
+    title: RIGHT_TITLE,
+    subtitle: RIGHT_SUBTITLE,
   },
   {
     id: "card-title-top",
@@ -99,9 +113,9 @@ const TEMPLATES: TemplateDefinition[] = [
     id: "card-callout-right",
     label: "Callout Right",
     filePath: path.join(TEMPLATE_ROOT, "card-callout-right-1920x1080.png"),
-    align: "left",
-    title: DEFAULT_TITLE,
-    subtitle: DEFAULT_SUBTITLE,
+    align: "right",
+    title: RIGHT_TITLE,
+    subtitle: RIGHT_SUBTITLE,
   },
   {
     id: "card-chapter-center",

@@ -3,13 +3,15 @@ import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
 import type { Overlay, Project } from "@content-tools/shared";
 import { DEFAULT_PRESET_ID, EXPORT_PRESETS } from "@content-tools/shared";
-import { FFMPEG_PATH, WORKSPACE_ROOT } from "../config.js";
+import { FFMPEG_PATH, REPO_ROOT, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { renderProjectAssets } from "./renderer.js";
 
 type ExportRequest = {
   presetId?: string;
   includeSlug?: boolean;
+  includeSlugStart?: boolean;
+  includeSlugEnd?: boolean;
   speed?: 1 | 2;
 };
 
@@ -25,7 +27,8 @@ type ExportManifest = {
   exportId: string;
   presetId: string;
   speed: 1 | 2;
-  includeSlug: boolean;
+  includeSlugStart: boolean;
+  includeSlugEnd: boolean;
   source: string;
   overlayInputs: string[];
   arrowInputs: string[];
@@ -58,7 +61,20 @@ type OverlayInput = {
   filePath: string;
 };
 
+type TimelineTransition = {
+  type: "cut" | "crossfade";
+  durationFrames: number;
+};
+
+type TimelineSegment = {
+  startFrame: number;
+  endFrame: number;
+  durationFrames: number;
+  outputStartFrame: number;
+};
+
 const DEFAULT_VIDEO_WIDTH = 1920;
+const DEFAULT_CROSSFADE_FRAMES = 12;
 
 function sortOverlays(overlays: Overlay[]): Overlay[] {
   return [...overlays].sort((a, b) => {
@@ -296,14 +312,16 @@ function buildOverlayInputLine(
 function buildFilterScript(
   project: Project,
   overlays: Overlay[],
-  speed: 1 | 2
+  speed: 1 | 2,
+  baseLabel: string,
+  preLines: string[]
 ): FilterResult {
   const fps = project.video.fpsNum / project.video.fpsDen;
   const videoWidth = project.video.width || DEFAULT_VIDEO_WIDTH;
-  const lines: string[] = [];
+  const lines: string[] = [...preLines];
   const speedExpr = speed === 2 ? "0.5*PTS" : "PTS-STARTPTS";
 
-  lines.push(`[0:v]setpts=${speedExpr}[v0]`);
+  lines.push(`${baseLabel}setpts=${speedExpr}[v0]`);
 
   let prevLabel = "[v0]";
 
@@ -323,7 +341,7 @@ function buildFilterScript(
       xExpr
     )}':y='${escapeFilterExpr(yExpr)}':enable='${escapeFilterExpr(
       enableExpr
-    )}'[v${inputIndex}]`;
+    )}':shortest=1[v${inputIndex}]`;
 
     lines.push(overlayLine);
     prevLabel = `[v${inputIndex}]`;
@@ -332,6 +350,238 @@ function buildFilterScript(
   return {
     script: lines.join(";\n"),
     outputLabel: prevLabel,
+  };
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeTransition(input?: {
+  type?: "cut" | "crossfade";
+  durationFrames?: number;
+}): TimelineTransition {
+  if (input?.type === "crossfade") {
+    return {
+      type: "crossfade",
+      durationFrames: Math.max(0, Math.floor(input.durationFrames ?? DEFAULT_CROSSFADE_FRAMES)),
+    };
+  }
+  return { type: "cut", durationFrames: 0 };
+}
+
+function buildTimelinePlan(project: Project): {
+  project: Project;
+  baseLabel: string;
+  baseLines: string[];
+  outputFrames: number;
+} {
+  const fps = project.video.fpsNum / project.video.fpsDen;
+  const totalFrames = Math.max(
+    1,
+    Math.floor((project.video.durationMs / 1000) * fps)
+  );
+  const trimStart = clampNumber(project.edits?.trimStartFrames ?? 0, 0, totalFrames - 1);
+  const trimEnd = clampNumber(
+    project.edits?.trimEndFrames ?? 0,
+    0,
+    totalFrames - 1 - trimStart
+  );
+  const hasCuts = (project.edits?.cuts?.length ?? 0) > 0;
+  const hasTrim = trimStart > 0 || trimEnd > 0;
+
+  if (!hasCuts && !hasTrim) {
+    return { project, baseLabel: "[0:v]", baseLines: [], outputFrames: totalFrames };
+  }
+
+  const keepStart = trimStart;
+  const keepEnd = totalFrames - trimEnd;
+  if (keepEnd <= keepStart) {
+    throw new Error("Trim removes entire video");
+  }
+
+  const cuts = (project.edits?.cuts ?? [])
+    .map((cut) => {
+      const start = clampNumber(cut.startFrame, keepStart, keepEnd - 1);
+      const endExclusive = clampNumber(cut.endFrame + 1, keepStart, keepEnd);
+      return {
+        ...cut,
+        startFrame: start,
+        endFrame: Math.max(start, endExclusive),
+        transition: normalizeTransition(cut.transition),
+      };
+    })
+    .filter((cut) => cut.endFrame > cut.startFrame)
+    .sort((a, b) => a.startFrame - b.startFrame);
+
+  const segments: TimelineSegment[] = [];
+  const transitions: TimelineTransition[] = [];
+  let cursor = keepStart;
+  let pendingTransition: TimelineTransition | null = null;
+
+  for (const cut of cuts) {
+    if (cut.endFrame <= cursor) continue;
+    const cutStart = Math.max(cut.startFrame, keepStart);
+    const cutEnd = Math.min(cut.endFrame, keepEnd);
+    if (cutStart > cursor) {
+      segments.push({
+        startFrame: cursor,
+        endFrame: cutStart,
+        durationFrames: cutStart - cursor,
+        outputStartFrame: 0,
+      });
+      if (pendingTransition) {
+        transitions.push(pendingTransition);
+        pendingTransition = null;
+      }
+    }
+    cursor = Math.max(cursor, cutEnd);
+    if (cursor < keepEnd) {
+      pendingTransition = normalizeTransition(cut.transition);
+    }
+  }
+
+  if (cursor < keepEnd) {
+    segments.push({
+      startFrame: cursor,
+      endFrame: keepEnd,
+      durationFrames: keepEnd - cursor,
+      outputStartFrame: 0,
+    });
+    if (pendingTransition) {
+      transitions.push(pendingTransition);
+    }
+  }
+
+  if (!segments.length) {
+    throw new Error("No video segments remain after trims/cuts");
+  }
+
+  while (transitions.length < segments.length - 1) {
+    transitions.push({ type: "cut", durationFrames: 0 });
+  }
+
+  const normalizedTransitions = transitions.map((transition, index) => {
+    if (transition.type !== "crossfade") return transition;
+    const maxDuration = Math.min(
+      transition.durationFrames,
+      segments[index].durationFrames,
+      segments[index + 1]?.durationFrames ?? transition.durationFrames
+    );
+    if (maxDuration <= 0) return { type: "cut", durationFrames: 0 };
+    return { type: "crossfade", durationFrames: maxDuration };
+  });
+
+  let outputCursor = 0;
+  segments.forEach((segment, index) => {
+    segment.outputStartFrame = outputCursor;
+    outputCursor += segment.durationFrames;
+    const transition = normalizedTransitions[index];
+    if (transition?.type === "crossfade") {
+      outputCursor -= transition.durationFrames;
+    }
+  });
+
+  const mapFrame = (frame: number) => {
+    for (const segment of segments) {
+      if (frame >= segment.startFrame && frame < segment.endFrame) {
+        return {
+          outputFrame: segment.outputStartFrame + (frame - segment.startFrame),
+          segment,
+        };
+      }
+    }
+    return null;
+  };
+
+  const adjustedOverlays: Overlay[] = [];
+  for (const overlay of project.overlays) {
+    const start = mapFrame(overlay.startFrame);
+    if (!start) continue;
+    const segment = start.segment;
+    const segmentEndOutput = segment.outputStartFrame + segment.durationFrames;
+    const mappedEnd = mapFrame(overlay.endFrame);
+    const nextEnd = mappedEnd
+      ? Math.min(mappedEnd.outputFrame, segmentEndOutput)
+      : segmentEndOutput;
+
+    if (nextEnd <= start.outputFrame) continue;
+    const nextOverlay: Overlay = {
+      ...overlay,
+      startFrame: Math.floor(start.outputFrame),
+      endFrame: Math.floor(nextEnd),
+    };
+
+    if (overlay.motion) {
+      const motion = { ...overlay.motion };
+      if (typeof motion.visibleStartFrame === "number") {
+        const visStart = mapFrame(motion.visibleStartFrame);
+        motion.visibleStartFrame = visStart
+          ? Math.floor(visStart.outputFrame)
+          : nextOverlay.startFrame;
+      }
+      if (typeof motion.visibleEndFrame === "number") {
+        const visEnd = mapFrame(motion.visibleEndFrame);
+        motion.visibleEndFrame = visEnd
+          ? Math.min(Math.floor(visEnd.outputFrame), nextOverlay.endFrame)
+          : nextOverlay.endFrame;
+      }
+      if (!isArrowOverlay(overlay) && typeof motion.displayFrames === "number") {
+        const slideIn = motion.slideInFrames ?? 0;
+        const slideOut = motion.slideOutFrames ?? 0;
+        const available = Math.max(
+          0,
+          segment.endFrame - overlay.startFrame - slideIn - slideOut
+        );
+        motion.displayFrames = Math.min(motion.displayFrames, available);
+      }
+      nextOverlay.motion = motion;
+    }
+    adjustedOverlays.push(nextOverlay);
+  }
+
+  const baseLines: string[] = [];
+  segments.forEach((segment, index) => {
+    const startSec = segment.startFrame / fps;
+    const endSec = segment.endFrame / fps;
+    baseLines.push(
+      `[0:v]trim=start=${formatNumber(startSec)}:end=${formatNumber(
+        endSec
+      )},setpts=PTS-STARTPTS,fps=${formatNumber(fps)}[s${index}]`
+    );
+  });
+
+  let currentLabel = "[s0]";
+  let currentDurationFrames = segments[0].durationFrames;
+
+  segments.slice(1).forEach((segment, index) => {
+    const nextLabel = `[s${index + 1}]`;
+    const transition = normalizedTransitions[index] ?? { type: "cut", durationFrames: 0 };
+    if (transition.type === "crossfade" && transition.durationFrames > 0) {
+      const durationFrames = transition.durationFrames;
+      const offsetFrames = Math.max(0, currentDurationFrames - durationFrames);
+      const outLabel = `[x${index + 1}]`;
+      baseLines.push(
+        `${currentLabel}${nextLabel}xfade=transition=fade:duration=${formatNumber(
+          durationFrames / fps
+        )}:offset=${formatNumber(offsetFrames / fps)}${outLabel}`
+      );
+      currentDurationFrames =
+        currentDurationFrames + segment.durationFrames - durationFrames;
+      currentLabel = outLabel;
+      return;
+    }
+    const outLabel = `[c${index + 1}]`;
+    baseLines.push(`${currentLabel}${nextLabel}concat=n=2:v=1:a=0${outLabel}`);
+    currentDurationFrames += segment.durationFrames;
+    currentLabel = outLabel;
+  });
+
+  return {
+    project: { ...project, overlays: adjustedOverlays },
+    baseLabel: currentLabel,
+    baseLines,
+    outputFrames: Math.max(1, currentDurationFrames),
   };
 }
 
@@ -386,9 +636,10 @@ function buildReadme(
     ].join("\n");
   }
 
-  const slugNote = manifest.includeSlug
-    ? "\nInclude slug: true (two-pass concat). Use slug paths from project.json."
-    : "";
+  const slugNote =
+    manifest.includeSlugStart || manifest.includeSlugEnd
+      ? `\nInclude slug start: ${manifest.includeSlugStart} · Include slug end: ${manifest.includeSlugEnd} (concat step). Use slug paths from project.json.`
+      : "";
 
   const lines: string[] = [
     "# Export Instructions",
@@ -441,7 +692,7 @@ async function runFfmpeg(
       const text = chunk.toString();
       stderr += text;
       buffer += text;
-      const lines = buffer.split("\n");
+      const lines = buffer.split(/\r?\n|\r/g);
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
@@ -469,24 +720,48 @@ async function runFfmpeg(
   });
 }
 
-function resolveProjectPath(projectRoot: string, inputPath?: string): string | null {
+async function resolveSlugPath(projectRoot: string, inputPath?: string): Promise<string | null> {
   if (!inputPath) return null;
-  return path.isAbsolute(inputPath) ? inputPath : path.join(projectRoot, inputPath);
+  if (path.isAbsolute(inputPath)) return inputPath;
+  const projectCandidate = path.join(projectRoot, inputPath);
+  if (await fileExists(projectCandidate)) return projectCandidate;
+  const repoCandidate = path.join(REPO_ROOT, inputPath);
+  if (await fileExists(repoCandidate)) return repoCandidate;
+  return null;
 }
 
 export async function writeExportBundle(
   project: Project,
   options: ExportRequest = {}
-): Promise<{ exportDir: string; exportId: string; manifest: ExportManifest }> {
+): Promise<{
+  exportDir: string;
+  exportId: string;
+  manifest: ExportManifest;
+  outputFrames: number;
+  projectForRender: Project;
+}> {
+  const timelinePlan = buildTimelinePlan(project);
+  const projectForRender = timelinePlan.project;
   const exportId = new Date().toISOString().replace(/[:.]/g, "-");
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const exportDir = path.join(projectRoot, "exports", exportId);
   const speed = options.speed ?? project.exportOptions?.speed ?? 1;
-  const includeSlug = options.includeSlug ?? project.exportOptions?.includeSlug ?? false;
+  const includeSlug =
+    typeof options.includeSlug === "boolean"
+      ? options.includeSlug
+      : project.exportOptions?.includeSlug ?? false;
+  const includeSlugStart =
+    typeof options.includeSlugStart === "boolean"
+      ? options.includeSlugStart
+      : includeSlug || project.exportOptions?.includeSlugStart || false;
+  const includeSlugEnd =
+    typeof options.includeSlugEnd === "boolean"
+      ? options.includeSlugEnd
+      : includeSlug || project.exportOptions?.includeSlugEnd || false;
   const presetId = options.presetId ?? project.lastExportPresetId ?? DEFAULT_PRESET_ID;
 
-  const cards = sortOverlays(project.overlays.filter((overlay) => !isArrowOverlay(overlay)));
-  const arrows = sortOverlays(project.overlays.filter(isArrowOverlay));
+  const cards = sortOverlays(projectForRender.overlays.filter((overlay) => !isArrowOverlay(overlay)));
+  const arrows = sortOverlays(projectForRender.overlays.filter(isArrowOverlay));
 
   const cardInputs: OverlayInput[] = cards.map((overlay) => ({
     overlay,
@@ -500,8 +775,20 @@ export async function writeExportBundle(
     filePath: path.join(projectRoot, "render", "arrows", `${overlay.id}.png`),
   }));
 
-  const cardsScript = buildFilterScript(project, cards, speed);
-  const cardsArrowsScript = buildFilterScript(project, [...cards, ...arrows], speed);
+  const cardsScript = buildFilterScript(
+    projectForRender,
+    cards,
+    speed,
+    timelinePlan.baseLabel,
+    timelinePlan.baseLines
+  );
+  const cardsArrowsScript = buildFilterScript(
+    projectForRender,
+    [...cards, ...arrows],
+    speed,
+    timelinePlan.baseLabel,
+    timelinePlan.baseLines
+  );
 
   await ensureDir(exportDir);
 
@@ -519,7 +806,8 @@ export async function writeExportBundle(
     exportId,
     presetId,
     speed,
-    includeSlug,
+    includeSlugStart,
+    includeSlugEnd,
     source: sourcePath,
     overlayInputs: cardInputs.map((input) => input.filePath),
     arrowInputs: arrowInputs.map((input) => input.filePath),
@@ -538,7 +826,13 @@ export async function writeExportBundle(
     "utf-8"
   );
 
-  return { exportDir, exportId, manifest };
+  return {
+    exportDir,
+    exportId,
+    manifest,
+    outputFrames: timelinePlan.outputFrames,
+    projectForRender,
+  };
 }
 
 export async function renderFinal(
@@ -551,10 +845,11 @@ export async function renderFinal(
   finalPath: string;
   manifest: ExportManifest;
 }> {
-  onProgress?.({ stage: "assets", message: "Rendering overlay assets" });
-  await renderProjectAssets(project);
+  const { exportDir, exportId, manifest, outputFrames, projectForRender } =
+    await writeExportBundle(project, options);
 
-  const { exportDir, exportId, manifest } = await writeExportBundle(project, options);
+  onProgress?.({ stage: "assets", message: "Rendering overlay assets" });
+  await renderProjectAssets(projectForRender);
   const preset = EXPORT_PRESETS[manifest.presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
 
   const missingInputs = [];
@@ -588,39 +883,54 @@ export async function renderFinal(
     "-c:v",
     preset.codec,
     ...preset.args,
+    "-shortest",
     "-pix_fmt",
     "yuv420p",
     mainOutputPath
   );
 
-  const durationSec = (project.video.durationMs / 1000) / (options.speed ?? 1);
+  const fps = project.video.fpsNum / project.video.fpsDen;
+  const durationSec = outputFrames / fps / (options.speed ?? 1);
   await runFfmpeg(args, exportDir, onProgress, durationSec, "ffmpeg-main");
 
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const finalPath = path.join(exportDir, "final.mp4");
 
-  if (manifest.includeSlug) {
-    const introPath = resolveProjectPath(projectRoot, project.slug?.introPath);
-    const outroPath = resolveProjectPath(projectRoot, project.slug?.outroPath);
-    if (!introPath || !outroPath) {
-      throw new Error("Slug intro/outro paths are required for includeSlug");
+  if (manifest.includeSlugStart || manifest.includeSlugEnd) {
+    const introPath = manifest.includeSlugStart
+      ? await resolveSlugPath(projectRoot, project.slug?.introPath)
+      : null;
+    const outroPath = manifest.includeSlugEnd
+      ? await resolveSlugPath(projectRoot, project.slug?.outroPath)
+      : null;
+    if (manifest.includeSlugStart && !introPath) {
+      throw new Error("Slug intro path is required for includeSlugStart");
     }
+    if (manifest.includeSlugEnd && !outroPath) {
+      throw new Error("Slug outro path is required for includeSlugEnd");
+    }
+
     const slugFps = project.slug?.fps ?? project.video.fpsNum / project.video.fpsDen;
-    const concatFilter = [
-      `[0:v]fps=${slugFps},setsar=1[v0]`,
-      `[1:v]fps=${slugFps},setsar=1[v1]`,
-      `[2:v]fps=${slugFps},setsar=1[v2]`,
-      "[v0][v1][v2]concat=n=3:v=1:a=0[v]",
-    ].join(";");
+    const inputs: string[] = [];
+    if (introPath) {
+      inputs.push(introPath);
+    }
+    inputs.push(mainOutputPath);
+    if (outroPath) {
+      inputs.push(outroPath);
+    }
+
+    const concatFilter = inputs
+      .map((_, index) => `[${index}:v]fps=${slugFps},setsar=1[v${index}]`)
+      .join(";")
+      .concat(
+        `;${inputs.map((_, index) => `[v${index}]`).join("")}concat=n=${inputs.length}:v=1:a=0[v]`
+      );
+
     const finalWithSlug = path.join(exportDir, "final_with_slug.mp4");
     const concatArgs = [
       "-y",
-      "-i",
-      introPath,
-      "-i",
-      mainOutputPath,
-      "-i",
-      outroPath,
+      ...inputs.flatMap((input) => ["-i", input]),
       "-filter_complex",
       concatFilter,
       "-map",
