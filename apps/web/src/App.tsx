@@ -35,6 +35,13 @@ const SLUG_OPTIONS = [
   },
 ];
 
+const DEFAULT_PRESET_ID = "balanced";
+const DEFAULT_CROSSFADE_FRAMES = 12;
+const RENDER_PRESET_OPTIONS = [
+  { id: "balanced", label: "Balanced (CPU)" },
+  { id: "quality", label: "High quality (CPU)" },
+];
+
 const FALLBACK_TEMPLATES = [
   { id: "card-lower-third-left", label: "Lower Third Left" },
   { id: "card-lower-third-right", label: "Lower Third Right" },
@@ -234,6 +241,7 @@ export default function App() {
     speed: 1 as 1 | 2,
     includeSlugStart: false,
     includeSlugEnd: false,
+    presetId: DEFAULT_PRESET_ID,
   });
   const [renderProgress, setRenderProgress] = useState<number | null>(null);
   const [renderLogs, setRenderLogs] = useState<string[]>([]);
@@ -252,6 +260,8 @@ export default function App() {
   const [editorCenterHeight, setEditorCenterHeight] = useState<number | null>(null);
   const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
+  const currentFrameRef = useRef(0);
+  const totalFramesRef = useRef(0);
   const historyRef = useRef<{ past: HistoryEntry[]; future: HistoryEntry[] }>({
     past: [],
     future: [],
@@ -290,6 +300,10 @@ export default function App() {
   const selectedSlugPath = project?.slug?.introPath ?? project?.slug?.outroPath ?? "";
   const selectedSlugOption =
     SLUG_OPTIONS.find((option) => option.path === selectedSlugPath) ?? null;
+  const slugTransition = project?.slug?.transition ?? {
+    type: "cut" as const,
+    durationFrames: 0,
+  };
   const edits = project?.edits ?? { trimStartFrames: 0, trimEndFrames: 0, cuts: [] };
   const trimRange = useMemo(() => {
     const start = edits.trimStartFrames ?? 0;
@@ -415,6 +429,7 @@ export default function App() {
       speed: project.exportOptions?.speed ?? prev.speed,
       includeSlugStart,
       includeSlugEnd,
+      presetId: project.lastExportPresetId ?? DEFAULT_PRESET_ID,
     }));
   }, [project?.id]);
 
@@ -423,6 +438,14 @@ export default function App() {
     setTrimStartTime(formatTimecode(trimRange.start, fps));
     setTrimEndTime(formatTimecode(trimRange.end, fps));
   }, [project?.id, trimRange.start, trimRange.end, fps]);
+
+  useEffect(() => {
+    currentFrameRef.current = currentFrame;
+  }, [currentFrame]);
+
+  useEffect(() => {
+    totalFramesRef.current = totalFrames;
+  }, [totalFrames]);
 
   useEffect(() => {
     if (!templateLibrary.length) return;
@@ -506,12 +529,12 @@ export default function App() {
     }
   }, [currentFrame, fps]);
 
-  function seekToFrame(frame: number, pause = true) {
+  const seekToFrame = useCallback((frame: number, pause = true) => {
     if (pause) {
       seekPauseRef.current = true;
     }
     setCurrentFrame(frame);
-  }
+  }, []);
 
   async function handleCreate() {
     if (!nameInput.trim()) return;
@@ -686,7 +709,15 @@ export default function App() {
     updateProjectState(
       {
         ...project,
-        slug: { introPath: slugOption.path, outroPath: slugOption.path, fps: slugOption.fps },
+        slug: {
+          introPath: slugOption.path,
+          outroPath: slugOption.path,
+          fps: slugOption.fps,
+          transition: project.slug?.transition ?? {
+            type: "cut",
+            durationFrames: 0,
+          },
+        },
       },
       undefined,
       { pushHistory: false }
@@ -704,6 +735,24 @@ export default function App() {
       includeSlugEnd,
       includeSlug: includeSlugStart && includeSlugEnd,
     });
+  }
+
+  function updateSlugTransition(
+    patch: Partial<{ type: "cut" | "crossfade"; durationFrames: number }>
+  ) {
+    if (!project?.slug) return;
+    const nextTransition = { ...project.slug.transition, ...patch };
+    updateProjectState(
+      {
+        ...project,
+        slug: {
+          ...project.slug,
+          transition: nextTransition,
+        },
+      },
+      undefined,
+      { pushHistory: false }
+    );
   }
 
   const undo = useCallback(() => {
@@ -832,6 +881,19 @@ export default function App() {
         return;
       }
 
+      if (isModifier && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+        if (isEditableTarget(event.target)) return;
+        event.preventDefault();
+        const delta = event.key === "ArrowLeft" ? -15 : 15;
+        const total = Math.max(1, totalFramesRef.current || totalFrames);
+        const nextFrame = Math.max(
+          0,
+          Math.min(total - 1, currentFrameRef.current + delta)
+        );
+        seekToFrame(nextFrame);
+        return;
+      }
+
       if (event.key === "Escape") {
         if (showHotkeys) {
           event.preventDefault();
@@ -867,7 +929,7 @@ export default function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedOverlayId, removeOverlay, undo, redo, showHotkeys]);
+  }, [selectedOverlayId, removeOverlay, undo, redo, showHotkeys, seekToFrame, totalFrames]);
 
   function createCardOverlay(templateId: string, x?: number, y?: number) {
     if (!project) return;
@@ -1292,6 +1354,9 @@ export default function App() {
           <div className="subtitle">
             Editing workspace · {project ? project.name : "Select a project"} · Frame {currentFrame}
           </div>
+        </div>
+        <div className="topbar-actions">
+          <div className="hotkey-tip">Tip: Ctrl + / for hotkeys</div>
         </div>
       </header>
 
@@ -2092,6 +2157,31 @@ export default function App() {
         </div>
         <div className="render-settings-grid">
           <div className="render-setting">
+            <label htmlFor="preset">Quality</label>
+            <select
+              id="preset"
+              value={renderOptions.presetId ?? DEFAULT_PRESET_ID}
+              disabled={!project}
+              onChange={(event) => {
+                const nextPresetId = event.target.value;
+                setRenderOptions((prev) => ({ ...prev, presetId: nextPresetId }));
+                if (project) {
+                  updateProjectState(
+                    { ...project, lastExportPresetId: nextPresetId },
+                    undefined,
+                    { pushHistory: false }
+                  );
+                }
+              }}
+            >
+              {RENDER_PRESET_OPTIONS.map((preset) => (
+                <option key={preset.id} value={preset.id}>
+                  {preset.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="render-setting">
             <label htmlFor="speed">Speed</label>
             <select
               id="speed"
@@ -2149,6 +2239,38 @@ export default function App() {
                 End
               </label>
             </div>
+          </div>
+          <div className="render-setting">
+            <label>Slug transition</label>
+            <select
+              value={slugTransition.type}
+              disabled={!selectedSlugOption || !project}
+              onChange={(event) => {
+                const nextType = event.target.value as "cut" | "crossfade";
+                updateSlugTransition({
+                  type: nextType,
+                  durationFrames:
+                    nextType === "crossfade"
+                      ? slugTransition.durationFrames || DEFAULT_CROSSFADE_FRAMES
+                      : 0,
+                });
+              }}
+            >
+              <option value="cut">Hard cut</option>
+              <option value="crossfade">Crossfade</option>
+            </select>
+            <input
+              type="number"
+              min={0}
+              value={slugTransition.durationFrames}
+              disabled={!selectedSlugOption || !project || slugTransition.type !== "crossfade"}
+              onChange={(event) =>
+                updateSlugTransition({
+                  type: "crossfade",
+                  durationFrames: Number(event.target.value),
+                })
+              }
+            />
           </div>
         </div>
         <div className="render-divider" />
@@ -2331,6 +2453,10 @@ export default function App() {
             <div className="hotkey-row">
               <span className="keys">Ctrl + /</span>
               <span>Toggle hotkeys</span>
+            </div>
+            <div className="hotkey-row">
+              <span className="keys">Ctrl + Left/Right</span>
+              <span>Step 15 frames</span>
             </div>
             <div className="hotkey-row">
               <span className="keys">Esc</span>

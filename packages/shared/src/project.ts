@@ -83,11 +83,19 @@ export const RenderCacheSchema = z.object({
   templatesVersion: z.string().optional(),
 });
 
+const TransitionSchema = z
+  .object({
+    type: z.enum(["cut", "crossfade"]).default("cut"),
+    durationFrames: z.number().int().nonnegative().default(0),
+  })
+  .optional();
+
 export const SlugSchema = z
   .object({
     introPath: z.string().optional(),
     outroPath: z.string().optional(),
     fps: z.number().positive().optional(),
+    transition: TransitionSchema,
   })
   .optional();
 
@@ -97,13 +105,6 @@ export const ExportOptionsSchema = z
     includeSlug: z.boolean().default(false),
     includeSlugStart: z.boolean().default(false),
     includeSlugEnd: z.boolean().default(false),
-  })
-  .optional();
-
-const TransitionSchema = z
-  .object({
-    type: z.enum(["cut", "crossfade"]).default("cut"),
-    durationFrames: z.number().int().nonnegative().default(0),
   })
   .optional();
 

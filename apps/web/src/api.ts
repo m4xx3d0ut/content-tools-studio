@@ -104,6 +104,7 @@ export type Project = ProjectSummary & {
     includeSlugStart?: boolean;
     includeSlugEnd?: boolean;
   };
+  lastExportPresetId?: string;
   edits?: {
     trimStartFrames?: number;
     trimEndFrames?: number;
@@ -114,7 +115,12 @@ export type Project = ProjectSummary & {
       transition?: { type?: "cut" | "crossfade"; durationFrames?: number };
     }>;
   };
-  slug?: { introPath?: string; outroPath?: string; fps?: number };
+  slug?: {
+    introPath?: string;
+    outroPath?: string;
+    fps?: number;
+    transition?: { type?: "cut" | "crossfade"; durationFrames?: number };
+  };
 };
 
 export async function listProjects(): Promise<ProjectSummary[]> {

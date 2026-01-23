@@ -6,6 +6,7 @@ import { DEFAULT_PRESET_ID, EXPORT_PRESETS } from "@content-tools/shared";
 import { FFMPEG_PATH, REPO_ROOT, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { renderProjectAssets } from "./renderer.js";
+import { probeVideo } from "./ffprobe.js";
 import { getTemplateById } from "./templates.js";
 
 type ExportRequest = {
@@ -938,17 +939,69 @@ export async function renderFinal(
       inputs.push(outroPath);
     }
 
-    const concatFilter = inputs
+    const slugTransition = normalizeTransition(project.slug?.transition);
+    const useCrossfade =
+      slugTransition.type === "crossfade" &&
+      slugTransition.durationFrames > 0 &&
+      inputs.length > 1;
+    const baseFilter = inputs
       .map(
         (_, index) =>
           `[${index}:v]fps=${formatNumber(
             slugFps
           )},scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${index}]`
       )
-      .join(";")
-      .concat(
+      .join(";");
+
+    let concatFilter = "";
+    let outputLabel = "[v]";
+    if (useCrossfade) {
+      const durationsSec: number[] = [];
+      if (introPath) {
+        const introInfo = await probeVideo(introPath);
+        durationsSec.push(introInfo.durationMs / 1000);
+      }
+      durationsSec.push(durationSec);
+      if (outroPath) {
+        const outroInfo = await probeVideo(outroPath);
+        durationsSec.push(outroInfo.durationMs / 1000);
+      }
+
+      const transitionSec = slugTransition.durationFrames / fps;
+      let currentLabel = "[v0]";
+      let currentDuration = durationsSec[0] ?? 0;
+      const chain: string[] = [];
+
+      inputs.slice(1).forEach((_, index) => {
+        const nextLabel = `[v${index + 1}]`;
+        const nextDuration = durationsSec[index + 1] ?? 0;
+        const safeDuration = Math.min(transitionSec, currentDuration, nextDuration);
+        if (safeDuration > 0) {
+          const offset = Math.max(0, currentDuration - safeDuration);
+          const outLabel = `[x${index + 1}]`;
+          chain.push(
+            `${currentLabel}${nextLabel}xfade=transition=fade:duration=${formatNumber(
+              safeDuration
+            )}:offset=${formatNumber(offset)}${outLabel}`
+          );
+          currentDuration = currentDuration + nextDuration - safeDuration;
+          currentLabel = outLabel;
+          return;
+        }
+        const outLabel = `[c${index + 1}]`;
+        chain.push(`${currentLabel}${nextLabel}concat=n=2:v=1:a=0${outLabel}`);
+        currentDuration += nextDuration;
+        currentLabel = outLabel;
+      });
+
+      concatFilter = `${baseFilter};${chain.join(";")}`;
+      outputLabel = currentLabel;
+    } else {
+      concatFilter = baseFilter.concat(
         `;${inputs.map((_, index) => `[v${index}]`).join("")}concat=n=${inputs.length}:v=1:a=0[v]`
       );
+      outputLabel = "[v]";
+    }
 
     const finalWithSlug = path.join(exportDir, "final_with_slug.mp4");
     const concatArgs = [
@@ -957,7 +1010,7 @@ export async function renderFinal(
       "-filter_complex",
       concatFilter,
       "-map",
-      "[v]",
+      outputLabel,
       "-c:v",
       preset.codec,
       ...preset.args,
