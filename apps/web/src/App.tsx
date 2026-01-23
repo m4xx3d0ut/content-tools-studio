@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import type { DragEvent } from "react";
+import type { DragEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { Group as KonvaGroup } from "konva/lib/Group";
 import type { Transformer as KonvaTransformer } from "konva/lib/shapes/Transformer";
 import { Arrow, Group, Image as KonvaImage, Layer, Rect, Stage, Text, Transformer } from "react-konva";
@@ -57,6 +57,32 @@ const FALLBACK_TEMPLATES = [
 
 function isArrow(overlay: Overlay) {
   return overlay.templateId.startsWith("arrow");
+}
+
+function getOverlayVisibleRange(overlay: Overlay) {
+  const motion = overlay.motion ?? {};
+  const startFrame = overlay.startFrame;
+  const slideInFrames = motion.slideInFrames ?? 0;
+  const slideOutFrames = motion.slideOutFrames ?? 0;
+  const displayFrames = motion.displayFrames;
+  let derivedEndFrame = overlay.endFrame;
+
+  if (!isArrow(overlay) && typeof displayFrames === "number") {
+    derivedEndFrame = startFrame + slideInFrames + displayFrames + slideOutFrames;
+  }
+
+  const visibleStartFrame = motion.visibleStartFrame ?? startFrame;
+  const visibleEndFrame = motion.visibleEndFrame ?? derivedEndFrame;
+  return {
+    start: formatFrame(visibleStartFrame),
+    end: formatFrame(visibleEndFrame),
+  };
+}
+
+function isOverlayVisibleAtFrame(overlay: Overlay, frame: number) {
+  const range = getOverlayVisibleRange(overlay);
+  if (range.end < range.start) return false;
+  return frame >= range.start && frame <= range.end;
 }
 
 function getFps(project: Project | null) {
@@ -786,9 +812,39 @@ export default function App() {
   function updateOverlay(id: string, patch: Partial<Overlay>) {
     if (!project) return;
     const overlays = project.overlays.map((overlay: Overlay) =>
-      overlay.id === id ? { ...overlay, ...patch } : overlay
+      overlay.id === id ? syncArrowVisibility(overlay, patch) : overlay
     );
     updateProjectState({ ...project, overlays });
+  }
+
+  function syncArrowVisibility(overlay: Overlay, patch: Partial<Overlay>) {
+    const next = { ...overlay, ...patch };
+    if (!isArrow(overlay)) return next;
+    const motion = overlay.motion ?? {};
+    let nextMotion = motion;
+    let updated = false;
+
+    if (typeof patch.startFrame === "number") {
+      const shouldSync =
+        typeof motion.visibleStartFrame !== "number" ||
+        motion.visibleStartFrame === overlay.startFrame;
+      if (shouldSync) {
+        nextMotion = { ...nextMotion, visibleStartFrame: patch.startFrame };
+        updated = true;
+      }
+    }
+
+    if (typeof patch.endFrame === "number") {
+      const shouldSync =
+        typeof motion.visibleEndFrame !== "number" ||
+        motion.visibleEndFrame === overlay.endFrame;
+      if (shouldSync) {
+        nextMotion = { ...nextMotion, visibleEndFrame: patch.endFrame };
+        updated = true;
+      }
+    }
+
+    return updated ? { ...next, motion: nextMotion } : next;
   }
 
   function updateOverlayMotion(id: string, patch: Partial<Overlay["motion"]>) {
@@ -811,10 +867,6 @@ export default function App() {
     if (!overlay) return;
     const nextRotation = normalizeRotation((overlay.rotationDeg ?? 0) + delta);
     updateOverlay(id, { rotationDeg: nextRotation });
-  }
-
-  function isOverlayAnchoredAtFrame(overlay: Overlay, frame: number) {
-    return formatFrame(overlay.startFrame) === frame;
   }
 
   function selectOverlayById(id: string, seek = true) {
@@ -881,10 +933,10 @@ export default function App() {
         return;
       }
 
-      if (isModifier && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      if (event.key === "ArrowUp" || event.key === "ArrowDown") {
         if (isEditableTarget(event.target)) return;
         event.preventDefault();
-        const delta = event.key === "ArrowLeft" ? -15 : 15;
+        const delta = event.key === "ArrowUp" ? -15 : 15;
         const total = Math.max(1, totalFramesRef.current || totalFrames);
         const nextFrame = Math.max(
           0,
@@ -1161,6 +1213,20 @@ export default function App() {
       return;
     }
   }
+
+  const handlePreviewKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      if (isPlayingRef.current) return;
+      if (!hasMedia) return;
+      event.preventDefault();
+      const delta = event.key === "ArrowLeft" ? -1 : 1;
+      const total = Math.max(1, totalFrames);
+      const nextFrame = Math.max(0, Math.min(total - 1, currentFrame + delta));
+      seekToFrame(nextFrame);
+    },
+    [currentFrame, hasMedia, seekToFrame, totalFrames]
+  );
 
   function renderCardShape(overlay: Overlay) {
     const scaleX = stageMetrics.scaleX;
@@ -1514,6 +1580,9 @@ export default function App() {
             ref={videoWrapperRef}
             onDragOver={handleDragOver}
             onDrop={handleDrop}
+            onKeyDown={handlePreviewKeyDown}
+            onClick={(event) => event.currentTarget.focus()}
+            tabIndex={0}
           >
             {project && hasMedia ? (
               <>
@@ -1545,7 +1614,7 @@ export default function App() {
                   >
                     <Layer>
                       {project.overlays
-                        .filter((overlay: Overlay) => isOverlayAnchoredAtFrame(overlay, currentFrame))
+                        .filter((overlay: Overlay) => isOverlayVisibleAtFrame(overlay, currentFrame))
                         .map((overlay: Overlay) =>
                           isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
                         )}
@@ -2075,9 +2144,10 @@ export default function App() {
                 {project.overlays
                   .filter((overlay) => !isArrow(overlay))
                   .map((overlay) => {
-                      const left = (overlay.startFrame / totalFrames) * 100;
-                      const width =
-                        ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
+                      const range = getOverlayVisibleRange(overlay);
+                      const left = (range.start / totalFrames) * 100;
+                      const spanFrames = Math.max(1, range.end - range.start + 1);
+                      const width = (spanFrames / totalFrames) * 100;
                       return (
                         <div
                           key={overlay.id}
@@ -2101,14 +2171,15 @@ export default function App() {
                 {project.overlays
                   .filter((overlay) => isArrow(overlay))
                   .map((overlay) => {
-                      const left = (overlay.startFrame / totalFrames) * 100;
-                      const width =
-                        ((overlay.endFrame - overlay.startFrame) / totalFrames) * 100;
+                      const range = getOverlayVisibleRange(overlay);
+                      const left = (range.start / totalFrames) * 100;
+                      const spanFrames = Math.max(1, range.end - range.start + 1);
+                      const width = (spanFrames / totalFrames) * 100;
                       return (
                         <div
                           key={overlay.id}
                           className="track-clip arrow"
-                          style={{ left: `${left}%`, width: `${Math.max(2, width)}%` }}
+                          style={{ left: `${left}%`, width: `${width}%` }}
                           onClick={() => selectOverlayById(overlay.id)}
                         >
                           Arrow
@@ -2455,7 +2526,11 @@ export default function App() {
               <span>Toggle hotkeys</span>
             </div>
             <div className="hotkey-row">
-              <span className="keys">Ctrl + Left/Right</span>
+              <span className="keys">Left/Right</span>
+              <span>Step 1 frame (preview focus)</span>
+            </div>
+            <div className="hotkey-row">
+              <span className="keys">Up/Down</span>
               <span>Step 15 frames</span>
             </div>
             <div className="hotkey-row">
