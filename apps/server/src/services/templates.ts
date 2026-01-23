@@ -108,6 +108,7 @@ const TEMPLATES: TemplateDefinition[] = [
     filePath: path.join(TEMPLATE_ROOT, "card-title-top-1920x1080.png"),
     align: "center",
     title: CENTER_TITLE,
+    subtitle: CENTER_SUBTITLE,
   },
   {
     id: "card-callout-right",

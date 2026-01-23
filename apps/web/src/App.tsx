@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import type { DragEvent } from "react";
 import type { Group as KonvaGroup } from "konva/lib/Group";
 import type { Transformer as KonvaTransformer } from "konva/lib/shapes/Transformer";
@@ -249,6 +249,7 @@ export default function App() {
   const [showHotkeys, setShowHotkeys] = useState(false);
   const [trimStartTime, setTrimStartTime] = useState("00:00:00.000");
   const [trimEndTime, setTrimEndTime] = useState("00:00:00.000");
+  const [editorCenterHeight, setEditorCenterHeight] = useState<number | null>(null);
   const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
   const historyRef = useRef<{ past: HistoryEntry[]; future: HistoryEntry[] }>({
@@ -260,12 +261,17 @@ export default function App() {
   const overlayRefs = useRef<Record<string, KonvaGroup>>({});
   const transformerRef = useRef<KonvaTransformer | null>(null);
   const videoWrapperRef = useRef<HTMLDivElement | null>(null);
+  const editorCenterRef = useRef<HTMLElement | null>(null);
   const [stageMetrics, setStageMetrics] = useState<StageMetrics>({
     width: 0,
     height: 0,
     scaleX: 1,
     scaleY: 1,
   });
+
+  const editorGridStyle: CSSProperties | undefined = editorCenterHeight
+    ? ({ "--editor-center-height": `${editorCenterHeight}px` } as CSSProperties)
+    : undefined;
 
   const fps = useMemo(() => getFps(project), [project]);
   const hasMedia = useMemo(() => {
@@ -461,6 +467,22 @@ export default function App() {
     observer.observe(element);
     return () => observer.disconnect();
   }, [project]);
+
+  useLayoutEffect(() => {
+    const element = editorCenterRef.current;
+    if (!element) return;
+
+    const update = () => {
+      const nextHeight = Math.round(element.getBoundingClientRect().height);
+      if (!nextHeight) return;
+      setEditorCenterHeight((prev) => (prev === nextHeight ? prev : nextHeight));
+    };
+
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!transformerRef.current) return;
@@ -1272,7 +1294,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className="editor-grid">
+      <div className="editor-grid" style={editorGridStyle}>
         <aside className="sidebar left">
           <div className="tabs">
             {(["media", "overlays", "exports"] as const).map((tab) => (
@@ -1420,7 +1442,7 @@ export default function App() {
           )}
         </aside>
 
-        <section className="editor-center">
+        <section className="editor-center" ref={editorCenterRef}>
           <div
             className="preview-pane"
             ref={videoWrapperRef}

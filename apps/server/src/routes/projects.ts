@@ -4,6 +4,7 @@ import { ProjectSchema } from "@content-tools/shared";
 import path from "node:path";
 import { promises as fs, createWriteStream, createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import {
   createProject,
@@ -14,9 +15,86 @@ import {
 } from "../services/workspace.js";
 import { probeVideo } from "../services/ffprobe.js";
 import { renderFinal, writeExportBundle, type RenderProgress } from "../services/exporter.js";
-import { WORKSPACE_ROOT } from "../config.js";
+import { FFMPEG_PATH, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { ensureThumbnail } from "../services/thumbnails.js";
+
+const NORMALIZED_WIDTH = 1920;
+const NORMALIZED_HEIGHT = 1080;
+
+async function runFfmpeg(args: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(FFMPEG_PATH, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr || `ffmpeg exited with code ${code}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function hashFile(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", resolve);
+  });
+  return hash.digest("hex");
+}
+
+async function normalizeVideoIfNeeded(
+  video: VideoInfo,
+  inputPath: string,
+  originalName: string,
+  mediaDir: string
+): Promise<{ filePath: string; filename: string; video: VideoInfo }> {
+  if (video.width <= NORMALIZED_WIDTH && video.height <= NORMALIZED_HEIGHT) {
+    return { filePath: inputPath, filename: originalName, video };
+  }
+
+  const parsed = path.parse(originalName);
+  const normalizedName = `${parsed.name}_1920x1080.mp4`;
+  const outputPath = path.join(mediaDir, normalizedName);
+  const filter = `scale=${NORMALIZED_WIDTH}:${NORMALIZED_HEIGHT}:force_original_aspect_ratio=decrease,pad=${NORMALIZED_WIDTH}:${NORMALIZED_HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
+
+  const args = [
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    filter,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a?",
+    "-c:v",
+    "libx264",
+    "-crf",
+    "18",
+    "-preset",
+    "veryfast",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "copy",
+    "-movflags",
+    "+faststart",
+    outputPath,
+  ];
+
+  await runFfmpeg(args);
+  const normalizedVideo = await probeVideo(outputPath);
+  return { filePath: outputPath, filename: normalizedName, video: normalizedVideo };
+}
 
 export const projectsRoutes: FastifyPluginAsync = async (app) => {
   app.get("/", async () => {
@@ -101,13 +179,6 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     await ensureDir(mediaDir);
 
     const targetPath = path.join(mediaDir, filename);
-    const hash = createHash("sha256");
-    let bytes = 0;
-    data.file.on("data", (chunk: Buffer) => {
-      bytes += chunk.length;
-      hash.update(chunk);
-    });
-
     await pipeline(data.file, createWriteStream(targetPath));
 
     let video;
@@ -120,14 +191,27 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
         message: (error as Error).message,
       });
     }
+
+    const normalized = await normalizeVideoIfNeeded(
+      video,
+      targetPath,
+      filename,
+      mediaDir
+    );
+    video = normalized.video;
+    const finalPath = normalized.filePath;
+    const finalFilename = normalized.filename;
+    const stat = await fs.stat(finalPath);
+    const sha256 = await hashFile(finalPath);
+
     const now = new Date().toISOString();
     const updatedProject = ProjectSchema.parse({
       ...project,
       updatedAt: now,
       source: {
-        filename,
-        sizeBytes: bytes,
-        sha256: hash.digest("hex"),
+        filename: finalFilename,
+        sizeBytes: stat.size,
+        sha256,
       },
       video,
     });

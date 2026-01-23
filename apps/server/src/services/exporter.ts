@@ -911,6 +911,8 @@ export async function renderFinal(
     }
 
     const slugFps = project.slug?.fps ?? project.video.fpsNum / project.video.fpsDen;
+    const targetWidth = projectForRender.video.width;
+    const targetHeight = projectForRender.video.height;
     const inputs: string[] = [];
     if (introPath) {
       inputs.push(introPath);
@@ -921,7 +923,12 @@ export async function renderFinal(
     }
 
     const concatFilter = inputs
-      .map((_, index) => `[${index}:v]fps=${slugFps},setsar=1[v${index}]`)
+      .map(
+        (_, index) =>
+          `[${index}:v]fps=${formatNumber(
+            slugFps
+          )},scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${index}]`
+      )
       .join(";")
       .concat(
         `;${inputs.map((_, index) => `[v${index}]`).join("")}concat=n=${inputs.length}:v=1:a=0[v]`

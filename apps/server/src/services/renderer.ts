@@ -17,6 +17,12 @@ const DEFAULT_TITLE_SCALE = 0.95;
 const DEFAULT_TEXT_SCALE = 1;
 const BASE_TITLE_OFFSET = -13;
 const BASE_TEXT_OFFSET = -27;
+const TITLE_Y_PCT = 0.18;
+const SUBTITLE_Y_PCT = 0.55;
+const TITLE_SIZE_PCT = 0.3;
+const SUBTITLE_SIZE_PCT = 0.18;
+const TITLE_COLOR = "#f5f2ea";
+const SUBTITLE_COLOR = "#d1c7b8";
 const OFFSET_MODE_KEY = "offsetMode";
 const OFFSET_MODE_DELTA = "delta-v1";
 
@@ -45,22 +51,20 @@ function resolveTextScale(value: unknown, fallback = 1) {
   return Math.min(2, Math.max(0.5, numeric));
 }
 
-function resolveTextMargin(value: unknown, fallback: number, width: number) {
+function resolveTextMargin(value: unknown, fallback: number) {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) {
     return fallback;
   }
-  const clamped = Math.max(0, Math.min(width * 0.5, numeric));
-  return clamped;
+  return Math.max(0, Math.min(400, numeric));
 }
 
-function resolveTextOffset(value: unknown, fallback: number, height: number) {
+function resolveTextOffset(value: unknown, fallback: number) {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) {
     return fallback;
   }
-  const limit = height * 0.5;
-  return Math.max(-limit, Math.min(limit, numeric));
+  return Math.max(-400, Math.min(400, numeric));
 }
 
 function escapeXml(text: string): string {
@@ -78,9 +82,13 @@ function buildTextSvg(
   title: string,
   subtitle: string | null,
   subtitleAlign: "left" | "center" | "right",
-  layout: {
-    title: { xPct: number; yPct: number; sizePct: number; color: string };
-    subtitle?: { xPct: number; yPct: number; sizePct: number; color: string };
+  colors: {
+    title: string;
+    subtitle: string;
+  },
+  scales: {
+    title: number;
+    subtitle: number;
   },
   margins?: { left: number; right: number },
   offsets?: { titleY?: number; subtitleY?: number }
@@ -88,27 +96,27 @@ function buildTextSvg(
   const subtitleAnchor =
     subtitleAlign === "center" ? "middle" : subtitleAlign === "right" ? "end" : "start";
   const titleAnchor = "middle";
-  const fontFamily = "Trebuchet MS, Segoe UI, Arial, sans-serif";
+  const fontFamily = "Arial";
+  const lineHeight = 1;
 
   const marginLeft = margins?.left ?? 0;
   const marginRight = margins?.right ?? 0;
-  const textAreaWidth = Math.max(1, width - marginLeft - marginRight);
+  const textAreaWidth = Math.max(40, width - marginLeft - marginRight);
 
   const titleX = marginLeft + textAreaWidth / 2;
-  const titleY = layout.title.yPct * height + (offsets?.titleY ?? 0);
-  const titleSize = Math.max(14, layout.title.sizePct * height);
+  const titleSize = Math.max(14, height * TITLE_SIZE_PCT * scales.title);
+  const titleTop = Math.max(8, height * TITLE_Y_PCT) + (offsets?.titleY ?? 0);
+  const titleY = titleTop + titleSize / 2;
 
-  const subtitleX = layout.subtitle
-    ? subtitleAlign === "left"
+  const subtitleX =
+    subtitleAlign === "left"
       ? marginLeft
       : subtitleAlign === "right"
         ? width - marginRight
-        : marginLeft + textAreaWidth / 2
-    : 0;
-  const subtitleY = layout.subtitle
-    ? layout.subtitle.yPct * height + (offsets?.subtitleY ?? 0)
-    : 0;
-  const subtitleSize = layout.subtitle ? Math.max(12, layout.subtitle.sizePct * height) : 0;
+        : marginLeft + textAreaWidth / 2;
+  const subtitleSize = Math.max(12, height * SUBTITLE_SIZE_PCT * scales.subtitle);
+  const subtitleTop = Math.max(8, height * SUBTITLE_Y_PCT) + (offsets?.subtitleY ?? 0);
+  const subtitleY = subtitleTop + subtitleSize / 2;
 
   const titleLines = escapeXml(title).split("\n");
   const subtitleLines = subtitle ? escapeXml(subtitle).split("\n") : [];
@@ -116,28 +124,28 @@ function buildTextSvg(
   const titleTspans = titleLines
     .map(
       (line, index) =>
-        `<tspan x="${titleX}" dy="${index === 0 ? 0 : titleSize * 1.2}">${line}</tspan>`
+        `<tspan x="${titleX}" dy="${index === 0 ? 0 : titleSize * lineHeight}">${line}</tspan>`
     )
     .join("");
 
   const subtitleTspans = subtitleLines
     .map(
       (line, index) =>
-        `<tspan x="${subtitleX}" dy="${index === 0 ? 0 : subtitleSize * 1.2}">${line}</tspan>`
+        `<tspan x="${subtitleX}" dy="${index === 0 ? 0 : subtitleSize * lineHeight}">${line}</tspan>`
     )
     .join("");
 
   return `
   <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
     <style>
-      .title { font-family: ${fontFamily}; font-weight: 700; }
-      .subtitle { font-family: ${fontFamily}; font-weight: 500; }
+      .title { font-family: ${fontFamily}; font-weight: normal; font-style: normal; }
+      .subtitle { font-family: ${fontFamily}; font-weight: normal; font-style: normal; }
     </style>
-    <text x="${titleX}" y="${titleY}" text-anchor="${titleAnchor}" fill="${layout.title.color}" font-size="${titleSize}" dominant-baseline="hanging" class="title">
+    <text x="${titleX}" y="${titleY}" text-anchor="${titleAnchor}" fill="${colors.title}" font-size="${titleSize}" dominant-baseline="alphabetic" class="title">
       ${titleTspans}
     </text>
-    ${layout.subtitle && subtitle ? `
-    <text x="${subtitleX}" y="${subtitleY}" text-anchor="${subtitleAnchor}" fill="${layout.subtitle.color}" font-size="${subtitleSize}" dominant-baseline="hanging" class="subtitle">
+    ${subtitle ? `
+    <text x="${subtitleX}" y="${subtitleY}" text-anchor="${subtitleAnchor}" fill="${colors.subtitle}" font-size="${subtitleSize}" dominant-baseline="alphabetic" class="subtitle">
       ${subtitleTspans}
     </text>` : ""}
   </svg>`;
@@ -185,25 +193,21 @@ export async function renderOverlayAsset(
   const textScale = resolveTextScale(overlay.fields.textScale, DEFAULT_TEXT_SCALE);
   const titleScale = resolveTextScale(overlay.fields.titleScale, DEFAULT_TITLE_SCALE);
   const defaultMargins = getDefaultTextMargins(template.align);
-  const marginLeft = resolveTextMargin(overlay.fields.textMarginLeft, defaultMargins.left, width);
-  const marginRight = resolveTextMargin(overlay.fields.textMarginRight, defaultMargins.right, width);
+  const marginLeft = resolveTextMargin(overlay.fields.textMarginLeft, defaultMargins.left);
+  const marginRight = resolveTextMargin(overlay.fields.textMarginRight, defaultMargins.right);
   const usesDelta = overlay.fields[OFFSET_MODE_KEY] === OFFSET_MODE_DELTA;
   const rawTextOffset = resolveTextOffset(
     overlay.fields.textOffsetY,
-    usesDelta ? 0 : BASE_TEXT_OFFSET,
-    height
+    usesDelta ? 0 : BASE_TEXT_OFFSET
   );
   const rawTitleOffset = resolveTextOffset(
     overlay.fields.titleOffsetY,
-    usesDelta ? 0 : BASE_TITLE_OFFSET,
-    height
+    usesDelta ? 0 : BASE_TITLE_OFFSET
   );
   const textOffsetY = usesDelta ? BASE_TEXT_OFFSET + rawTextOffset : rawTextOffset;
   const titleOffsetY = usesDelta ? BASE_TITLE_OFFSET + rawTitleOffset : rawTitleOffset;
-  const titleLayout = { ...template.title, sizePct: template.title.sizePct * titleScale };
-  const subtitleLayout = template.subtitle
-    ? { ...template.subtitle, sizePct: template.subtitle.sizePct * textScale }
-    : undefined;
+  const titleColor = template.title?.color ?? TITLE_COLOR;
+  const subtitleColor = template.subtitle?.color ?? SUBTITLE_COLOR;
 
   const svg = buildTextSvg(
     width,
@@ -212,8 +216,12 @@ export async function renderOverlayAsset(
     subtitle,
     textAlign,
     {
-      title: titleLayout,
-      subtitle: subtitleLayout,
+      title: titleColor,
+      subtitle: subtitleColor,
+    },
+    {
+      title: titleScale,
+      subtitle: textScale,
     },
     { left: marginLeft, right: marginRight },
     { titleY: titleOffsetY, subtitleY: textOffsetY }
