@@ -174,6 +174,7 @@ export type ExportOptions = {
   includeSlugStart?: boolean;
   includeSlugEnd?: boolean;
   speed?: 1 | 2;
+  renderMode?: "final" | "rough";
 };
 
 export async function exportProject(projectId: string, options: ExportOptions) {
@@ -205,6 +206,7 @@ export function renderStreamUrl(projectId: string, options: ExportOptions): stri
     params.set("includeSlugEnd", String(options.includeSlugEnd));
   }
   if (options.speed) params.set("speed", String(options.speed));
+  if (options.renderMode === "rough") params.set("renderMode", options.renderMode);
   const query = params.toString();
   return `${API_BASE}/projects/${projectId}/render/stream${query ? `?${query}` : ""}`;
 }

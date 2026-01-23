@@ -9,12 +9,15 @@ import { renderProjectAssets } from "./renderer.js";
 import { probeVideo } from "./ffprobe.js";
 import { getTemplateById } from "./templates.js";
 
+type RenderMode = "final" | "rough";
+
 type ExportRequest = {
   presetId?: string;
   includeSlug?: boolean;
   includeSlugStart?: boolean;
   includeSlugEnd?: boolean;
   speed?: 1 | 2;
+  renderMode?: RenderMode;
 };
 
 export type RenderProgress = {
@@ -38,6 +41,10 @@ type ExportManifest = {
   filterCardsArrows: string;
   outputLabelCards: string;
   outputLabelCardsArrows: string;
+  renderMode?: RenderMode;
+  outputFps?: number;
+  outputWidth?: number;
+  outputHeight?: number;
 };
 
 type FilterResult = {
@@ -76,7 +83,104 @@ type TimelineSegment = {
 };
 
 const DEFAULT_VIDEO_WIDTH = 1920;
+const DEFAULT_VIDEO_HEIGHT = 1080;
 const DEFAULT_CROSSFADE_FRAMES = 12;
+const ROUGH_PREVIEW_MAX_WIDTH = 960;
+const ROUGH_PREVIEW_MAX_HEIGHT = 540;
+const ROUGH_PREVIEW_FPS = 15;
+const ROUGH_PREVIEW_PRESET_ID = "roughPreview";
+
+type RenderTuning = {
+  mode: RenderMode;
+  presetId: string;
+  outputFps?: number;
+  outputWidth?: number;
+  outputHeight?: number;
+  scaleX?: number;
+  scaleY?: number;
+};
+
+function clampEven(value: number): number {
+  if (!Number.isFinite(value)) return 2;
+  const rounded = Math.round(value);
+  const even = rounded % 2 === 0 ? rounded : rounded - 1;
+  return Math.max(2, even);
+}
+
+function resolveRenderTuning(project: Project, options: ExportRequest): RenderTuning {
+  const mode: RenderMode = options.renderMode === "rough" ? "rough" : "final";
+  const presetId =
+    mode === "rough"
+      ? ROUGH_PREVIEW_PRESET_ID
+      : options.presetId ?? project.lastExportPresetId ?? DEFAULT_PRESET_ID;
+
+  if (mode !== "rough") {
+    return { mode, presetId };
+  }
+
+  const width = project.video.width || DEFAULT_VIDEO_WIDTH;
+  const height = project.video.height || DEFAULT_VIDEO_HEIGHT;
+  const widthScale = ROUGH_PREVIEW_MAX_WIDTH / width;
+  const heightScale = ROUGH_PREVIEW_MAX_HEIGHT / height;
+  const scale = Math.min(1, widthScale, heightScale);
+  const outputWidth = clampEven(width * scale);
+  const outputHeight = clampEven(height * scale);
+  const scaleX = outputWidth / width;
+  const scaleY = outputHeight / height;
+  const sourceFps = project.video.fpsNum / project.video.fpsDen || ROUGH_PREVIEW_FPS;
+  const outputFps = Math.max(1, Math.min(ROUGH_PREVIEW_FPS, Math.round(sourceFps)));
+
+  return {
+    mode,
+    presetId,
+    outputFps,
+    outputWidth,
+    outputHeight,
+    scaleX,
+    scaleY,
+  };
+}
+
+function scaleProjectForRender(project: Project, tuning: RenderTuning): Project {
+  if (!tuning.outputWidth || !tuning.outputHeight || !tuning.scaleX || !tuning.scaleY) {
+    return project;
+  }
+  const scaleX = tuning.scaleX;
+  const scaleY = tuning.scaleY;
+  if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0) {
+    return project;
+  }
+
+  const overlays = project.overlays.map((overlay) => {
+    const rect = overlay.rect;
+    const motion = overlay.motion ? { ...overlay.motion } : undefined;
+    if (motion?.bouncePx) {
+      const bounceScale =
+        motion.bounceAxis === "y"
+          ? scaleY
+          : motion.bounceAxis === "x"
+            ? scaleX
+            : (scaleX + scaleY) / 2;
+      motion.bouncePx = motion.bouncePx * bounceScale;
+    }
+    return {
+      ...overlay,
+      rect: {
+        x: rect.x * scaleX,
+        y: rect.y * scaleY,
+        w: rect.w * scaleX,
+        h: rect.h * scaleY,
+      },
+      motion,
+    };
+  });
+
+  return {
+    ...project,
+    video: { ...project.video, width: tuning.outputWidth, height: tuning.outputHeight },
+    overlays,
+  };
+}
 
 function sortOverlays(overlays: Overlay[]): Overlay[] {
   return [...overlays].sort((a, b) => {
@@ -331,14 +435,26 @@ function buildFilterScript(
   overlays: Overlay[],
   speed: 1 | 2,
   baseLabel: string,
-  preLines: string[]
+  preLines: string[],
+  renderTuning?: {
+    outputFps?: number;
+    outputWidth?: number;
+    outputHeight?: number;
+  }
 ): FilterResult {
   const fps = project.video.fpsNum / project.video.fpsDen;
   const videoWidth = project.video.width || DEFAULT_VIDEO_WIDTH;
   const lines: string[] = [...preLines];
   const speedExpr = speed === 2 ? "0.5*PTS" : "PTS-STARTPTS";
 
-  lines.push(`${baseLabel}setpts=${speedExpr}[v0]`);
+  const baseChain = [`${baseLabel}setpts=${speedExpr}`];
+  if (renderTuning?.outputFps && renderTuning.outputFps > 0) {
+    baseChain.push(`fps=${formatNumber(renderTuning.outputFps)}`);
+  }
+  if (renderTuning?.outputWidth && renderTuning?.outputHeight) {
+    baseChain.push(`scale=${renderTuning.outputWidth}:${renderTuning.outputHeight}`);
+  }
+  lines.push(`${baseChain.join(",")}[v0]`);
 
   let prevLabel = "[v0]";
 
@@ -756,9 +872,14 @@ export async function writeExportBundle(
   manifest: ExportManifest;
   outputFrames: number;
   projectForRender: Project;
+  renderTuning: RenderTuning;
 }> {
   const timelinePlan = buildTimelinePlan(project);
-  const projectForRender = timelinePlan.project;
+  const renderTuning = resolveRenderTuning(project, options);
+  const projectForRender =
+    renderTuning.mode === "rough"
+      ? scaleProjectForRender(timelinePlan.project, renderTuning)
+      : timelinePlan.project;
   const exportId = new Date().toISOString().replace(/[:.]/g, "-");
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const exportDir = path.join(projectRoot, "exports", exportId);
@@ -775,7 +896,16 @@ export async function writeExportBundle(
     typeof options.includeSlugEnd === "boolean"
       ? options.includeSlugEnd
       : includeSlug || project.exportOptions?.includeSlugEnd || false;
-  const presetId = options.presetId ?? project.lastExportPresetId ?? DEFAULT_PRESET_ID;
+  const presetId = renderTuning.presetId;
+
+  const filterTuning =
+    renderTuning.mode === "rough"
+      ? {
+          outputFps: renderTuning.outputFps,
+          outputWidth: renderTuning.outputWidth,
+          outputHeight: renderTuning.outputHeight,
+        }
+      : undefined;
 
   const cards = sortOverlays(projectForRender.overlays.filter((overlay) => !isArrowOverlay(overlay)));
   const arrows = sortOverlays(projectForRender.overlays.filter(isArrowOverlay));
@@ -797,14 +927,16 @@ export async function writeExportBundle(
     cards,
     speed,
     timelinePlan.baseLabel,
-    timelinePlan.baseLines
+    timelinePlan.baseLines,
+    filterTuning
   );
   const cardsArrowsScript = buildFilterScript(
     projectForRender,
     [...cards, ...arrows],
     speed,
     timelinePlan.baseLabel,
-    timelinePlan.baseLines
+    timelinePlan.baseLines,
+    filterTuning
   );
 
   await ensureDir(exportDir);
@@ -832,6 +964,10 @@ export async function writeExportBundle(
     filterCardsArrows: path.basename(filterCardsArrowsPath),
     outputLabelCards: cardsScript.outputLabel,
     outputLabelCardsArrows: cardsArrowsScript.outputLabel,
+    renderMode: renderTuning.mode,
+    outputFps: renderTuning.outputFps,
+    outputWidth: renderTuning.outputWidth,
+    outputHeight: renderTuning.outputHeight,
   };
 
   const readme = buildReadme(exportDir, manifest, cardInputs, arrowInputs);
@@ -849,6 +985,7 @@ export async function writeExportBundle(
     manifest,
     outputFrames: timelinePlan.outputFrames,
     projectForRender,
+    renderTuning,
   };
 }
 
@@ -862,7 +999,7 @@ export async function renderFinal(
   finalPath: string;
   manifest: ExportManifest;
 }> {
-  const { exportDir, exportId, manifest, outputFrames, projectForRender } =
+  const { exportDir, exportId, manifest, outputFrames, projectForRender, renderTuning } =
     await writeExportBundle(project, options);
 
   onProgress?.({ stage: "assets", message: "Rendering overlay assets" });
@@ -927,7 +1064,10 @@ export async function renderFinal(
       throw new Error("Slug outro path is required for includeSlugEnd");
     }
 
-    const slugFps = project.slug?.fps ?? project.video.fpsNum / project.video.fpsDen;
+    const slugFps =
+      renderTuning.outputFps ??
+      project.slug?.fps ??
+      project.video.fpsNum / project.video.fpsDen;
     const targetWidth = projectForRender.video.width;
     const targetHeight = projectForRender.video.height;
     const inputs: string[] = [];

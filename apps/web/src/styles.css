@@ -591,6 +591,10 @@ button.danger:hover {
   margin-bottom: 6px;
 }
 
+.render-setting .details {
+  margin-top: 6px;
+}
+
 .slug-flags {
   display: flex;
   gap: 12px;

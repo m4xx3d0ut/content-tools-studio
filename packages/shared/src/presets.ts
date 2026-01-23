@@ -13,6 +13,12 @@ export const EXPORT_PRESETS: Record<string, ExportPreset> = {
     codec: "libx264",
     args: ["-crf", "23", "-preset", "veryfast"],
   },
+  roughPreview: {
+    id: "roughPreview",
+    label: "Rough preview (CPU)",
+    codec: "libx264",
+    args: ["-crf", "32", "-preset", "ultrafast", "-tune", "zerolatency"],
+  },
   balanced: {
     id: "balanced",
     label: "Balanced (CPU)",

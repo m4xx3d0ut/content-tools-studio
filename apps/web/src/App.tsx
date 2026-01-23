@@ -41,6 +41,10 @@ const RENDER_PRESET_OPTIONS = [
   { id: "balanced", label: "Balanced (CPU)" },
   { id: "quality", label: "High quality (CPU)" },
 ];
+const RENDER_MODE_OPTIONS = [
+  { id: "final", label: "Final" },
+  { id: "rough", label: "Rough preview (fast)" },
+];
 
 const FALLBACK_TEMPLATES = [
   { id: "card-lower-third-left", label: "Lower Third Left" },
@@ -264,6 +268,7 @@ export default function App() {
   const [videoDurationSec, setVideoDurationSec] = useState(0);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [renderOptions, setRenderOptions] = useState({
+    renderMode: "final" as "final" | "rough",
     speed: 1 as 1 | 2,
     includeSlugStart: false,
     includeSlugEnd: false,
@@ -330,6 +335,7 @@ export default function App() {
     type: "cut" as const,
     durationFrames: 0,
   };
+  const isRoughPreview = renderOptions.renderMode === "rough";
   const edits = project?.edits ?? { trimStartFrames: 0, trimEndFrames: 0, cuts: [] };
   const trimRange = useMemo(() => {
     const start = edits.trimStartFrames ?? 0;
@@ -1564,10 +1570,14 @@ export default function App() {
 
           {leftTab === "exports" && (
             <div className="panel-block">
-              <div className="details">Final renders live in workspace exports folder.</div>
+              <div className="details">
+                {isRoughPreview
+                  ? "Preview renders live in workspace exports folder."
+                  : "Final renders live in workspace exports folder."}
+              </div>
               <div className="actions">
                 <button onClick={handleRenderFinal} disabled={!project}>
-                  Render final
+                  {isRoughPreview ? "Render preview" : "Render final"}
                 </button>
               </div>
             </div>
@@ -2202,7 +2212,7 @@ export default function App() {
               Save
             </button>
             <button onClick={handleRenderFinal} disabled={!project}>
-              Render final
+              {isRoughPreview ? "Render preview" : "Render final"}
             </button>
             {renderReady && downloadUrl && (
               <a
@@ -2211,12 +2221,12 @@ export default function App() {
                 target="_blank"
                 rel="noreferrer"
               >
-                Download final
+                {isRoughPreview ? "Download preview" : "Download final"}
               </a>
             )}
             {renderReady && renderFinalPath && (
               <button className="secondary" onClick={handleCopyFinalPath}>
-                Copy final path
+                {isRoughPreview ? "Copy preview path" : "Copy final path"}
               </button>
             )}
           </div>
@@ -2228,11 +2238,32 @@ export default function App() {
         </div>
         <div className="render-settings-grid">
           <div className="render-setting">
+            <label htmlFor="render-mode">Render mode</label>
+            <select
+              id="render-mode"
+              value={renderOptions.renderMode}
+              disabled={!project}
+              onChange={(event) => {
+                const nextMode = event.target.value as "final" | "rough";
+                setRenderOptions((prev) => ({ ...prev, renderMode: nextMode }));
+              }}
+            >
+              {RENDER_MODE_OPTIONS.map((mode) => (
+                <option key={mode.id} value={mode.id}>
+                  {mode.label}
+                </option>
+              ))}
+            </select>
+            {isRoughPreview && (
+              <div className="details">Rough preview renders at ~960x540 / 15 fps.</div>
+            )}
+          </div>
+          <div className="render-setting">
             <label htmlFor="preset">Quality</label>
             <select
               id="preset"
               value={renderOptions.presetId ?? DEFAULT_PRESET_ID}
-              disabled={!project}
+              disabled={!project || isRoughPreview}
               onChange={(event) => {
                 const nextPresetId = event.target.value;
                 setRenderOptions((prev) => ({ ...prev, presetId: nextPresetId }));

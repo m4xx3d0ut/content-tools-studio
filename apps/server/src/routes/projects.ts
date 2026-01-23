@@ -433,6 +433,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       includeSlugStart?: boolean;
       includeSlugEnd?: boolean;
       speed?: 1 | 2;
+      renderMode?: "final" | "rough";
     };
     const result = await writeExportBundle(project, body ?? {});
 
@@ -483,6 +484,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       includeSlugStart?: boolean;
       includeSlugEnd?: boolean;
       speed?: 1 | 2;
+      renderMode?: "final" | "rough";
     };
     try {
       const result = await renderFinal(project, body ?? {});
@@ -531,6 +533,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       includeSlugStart?: string;
       includeSlugEnd?: string;
       speed?: string;
+      renderMode?: string;
     };
     const project = await readProject(id);
     if (!project) {
@@ -549,6 +552,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       includeSlugStart,
       includeSlugEnd,
       speed: query.speed ? (Number(query.speed) as 1 | 2) : undefined,
+      renderMode: query.renderMode === "rough" ? "rough" : undefined,
     };
 
     const origin = request.headers.origin ?? "*";
