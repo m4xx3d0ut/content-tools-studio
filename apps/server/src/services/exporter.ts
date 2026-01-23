@@ -6,6 +6,7 @@ import { DEFAULT_PRESET_ID, EXPORT_PRESETS } from "@content-tools/shared";
 import { FFMPEG_PATH, REPO_ROOT, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { renderProjectAssets } from "./renderer.js";
+import { getTemplateById } from "./templates.js";
 
 type ExportRequest = {
   presetId?: string;
@@ -149,11 +150,26 @@ function computeOverlayTiming(
   };
 }
 
+function resolveTemplateAlign(overlay: Overlay): "left" | "center" | "right" | null {
+  const template = getTemplateById(overlay.templateId);
+  if (template) return template.align;
+  if (overlay.templateId.includes("right")) return "right";
+  if (overlay.templateId.includes("center")) return "center";
+  if (overlay.templateId.includes("left")) return "left";
+  return null;
+}
+
 function resolveSlideDirection(
   overlay: Overlay,
   videoWidth: number
 ): "fromLeft" | "fromRight" | "none" {
   const motion = overlay.motion;
+  if (motion?.slideDirection === "none") return "none";
+
+  const align = resolveTemplateAlign(overlay);
+  if (align === "right") return "fromRight";
+  if (align === "left" || align === "center") return "fromLeft";
+
   if (motion?.slideDirection) return motion.slideDirection;
   const centerX = overlay.rect.x + overlay.rect.w / 2;
   return centerX < videoWidth / 2 ? "fromLeft" : "fromRight";

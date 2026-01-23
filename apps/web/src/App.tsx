@@ -876,6 +876,7 @@ export default function App() {
     const end = start + Math.floor(fps * 5);
     const template = templateMap[templateId];
     const templateAlign = resolveTemplateAlign(templateId, template);
+    const slideDirection = templateAlign === "right" ? "fromRight" : "fromLeft";
     const defaultMargins = getDefaultTextMargins(templateAlign);
     const baseRect = getTemplateRect(templateId);
     const rectX = typeof x === "number" ? Math.max(0, x) : baseRect.x;
@@ -910,7 +911,7 @@ export default function App() {
         slideInFrames: 12,
         displayFrames: Math.floor(fps * 3),
         slideOutFrames: 12,
-        slideDirection: "fromLeft",
+        slideDirection,
       },
     };
     updateProjectState({ ...project, overlays: [...project.overlays, overlay] });
