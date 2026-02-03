@@ -102,6 +102,7 @@ export const SlugSchema = z
 export const ExportOptionsSchema = z
   .object({
     speed: z.union([z.literal(1), z.literal(2)]).default(1),
+    includeAudio: z.boolean().default(true),
     includeSlug: z.boolean().default(false),
     includeSlugStart: z.boolean().default(false),
     includeSlugEnd: z.boolean().default(false),

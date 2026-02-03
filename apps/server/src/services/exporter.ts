@@ -13,6 +13,7 @@ type RenderMode = "final" | "rough";
 
 type ExportRequest = {
   presetId?: string;
+  includeAudio?: boolean;
   includeSlug?: boolean;
   includeSlugStart?: boolean;
   includeSlugEnd?: boolean;
@@ -32,6 +33,7 @@ type ExportManifest = {
   exportId: string;
   presetId: string;
   speed: 1 | 2;
+  includeAudio: boolean;
   includeSlugStart: boolean;
   includeSlugEnd: boolean;
   source: string;
@@ -41,6 +43,8 @@ type ExportManifest = {
   filterCardsArrows: string;
   outputLabelCards: string;
   outputLabelCardsArrows: string;
+  outputLabelCardsAudio?: string;
+  outputLabelCardsArrowsAudio?: string;
   renderMode?: RenderMode;
   outputFps?: number;
   outputWidth?: number;
@@ -50,6 +54,12 @@ type ExportManifest = {
 type FilterResult = {
   script: string;
   outputLabel: string;
+  audioLabel?: string;
+};
+
+type AudioPlan = {
+  label: string;
+  lines: string[];
 };
 
 type OverlayTiming = {
@@ -440,11 +450,15 @@ function buildFilterScript(
     outputFps?: number;
     outputWidth?: number;
     outputHeight?: number;
-  }
+  },
+  audioPlan?: AudioPlan
 ): FilterResult {
   const fps = project.video.fpsNum / project.video.fpsDen;
   const videoWidth = project.video.width || DEFAULT_VIDEO_WIDTH;
   const lines: string[] = [...preLines];
+  if (audioPlan?.lines?.length) {
+    lines.push(...audioPlan.lines);
+  }
   const speedExpr = speed === 2 ? "0.5*PTS" : "PTS-STARTPTS";
 
   const baseChain = [`${baseLabel}setpts=${speedExpr}`];
@@ -455,6 +469,13 @@ function buildFilterScript(
     baseChain.push(`scale=${renderTuning.outputWidth}:${renderTuning.outputHeight}`);
   }
   lines.push(`${baseChain.join(",")}[v0]`);
+
+  let audioOutputLabel: string | undefined;
+  if (audioPlan?.label) {
+    const speedFilter = speed === 2 ? ",atempo=2.0" : "";
+    lines.push(`${audioPlan.label}asetpts=PTS-STARTPTS${speedFilter}[aout]`);
+    audioOutputLabel = "[aout]";
+  }
 
   let prevLabel = "[v0]";
 
@@ -480,9 +501,15 @@ function buildFilterScript(
     prevLabel = `[v${inputIndex}]`;
   });
 
+  const script = lines
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join(";\n");
+
   return {
-    script: lines.join(";\n"),
+    script,
     outputLabel: prevLabel,
+    audioLabel: audioOutputLabel,
   };
 }
 
@@ -508,8 +535,11 @@ function buildTimelinePlan(project: Project): {
   baseLabel: string;
   baseLines: string[];
   outputFrames: number;
+  audioLabel?: string;
+  audioLines?: string[];
 } {
   const fps = project.video.fpsNum / project.video.fpsDen;
+  const hasAudio = Boolean(project.video.audio?.hasAudio);
   const totalFrames = Math.max(
     1,
     Math.floor((project.video.durationMs / 1000) * fps)
@@ -524,7 +554,14 @@ function buildTimelinePlan(project: Project): {
   const hasTrim = trimStart > 0 || trimEnd > 0;
 
   if (!hasCuts && !hasTrim) {
-    return { project, baseLabel: "[0:v]", baseLines: [], outputFrames: totalFrames };
+    return {
+      project,
+      baseLabel: "[0:v]",
+      baseLines: [],
+      outputFrames: totalFrames,
+      audioLabel: hasAudio ? "[0:a]" : undefined,
+      audioLines: hasAudio ? [] : undefined,
+    };
   }
 
   const keepStart = trimStart;
@@ -710,11 +747,48 @@ function buildTimelinePlan(project: Project): {
     currentLabel = outLabel;
   });
 
+  const audioLines: string[] = [];
+  let audioLabel: string | undefined;
+  if (hasAudio) {
+    segments.forEach((segment, index) => {
+      const startSec = segment.startFrame / fps;
+      const endSec = segment.endFrame / fps;
+      audioLines.push(
+        `[0:a]atrim=start=${formatNumber(startSec)}:end=${formatNumber(
+          endSec
+        )},asetpts=PTS-STARTPTS[a${index}]`
+      );
+    });
+
+    let currentAudioLabel = "[a0]";
+    segments.slice(1).forEach((_, index) => {
+      const nextLabel = `[a${index + 1}]`;
+      const transition = normalizedTransitions[index] ?? { type: "cut", durationFrames: 0 };
+      if (transition.type === "crossfade" && transition.durationFrames > 0) {
+        const durationSec = transition.durationFrames / fps;
+        const outLabel = `[ax${index + 1}]`;
+        audioLines.push(
+          `${currentAudioLabel}${nextLabel}acrossfade=d=${formatNumber(
+            durationSec
+          )}:c1=tri:c2=tri${outLabel}`
+        );
+        currentAudioLabel = outLabel;
+        return;
+      }
+      const outLabel = `[ac${index + 1}]`;
+      audioLines.push(`${currentAudioLabel}${nextLabel}concat=n=2:v=0:a=1${outLabel}`);
+      currentAudioLabel = outLabel;
+    });
+    audioLabel = currentAudioLabel;
+  }
+
   return {
     project: { ...project, overlays: adjustedOverlays },
     baseLabel: currentLabel,
     baseLines,
     outputFrames: Math.max(1, currentDurationFrames),
+    audioLabel,
+    audioLines: audioLines.length ? audioLines : undefined,
   };
 }
 
@@ -749,9 +823,14 @@ function buildReadme(
     `ffmpeg -y -i ${inputVideo} \\\\`,
     ...overlayLines,
     `  -filter_complex_script ${cardsScript} \\\\`,
-    `  -map "${manifest.outputLabelCards}" -c:v ${preset.codec} ${preset.args.join(
-      " "
-    )} -pix_fmt yuv420p \\\\`,
+    `  -map "${manifest.outputLabelCards}" \\\\`,
+    ...(manifest.includeAudio && manifest.outputLabelCardsAudio
+      ? [
+          `  -map "${manifest.outputLabelCardsAudio}" \\\\`,
+          "  -c:a aac -b:a 192k \\\\",
+        ]
+      : []),
+    `  -c:v ${preset.codec} ${preset.args.join(" ")} -pix_fmt yuv420p \\\\`,
     "  main_noslug.mp4",
   ].join("\n");
 
@@ -762,9 +841,14 @@ function buildReadme(
       ...overlayLines,
       ...arrowLines,
       `  -filter_complex_script ${cardsArrowsScript} \\\\`,
-      `  -map "${manifest.outputLabelCardsArrows}" -c:v ${preset.codec} ${preset.args.join(
-        " "
-      )} -pix_fmt yuv420p \\\\`,
+      `  -map "${manifest.outputLabelCardsArrows}" \\\\`,
+      ...(manifest.includeAudio && manifest.outputLabelCardsArrowsAudio
+        ? [
+            `  -map "${manifest.outputLabelCardsArrowsAudio}" \\\\`,
+            "  -c:a aac -b:a 192k \\\\",
+          ]
+        : []),
+      `  -c:v ${preset.codec} ${preset.args.join(" ")} -pix_fmt yuv420p \\\\`,
       "  main_noslug_arrows.mp4",
     ].join("\n");
   }
@@ -884,6 +968,11 @@ export async function writeExportBundle(
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const exportDir = path.join(projectRoot, "exports", exportId);
   const speed = options.speed ?? project.exportOptions?.speed ?? 1;
+  const hasAudio = Boolean(project.video.audio?.hasAudio);
+  const includeAudio =
+    (typeof options.includeAudio === "boolean"
+      ? options.includeAudio
+      : project.exportOptions?.includeAudio ?? true) && hasAudio;
   const includeSlug =
     typeof options.includeSlug === "boolean"
       ? options.includeSlug
@@ -922,13 +1011,19 @@ export async function writeExportBundle(
     filePath: path.join(projectRoot, "render", "arrows", `${overlay.id}.png`),
   }));
 
+  const audioPlan =
+    includeAudio && timelinePlan.audioLabel
+      ? { label: timelinePlan.audioLabel, lines: timelinePlan.audioLines ?? [] }
+      : undefined;
+
   const cardsScript = buildFilterScript(
     projectForRender,
     cards,
     speed,
     timelinePlan.baseLabel,
     timelinePlan.baseLines,
-    filterTuning
+    filterTuning,
+    audioPlan
   );
   const cardsArrowsScript = buildFilterScript(
     projectForRender,
@@ -936,7 +1031,8 @@ export async function writeExportBundle(
     speed,
     timelinePlan.baseLabel,
     timelinePlan.baseLines,
-    filterTuning
+    filterTuning,
+    audioPlan
   );
 
   await ensureDir(exportDir);
@@ -955,6 +1051,7 @@ export async function writeExportBundle(
     exportId,
     presetId,
     speed,
+    includeAudio,
     includeSlugStart,
     includeSlugEnd,
     source: sourcePath,
@@ -964,6 +1061,8 @@ export async function writeExportBundle(
     filterCardsArrows: path.basename(filterCardsArrowsPath),
     outputLabelCards: cardsScript.outputLabel,
     outputLabelCardsArrows: cardsArrowsScript.outputLabel,
+    outputLabelCardsAudio: cardsScript.audioLabel,
+    outputLabelCardsArrowsAudio: cardsArrowsScript.audioLabel,
     renderMode: renderTuning.mode,
     outputFps: renderTuning.outputFps,
     outputWidth: renderTuning.outputWidth,
@@ -1019,6 +1118,9 @@ export async function renderFinal(
   const hasArrows = manifest.arrowInputs.length > 0;
   const filterScript = hasArrows ? manifest.filterCardsArrows : manifest.filterCards;
   const outputLabel = hasArrows ? manifest.outputLabelCardsArrows : manifest.outputLabelCards;
+  const audioLabel = hasArrows
+    ? manifest.outputLabelCardsArrowsAudio
+    : manifest.outputLabelCardsAudio;
   const mainOutputName = hasArrows ? "main_noslug_arrows.mp4" : "main_noslug.mp4";
   const mainOutputPath = path.join(exportDir, mainOutputName);
 
@@ -1034,8 +1136,10 @@ export async function renderFinal(
     filterScript,
     "-map",
     outputLabel,
+    ...(manifest.includeAudio && audioLabel ? ["-map", audioLabel] : []),
     "-c:v",
     preset.codec,
+    ...(manifest.includeAudio && audioLabel ? ["-c:a", "aac", "-b:a", "192k"] : []),
     ...preset.args,
     "-shortest",
     "-pix_fmt",
@@ -1084,6 +1188,28 @@ export async function renderFinal(
       slugTransition.type === "crossfade" &&
       slugTransition.durationFrames > 0 &&
       inputs.length > 1;
+    const includeAudio = manifest.includeAudio;
+    const needsInputInfo = includeAudio || useCrossfade;
+    const inputInfos: Array<{ durationSec: number; hasAudio: boolean }> = [];
+    if (needsInputInfo) {
+      if (introPath) {
+        const introInfo = await probeVideo(introPath);
+        inputInfos.push({
+          durationSec: introInfo.durationMs / 1000,
+          hasAudio: Boolean(introInfo.audio?.hasAudio),
+        });
+      }
+      inputInfos.push({ durationSec, hasAudio: includeAudio });
+      if (outroPath) {
+        const outroInfo = await probeVideo(outroPath);
+        inputInfos.push({
+          durationSec: outroInfo.durationMs / 1000,
+          hasAudio: Boolean(outroInfo.audio?.hasAudio),
+        });
+      }
+    }
+    const durationsSec = needsInputInfo ? inputInfos.map((info) => info.durationSec) : [];
+
     const baseFilter = inputs
       .map(
         (_, index) =>
@@ -1093,24 +1219,36 @@ export async function renderFinal(
       )
       .join(";");
 
+    const audioLines: string[] = [];
+    if (includeAudio) {
+      const audioFormat = "aformat=sample_rates=48000:channel_layouts=stereo";
+      inputInfos.forEach((info, index) => {
+        if (info.hasAudio) {
+          audioLines.push(
+            `[${index}:a]${audioFormat},asetpts=PTS-STARTPTS[a${index}]`
+          );
+          return;
+        }
+        audioLines.push(
+          `anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration=${formatNumber(
+            info.durationSec
+          )},asetpts=PTS-STARTPTS[a${index}]`
+        );
+      });
+    }
+
     let concatFilter = "";
     let outputLabel = "[v]";
+    let audioOutputLabel: string | null = null;
     if (useCrossfade) {
-      const durationsSec: number[] = [];
-      if (introPath) {
-        const introInfo = await probeVideo(introPath);
-        durationsSec.push(introInfo.durationMs / 1000);
-      }
-      durationsSec.push(durationSec);
-      if (outroPath) {
-        const outroInfo = await probeVideo(outroPath);
-        durationsSec.push(outroInfo.durationMs / 1000);
-      }
-
       const transitionSec = slugTransition.durationFrames / fps;
       let currentLabel = "[v0]";
       let currentDuration = durationsSec[0] ?? 0;
       const chain: string[] = [];
+      const audioChain: string[] = [];
+
+      let currentAudioLabel = "[a0]";
+      let currentAudioDuration = durationsSec[0] ?? 0;
 
       inputs.slice(1).forEach((_, index) => {
         const nextLabel = `[v${index + 1}]`;
@@ -1126,20 +1264,62 @@ export async function renderFinal(
           );
           currentDuration = currentDuration + nextDuration - safeDuration;
           currentLabel = outLabel;
+        } else {
+          const outLabel = `[c${index + 1}]`;
+          chain.push(`${currentLabel}${nextLabel}concat=n=2:v=1:a=0${outLabel}`);
+          currentDuration += nextDuration;
+          currentLabel = outLabel;
+        }
+
+        if (!includeAudio) return;
+        const nextAudioLabel = `[a${index + 1}]`;
+        const safeAudioDuration = Math.min(
+          transitionSec,
+          currentAudioDuration,
+          durationsSec[index + 1] ?? 0
+        );
+        if (safeAudioDuration > 0) {
+          const outAudioLabel = `[ax${index + 1}]`;
+          audioChain.push(
+            `${currentAudioLabel}${nextAudioLabel}acrossfade=d=${formatNumber(
+              safeAudioDuration
+            )}:c1=tri:c2=tri${outAudioLabel}`
+          );
+          currentAudioDuration =
+            currentAudioDuration + (durationsSec[index + 1] ?? 0) - safeAudioDuration;
+          currentAudioLabel = outAudioLabel;
           return;
         }
-        const outLabel = `[c${index + 1}]`;
-        chain.push(`${currentLabel}${nextLabel}concat=n=2:v=1:a=0${outLabel}`);
-        currentDuration += nextDuration;
-        currentLabel = outLabel;
+        const outAudioLabel = `[ac${index + 1}]`;
+        audioChain.push(
+          `${currentAudioLabel}${nextAudioLabel}concat=n=2:v=0:a=1${outAudioLabel}`
+        );
+        currentAudioDuration += durationsSec[index + 1] ?? 0;
+        currentAudioLabel = outAudioLabel;
       });
 
-      concatFilter = `${baseFilter};${chain.join(";")}`;
+      const filterParts = [baseFilter, ...audioLines];
+      if (chain.length) {
+        filterParts.push(chain.join(";"));
+      }
+      if (includeAudio && audioChain.length) {
+        filterParts.push(audioChain.join(";"));
+        audioOutputLabel = currentAudioLabel;
+      }
+      concatFilter = filterParts.filter((part) => part.trim().length > 0).join(";");
       outputLabel = currentLabel;
     } else {
-      concatFilter = baseFilter.concat(
-        `;${inputs.map((_, index) => `[v${index}]`).join("")}concat=n=${inputs.length}:v=1:a=0[v]`
+      const filterParts = [baseFilter, ...audioLines];
+      filterParts.push(
+        `${inputs.map((_, index) => `[v${index}]`).join("")}concat=n=${inputs.length}:v=1:a=0[v]`
       );
+      if (includeAudio) {
+        filterParts.push(
+          `${inputs.map((_, index) => `[a${index}]`).join("")}concat=n=${inputs.length}:v=0:a=1[a]`
+        );
+        audioOutputLabel = "[a]";
+      }
+      concatFilter = filterParts.filter((part) => part.trim().length > 0).join(";");
       outputLabel = "[v]";
     }
 
@@ -1151,8 +1331,10 @@ export async function renderFinal(
       concatFilter,
       "-map",
       outputLabel,
+      ...(includeAudio && audioOutputLabel ? ["-map", audioOutputLabel] : []),
       "-c:v",
       preset.codec,
+      ...(includeAudio && audioOutputLabel ? ["-c:a", "aac", "-b:a", "192k"] : []),
       ...preset.args,
       "-pix_fmt",
       "yuv420p",

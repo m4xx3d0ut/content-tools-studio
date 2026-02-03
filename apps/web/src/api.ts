@@ -26,7 +26,13 @@ export type ProjectSummary = {
   createdAt: string;
   updatedAt: string;
   source: { filename: string };
-  video: { width: number; height: number; fpsNum: number; fpsDen: number };
+  video: {
+    width: number;
+    height: number;
+    fpsNum: number;
+    fpsDen: number;
+    audio?: { hasAudio: boolean; sampleRate?: number; channels?: number };
+  };
 };
 
 export type Rect = { x: number; y: number; w: number; h: number };
@@ -96,10 +102,12 @@ export type Project = ProjectSummary & {
     fpsNum: number;
     fpsDen: number;
     durationMs: number;
+    audio?: { hasAudio: boolean; sampleRate?: number; channels?: number };
   };
   overlays: Overlay[];
   exportOptions?: {
     speed?: 1 | 2;
+    includeAudio?: boolean;
     includeSlug?: boolean;
     includeSlugStart?: boolean;
     includeSlugEnd?: boolean;
@@ -170,6 +178,7 @@ export async function updateProject(projectId: string, project: Project): Promis
 
 export type ExportOptions = {
   presetId?: string;
+  includeAudio?: boolean;
   includeSlug?: boolean;
   includeSlugStart?: boolean;
   includeSlugEnd?: boolean;
@@ -196,6 +205,9 @@ export async function renderProject(projectId: string, options: ExportOptions) {
 export function renderStreamUrl(projectId: string, options: ExportOptions): string {
   const params = new URLSearchParams();
   if (options.presetId) params.set("presetId", options.presetId);
+  if (typeof options.includeAudio === "boolean") {
+    params.set("includeAudio", String(options.includeAudio));
+  }
   if (typeof options.includeSlug === "boolean") {
     params.set("includeSlug", String(options.includeSlug));
   }

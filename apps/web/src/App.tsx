@@ -270,6 +270,7 @@ export default function App() {
   const [renderOptions, setRenderOptions] = useState({
     renderMode: "final" as "final" | "rough",
     speed: 1 as 1 | 2,
+    includeAudio: true,
     includeSlugStart: false,
     includeSlugEnd: false,
     presetId: DEFAULT_PRESET_ID,
@@ -336,6 +337,7 @@ export default function App() {
     durationFrames: 0,
   };
   const isRoughPreview = renderOptions.renderMode === "rough";
+  const hasAudio = project?.video?.audio?.hasAudio ?? false;
   const edits = project?.edits ?? { trimStartFrames: 0, trimEndFrames: 0, cuts: [] };
   const trimRange = useMemo(() => {
     const start = edits.trimStartFrames ?? 0;
@@ -456,9 +458,14 @@ export default function App() {
       project.exportOptions?.includeSlugStart ?? project.exportOptions?.includeSlug ?? false;
     const includeSlugEnd =
       project.exportOptions?.includeSlugEnd ?? project.exportOptions?.includeSlug ?? false;
+    const nextIncludeAudio =
+      typeof project.exportOptions?.includeAudio === "boolean"
+        ? project.exportOptions.includeAudio
+        : project.video?.audio?.hasAudio ?? false;
     setRenderOptions((prev) => ({
       ...prev,
       speed: project.exportOptions?.speed ?? prev.speed,
+      includeAudio: nextIncludeAudio,
       includeSlugStart,
       includeSlugEnd,
       presetId: project.lastExportPresetId ?? DEFAULT_PRESET_ID,
@@ -2298,6 +2305,25 @@ export default function App() {
               <option value={1}>1× (normal)</option>
               <option value={2}>2× (fast)</option>
             </select>
+          </div>
+          <div className="render-setting">
+            <label>Audio</label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                disabled={!project || !hasAudio}
+                checked={renderOptions.includeAudio && hasAudio}
+                onChange={(event) => {
+                  const nextIncludeAudio = event.target.checked;
+                  setRenderOptions((prev) => ({ ...prev, includeAudio: nextIncludeAudio }));
+                  updateProjectExportOptions({ includeAudio: nextIncludeAudio });
+                }}
+              />
+              Include source audio
+            </label>
+            {!hasAudio && project && (
+              <div className="details">No audio track detected in source.</div>
+            )}
           </div>
           <div className="render-setting">
             <label htmlFor="slug-select">Slug video</label>

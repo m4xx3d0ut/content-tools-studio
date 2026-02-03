@@ -429,6 +429,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
 
     const body = request.body as {
       presetId?: string;
+      includeAudio?: boolean;
       includeSlug?: boolean;
       includeSlugStart?: boolean;
       includeSlugEnd?: boolean;
@@ -438,6 +439,11 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     const result = await writeExportBundle(project, body ?? {});
 
     const now = new Date().toISOString();
+    const hasAudio = Boolean(project.video.audio?.hasAudio);
+    const includeAudio =
+      (typeof body?.includeAudio === "boolean"
+        ? body.includeAudio
+        : project.exportOptions?.includeAudio ?? true) && hasAudio;
     const includeSlug =
       typeof body?.includeSlug === "boolean" ? body.includeSlug : project.exportOptions?.includeSlug;
     const includeSlugStart =
@@ -455,6 +461,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       exportOptions: body
         ? {
             speed: body.speed ?? project.exportOptions?.speed ?? 1,
+            includeAudio,
             includeSlug: includeSlugStart && includeSlugEnd,
             includeSlugStart,
             includeSlugEnd,
@@ -480,6 +487,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
 
     const body = request.body as {
       presetId?: string;
+      includeAudio?: boolean;
       includeSlug?: boolean;
       includeSlugStart?: boolean;
       includeSlugEnd?: boolean;
@@ -489,6 +497,11 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     try {
       const result = await renderFinal(project, body ?? {});
       const now = new Date().toISOString();
+      const hasAudio = Boolean(project.video.audio?.hasAudio);
+      const includeAudio =
+        (typeof body?.includeAudio === "boolean"
+          ? body.includeAudio
+          : project.exportOptions?.includeAudio ?? true) && hasAudio;
       const includeSlug =
         typeof body?.includeSlug === "boolean" ? body.includeSlug : project.exportOptions?.includeSlug;
       const includeSlugStart =
@@ -506,6 +519,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
         exportOptions: body
           ? {
               speed: body.speed ?? project.exportOptions?.speed ?? 1,
+              includeAudio,
               includeSlug: includeSlugStart && includeSlugEnd,
               includeSlugStart,
               includeSlugEnd,
@@ -529,6 +543,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     const { id } = request.params as { id: string };
     const query = request.query as {
       presetId?: string;
+      includeAudio?: string;
       includeSlug?: string;
       includeSlugStart?: string;
       includeSlugEnd?: string;
@@ -540,6 +555,8 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(404).send({ error: "project not found" });
     }
 
+    const includeAudio =
+      typeof query.includeAudio === "string" ? query.includeAudio === "true" : undefined;
     const includeSlug = query.includeSlug === "true";
     const includeSlugStart =
       query.includeSlugStart === "true" || (includeSlug && query.includeSlugStart == null);
@@ -548,6 +565,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
 
     const options = {
       presetId: query.presetId,
+      includeAudio,
       includeSlug,
       includeSlugStart,
       includeSlugEnd,
