@@ -149,6 +149,26 @@ Build all packages:
 npm run build
 ```
 
+### NixOS development
+
+This repository includes a project-local Nix flake for a reproducible development toolchain. It provides Node.js 22, npm, FFmpeg/FFprobe, and native build tools while leaving `node_modules` managed by npm.
+
+With direnv:
+
+```bash
+direnv allow
+npm ci
+npm run dev:all
+```
+
+Without direnv:
+
+```bash
+nix develop path:$PWD
+npm ci
+npm run dev:all
+```
+
 ---
 
 ## Typical workflow
@@ -169,4 +189,3 @@ npm run build
 - Example videos and frame dumps are ignored by default (`*.mp4`, `frames*`).
 - The app is **local-first** and writes outputs into the `workspace/` folder.
 - All edits are stored in `project.json` and can be reloaded at any time.
-

@@ -129,6 +129,8 @@ function parseTimecode(value: string): number | null {
 const TIMECODE_COMPLETE_REGEX = /^\d{2,}:\d{2}:\d{2}(?:\.\d{1,3})?$/;
 const TEXT_ALIGNMENTS = ["left", "center", "right"] as const;
 type TextAlignment = (typeof TEXT_ALIGNMENTS)[number];
+type ProjectEdits = NonNullable<Project["edits"]>;
+type ProjectCut = NonNullable<ProjectEdits["cuts"]>[number];
 
 const DEFAULT_TITLE_SCALE = 0.95;
 const DEFAULT_TEXT_SCALE = 1;
@@ -705,7 +707,7 @@ export default function App() {
     updateEdits({ cuts: [...(edits.cuts ?? []), cut] });
   }
 
-  function updateCut(id: string, patch: Partial<(NonNullable<Project["edits"]>["cuts"])[number]>) {
+  function updateCut(id: string, patch: Partial<ProjectCut>) {
     if (!project) return;
     const nextCuts = (edits.cuts ?? []).map((cut) => {
       if (cut.id !== id) return cut;

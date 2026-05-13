@@ -570,7 +570,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       includeSlugStart,
       includeSlugEnd,
       speed: query.speed ? (Number(query.speed) as 1 | 2) : undefined,
-      renderMode: query.renderMode === "rough" ? "rough" : undefined,
+      renderMode: query.renderMode === "rough" ? ("rough" as const) : undefined,
     };
 
     const origin = request.headers.origin ?? "*";

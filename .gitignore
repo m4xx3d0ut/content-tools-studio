@@ -5,10 +5,16 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+.direnv/
 
 # Node
 node_modules/
 .pnpm-store/
+
+# Local environment
+.env
+.env.local
+.env.*.local
 
 # Build output
 dist/
@@ -39,3 +45,4 @@ coverage/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.codex/
