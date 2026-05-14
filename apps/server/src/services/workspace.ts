@@ -8,7 +8,7 @@ import { ensureDir, fileExists } from "../utils/fs.js";
 
 const PROJECT_FILENAME = "project.json";
 
-function projectDir(id: string): string {
+export function projectDir(id: string): string {
   return path.join(WORKSPACE_ROOT, id);
 }
 

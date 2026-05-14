@@ -377,6 +377,27 @@ button.danger:hover {
   color: #0b0c0f;
 }
 
+.slug-library-list {
+  display: grid;
+  gap: 10px;
+}
+
+.slug-library-item {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(12, 14, 18, 0.7);
+}
+
+.slug-preview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 6px;
+  background: #05070a;
+}
+
 .overlay-list {
   list-style: none;
   padding: 0;
@@ -527,8 +548,120 @@ button.danger:hover {
   margin: 4px 0;
 }
 
+.segment-section h3,
 .trim-section h3 {
   margin: 0 0 12px;
+}
+
+.segment-section {
+  display: grid;
+  gap: 12px;
+}
+
+.segment-toggle {
+  min-width: 0;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+}
+
+.segment-toggle:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.segment-toggle > span:last-child {
+  display: grid;
+  gap: 2px;
+}
+
+.segment-title {
+  display: block;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.segment-chevron {
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 7px solid var(--accent);
+  transition: transform 0.15s ease;
+}
+
+.segment-section.open .segment-chevron {
+  transform: rotate(90deg);
+}
+
+.segment-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.segment-header,
+.segment-actions,
+.segment-card-header,
+.segment-move {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.segment-header,
+.segment-card-header {
+  justify-content: space-between;
+}
+
+.timeline-recipe {
+  min-height: 120px;
+  resize: vertical;
+}
+
+.segment-list {
+  display: grid;
+  gap: 10px;
+}
+
+.segment-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(8, 10, 14, 0.5);
+}
+
+.segment-card-header input {
+  min-width: 0;
+  width: 100%;
+}
+
+.segment-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+}
+
+.segment-grid label {
+  display: grid;
+  gap: 5px;
+}
+
+.segment-grid input,
+.segment-grid select {
+  width: 100%;
+}
+
+.segment-meta {
+  color: #9ca3af;
+  font-size: 12px;
 }
 
 .trim-grid {
@@ -710,6 +843,23 @@ button.danger:hover {
   pointer-events: none;
 }
 
+.track-segment {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  min-width: 12px;
+  border-radius: 8px;
+  background: rgba(74, 222, 128, 0.55);
+  border: 1px solid rgba(74, 222, 128, 0.9);
+  color: #052e16;
+  font-size: 11px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  z-index: 2;
+  overflow: hidden;
+}
+
 .track-trim {
   position: absolute;
   top: 4px;
@@ -760,6 +910,20 @@ button.danger:hover {
   background: rgba(0, 0, 0, 0.35);
   color: var(--muted);
   font-size: 0.95rem;
+}
+
+.toast {
+  position: fixed;
+  right: 24px;
+  bottom: 86px;
+  z-index: 30;
+  max-width: min(420px, calc(100vw - 48px));
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  background: rgba(9, 13, 18, 0.94);
+  color: var(--ink);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
 }
 
 @media (max-width: 1000px) {

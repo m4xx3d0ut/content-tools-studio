@@ -89,6 +89,16 @@ export type Overlay = {
   motion?: Motion;
 };
 
+export type SourceSegment = {
+  id: string;
+  label?: string;
+  startFrame: number;
+  endFrameExclusive: number;
+  playbackRate: number;
+  audio: "preserve" | "mute";
+  transition?: { type: "cut" | "crossfade"; durationFrames: number };
+};
+
 export type TemplateTextLayout = {
   xPct: number;
   yPct: number;
@@ -114,6 +124,27 @@ export type ArrowInfo = {
   imagePath: string;
   sourceWidth: number;
   sourceHeight: number;
+};
+
+export type SlugAsset = {
+  id: string;
+  label: string;
+  filename: string;
+  path: string;
+  source: "seed" | "upload";
+  video: {
+    width: number;
+    height: number;
+    fpsNum: number;
+    fpsDen: number;
+    durationMs: number;
+    audio: { hasAudio: boolean; sampleRate?: number; channels?: number };
+  };
+  sizeBytes: number;
+  sha256: string;
+  createdAt: string;
+  updatedAt: string;
+  usageCount?: number;
 };
 
 export type Project = ProjectSummary & {
@@ -153,6 +184,7 @@ export type Project = ProjectSummary & {
       endFrame: number;
       transition?: { type: "cut" | "crossfade"; durationFrames: number };
     }>;
+    sourceSegments: SourceSegment[];
   };
   slug?: {
     introPath?: string;
@@ -178,6 +210,24 @@ export async function listTemplates(): Promise<{
   return request("/templates");
 }
 
+export async function listSlugs(): Promise<SlugAsset[]> {
+  const data = await request<{ slugs: SlugAsset[] }>("/slugs");
+  return data.slugs;
+}
+
+export async function importSlugVideo(file: File): Promise<SlugAsset> {
+  const form = new FormData();
+  form.append("file", file);
+  return request<SlugAsset>("/slugs", {
+    method: "POST",
+    body: form,
+  });
+}
+
+export async function deleteSlug(slugId: string): Promise<{ ok: boolean }> {
+  return request(`/slugs/${slugId}`, { method: "DELETE" });
+}
+
 export async function createProject(name: string): Promise<ProjectSummary> {
   return request<ProjectSummary>("/projects", {
     method: "POST",
@@ -194,6 +244,17 @@ export async function importVideo(projectId: string, file: File): Promise<Projec
   const form = new FormData();
   form.append("file", file);
   return request<ProjectSummary>(`/projects/${projectId}/import`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+export type ProjectBundleMode = "project" | "project-media" | "full";
+
+export async function importProjectBundle(file: File): Promise<Project> {
+  const form = new FormData();
+  form.append("file", file);
+  return request<Project>("/projects/import-bundle", {
     method: "POST",
     body: form,
   });
@@ -234,6 +295,23 @@ export async function renderProject(projectId: string, options: ExportOptions) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
+  });
+}
+
+export async function parseSourceTimeline(
+  projectId: string,
+  text: string,
+  options: { defaultAudio?: "preserve" | "mute"; fastAudio?: "preserve" | "mute" } = {}
+) {
+  return request<{
+    segments: SourceSegment[];
+    warnings: string[];
+    outputDurationSeconds: number;
+    outputFrames: number;
+  }>(`/projects/${projectId}/timeline/parse`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, ...options }),
   });
 }
 
@@ -285,6 +363,15 @@ export function exportLatestUrl(projectId: string): string {
   return `${API_BASE}/projects/${projectId}/exports/latest`;
 }
 
+export function projectBundleUrl(projectId: string, mode: ProjectBundleMode = "project-media"): string {
+  const params = new URLSearchParams({ mode });
+  return `${API_BASE}/projects/${projectId}/bundle?${params.toString()}`;
+}
+
 export function projectEventsUrl(projectId: string): string {
   return `${API_BASE}/projects/${projectId}/events`;
+}
+
+export function slugMediaUrl(slugId: string): string {
+  return `${API_BASE}/slugs/${slugId}/media`;
 }

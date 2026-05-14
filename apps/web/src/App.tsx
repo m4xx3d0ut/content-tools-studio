@@ -15,34 +15,35 @@ import {
   assetUrl,
   createProject,
   deleteProject,
+  deleteSlug,
   exportLatestUrl,
   getProject,
+  importProjectBundle,
+  importSlugVideo,
   importVideo,
   listProjects,
+  listSlugs,
   listTemplates,
   mediaUrl,
+  parseSourceTimeline,
+  projectBundleUrl,
   projectEventsUrl,
   renderStreamUrl,
+  slugMediaUrl,
   thumbnailUrl,
   updateProject,
   type ArrowInfo,
   type Overlay,
   type Project,
+  type ProjectBundleMode,
   type ProjectSummary,
+  type SlugAsset,
+  type SourceSegment,
   type TemplateInfo,
 } from "./api";
 
 const DEFAULT_CARD_SIZE = { w: 1100, h: 180 };
 const DEFAULT_ARROW_SIZE = { w: 128, h: 128 };
-
-const SLUG_OPTIONS = [
-  {
-    id: "k1s-title-variant3",
-    label: "K1s Title Variant 3 (3s)",
-    path: "slug/k1s-title-variant3-motion-loop-3s_1080p30.mp4",
-    fps: 30,
-  },
-];
 
 const DEFAULT_PRESET_ID = "balanced";
 const DEFAULT_CROSSFADE_FRAMES = 12;
@@ -116,6 +117,11 @@ function formatTimecode(frames: number, fps: number) {
   const millis = totalMillis % 1000;
   const pad = (value: number, size = 2) => String(value).padStart(size, "0");
   return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}.${pad(millis, 3)}`;
+}
+
+function formatSeconds(seconds: number) {
+  if (!Number.isFinite(seconds)) return "0.000s";
+  return `${Math.max(0, seconds).toFixed(3)}s`;
 }
 
 function parseTimecode(value: string): number | null {
@@ -275,6 +281,7 @@ export default function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [nameInput, setNameInput] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [videoDurationSec, setVideoDurationSec] = useState(0);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
@@ -292,14 +299,23 @@ export default function App() {
   const [renderReady, setRenderReady] = useState(false);
   const [renderFinalPath, setRenderFinalPath] = useState("");
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
+  const [bundleMode, setBundleMode] = useState<ProjectBundleMode>("project-media");
   const [thumbnailError, setThumbnailError] = useState<string | null>(null);
   const [templateLibrary, setTemplateLibrary] = useState<TemplateInfo[]>([]);
   const [arrowLibrary, setArrowLibrary] = useState<ArrowInfo[]>([]);
+  const [slugLibrary, setSlugLibrary] = useState<SlugAsset[]>([]);
   const [templateImages, setTemplateImages] = useState<Record<string, HTMLImageElement>>({});
   const [arrowImage, setArrowImage] = useState<HTMLImageElement | null>(null);
   const [showHotkeys, setShowHotkeys] = useState(false);
   const [trimStartTime, setTrimStartTime] = useState("00:00:00.000");
   const [trimEndTime, setTrimEndTime] = useState("00:00:00.000");
+  const [sourceTimelineText, setSourceTimelineText] = useState("");
+  const [sourceTimelineWarnings, setSourceTimelineWarnings] = useState<string[]>([]);
+  const [sourceTimelineOutput, setSourceTimelineOutput] = useState<{
+    outputDurationSeconds: number;
+    outputFrames: number;
+  } | null>(null);
+  const [sourceSegmentsOpen, setSourceSegmentsOpen] = useState(false);
   const [editorCenterHeight, setEditorCenterHeight] = useState<number | null>(null);
   const [isDirty, setIsDirty] = useState(false);
   const [externalUpdateAvailable, setExternalUpdateAvailable] = useState(false);
@@ -346,14 +362,28 @@ export default function App() {
     project?.overlays.find((overlay) => overlay.id === selectedOverlayId) ?? null;
   const selectedSlugPath = project?.slug?.introPath ?? project?.slug?.outroPath ?? "";
   const selectedSlugOption =
-    SLUG_OPTIONS.find((option) => option.path === selectedSlugPath) ?? null;
+    slugLibrary.find((option) => option.path === selectedSlugPath) ?? null;
   const slugTransition = project?.slug?.transition ?? {
     type: "cut" as const,
     durationFrames: 0,
   };
   const isRoughPreview = renderOptions.renderMode === "rough";
   const hasAudio = project?.video?.audio?.hasAudio ?? false;
-  const edits = project?.edits ?? { trimStartFrames: 0, trimEndFrames: 0, cuts: [] };
+  const edits = project?.edits ?? {
+    trimStartFrames: 0,
+    trimEndFrames: 0,
+    cuts: [],
+    sourceSegments: [],
+  };
+  const sourceSegments = edits.sourceSegments ?? [];
+  const hasSourceSegments = sourceSegments.length > 0;
+  const sourceSegmentsOutput = useMemo(() => {
+    const outputFrames = sourceSegments.reduce((sum, segment) => {
+      const sourceFrames = Math.max(1, segment.endFrameExclusive - segment.startFrame);
+      return sum + Math.max(1, Math.round(sourceFrames / Math.max(0.01, segment.playbackRate)));
+    }, 0);
+    return { outputFrames, seconds: outputFrames / fps };
+  }, [sourceSegments, fps]);
   const trimRange = useMemo(() => {
     const start = edits.trimStartFrames ?? 0;
     const end = totalFrames - (edits.trimEndFrames ?? 0);
@@ -417,6 +447,16 @@ export default function App() {
 
   const downloadUrl = selectedId ? exportLatestUrl(selectedId) : "";
 
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 4500);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
   async function refreshProjects(nextSelectedId?: string) {
     const list = await listProjects();
     setProjects(list);
@@ -427,6 +467,11 @@ export default function App() {
     if (list.length && !selectedId) {
       setSelectedId(list[0].id);
     }
+  }
+
+  async function refreshSlugs() {
+    const slugs = await listSlugs();
+    setSlugLibrary(slugs);
   }
 
   useEffect(() => {
@@ -440,6 +485,7 @@ export default function App() {
         setArrowLibrary(data.arrows);
       })
       .catch((error: unknown) => setStatus((error as Error).message));
+    refreshSlugs().catch((error: unknown) => setStatus((error as Error).message));
   }, []);
 
   useEffect(() => {
@@ -448,6 +494,7 @@ export default function App() {
       setSelectedOverlayId(null);
       setIsDirty(false);
       setExternalUpdateAvailable(false);
+      setSourceSegmentsOpen(false);
       historyRef.current = { past: [], future: [] };
       return;
     }
@@ -461,6 +508,7 @@ export default function App() {
         setSelectedOverlayId(normalizedProject.overlays[0]?.id ?? null);
         setIsDirty(false);
         setExternalUpdateAvailable(false);
+        setSourceSegmentsOpen(false);
         historyRef.current = { past: [], future: [] };
       })
       .catch((error: unknown) => setStatus((error as Error).message));
@@ -472,21 +520,33 @@ export default function App() {
 
     const refreshFromEvent = (event: MessageEvent<string>) => {
       try {
-        const data = JSON.parse(event.data) as { revision?: number; source?: string };
+        const data = JSON.parse(event.data) as {
+          revision?: number;
+          source?: string;
+          actor?: string;
+          summary?: string;
+        };
         const currentRevision = projectRef.current?.revision ?? 0;
         if (data.source === "snapshot" || !data.revision || data.revision <= currentRevision) {
           return;
         }
+        const message =
+          data.summary ??
+          (data.actor === "agent"
+            ? "Agent updated the project."
+            : "Project refreshed from external update.");
         if (isDirtyRef.current) {
           setExternalUpdateAvailable(true);
           setStatus("External project update available. Save will reload the latest version on conflict.");
+          showToast(message);
           return;
         }
         getProject(selectedId)
           .then((latest) => {
             setProject(latest);
             setExternalUpdateAvailable(false);
-            setStatus("Project refreshed from external update.");
+            setStatus(message);
+            showToast(message);
           })
           .catch((error: unknown) => setStatus((error as Error).message));
       } catch {
@@ -499,14 +559,16 @@ export default function App() {
       refreshProjects();
       setProject(null);
       setSelectedOverlayId(null);
+      setSourceSegmentsOpen(false);
       setStatus("Selected project was deleted externally.");
+      showToast("Selected project was deleted externally.");
     });
     events.onerror = () => {
       events.close();
     };
 
     return () => events.close();
-  }, [selectedId]);
+  }, [selectedId, showToast]);
 
   useEffect(() => {
     setRenderReady(false);
@@ -695,6 +757,50 @@ export default function App() {
     }
   }
 
+  async function handleImportBundle(file: File) {
+    setStatus("Importing project bundle...");
+    try {
+      const imported = await importProjectBundle(file);
+      await refreshProjects(imported.id);
+      setProject(imported);
+      setSelectedOverlayId(imported.overlays[0]?.id ?? null);
+      setSourceSegmentsOpen(false);
+      setIsDirty(false);
+      setExternalUpdateAvailable(false);
+      historyRef.current = { past: [], future: [] };
+      setStatus(`Imported project bundle ${imported.name}.`);
+      showToast(`Imported project bundle ${imported.name}.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    }
+  }
+
+  async function handleImportSlug(file: File) {
+    setStatus("Importing slug video...");
+    try {
+      const asset = await importSlugVideo(file);
+      await refreshSlugs();
+      setStatus(`Imported slug ${asset.label}.`);
+      showToast(`Imported slug ${asset.label}.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    }
+  }
+
+  async function handleDeleteSlug(slug: SlugAsset) {
+    const confirmed = window.confirm(`Delete slug "${slug.label}"?`);
+    if (!confirmed) return;
+    setStatus("Deleting slug...");
+    try {
+      await deleteSlug(slug.id);
+      await refreshSlugs();
+      setStatus(`Deleted slug ${slug.label}.`);
+      showToast(`Deleted slug ${slug.label}.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    }
+  }
+
   function updateProjectState(
     next: Project,
     nextSelectedId?: string | null,
@@ -747,6 +853,7 @@ export default function App() {
       trimStartFrames: project.edits?.trimStartFrames ?? 0,
       trimEndFrames: project.edits?.trimEndFrames ?? 0,
       cuts: project.edits?.cuts ?? [],
+      sourceSegments: project.edits?.sourceSegments ?? [],
       ...patch,
     };
     updateProjectState({ ...project, edits: nextEdits }, undefined, { pushHistory: false });
@@ -804,9 +911,110 @@ export default function App() {
     updateEdits({ cuts: (edits.cuts ?? []).filter((cut) => cut.id !== id) });
   }
 
+  function applySourceSegments(segments: SourceSegment[]) {
+    if (!project) return;
+    setSourceSegmentsOpen(true);
+    const nextEdits = {
+      trimStartFrames: project.edits?.trimStartFrames ?? 0,
+      trimEndFrames: project.edits?.trimEndFrames ?? 0,
+      cuts: project.edits?.cuts ?? [],
+      sourceSegments: segments,
+    };
+    const nextExportOptions = {
+      speed: 1 as const,
+      includeAudio: project.exportOptions?.includeAudio ?? true,
+      includeSlug: project.exportOptions?.includeSlug ?? false,
+      includeSlugStart: project.exportOptions?.includeSlugStart ?? false,
+      includeSlugEnd: project.exportOptions?.includeSlugEnd ?? false,
+    };
+    setRenderOptions((prev) => ({ ...prev, speed: 1 }));
+    updateProjectState(
+      { ...project, edits: nextEdits, exportOptions: nextExportOptions },
+      undefined,
+      { pushHistory: false }
+    );
+  }
+
+  function updateSourceSegment(id: string, patch: Partial<SourceSegment>) {
+    if (!project) return;
+    const nextSegments = sourceSegments.map((segment) => {
+      if (segment.id !== id) return segment;
+      const next = { ...segment, ...patch };
+      const startFrame = Math.max(0, Math.min(formatFrame(next.startFrame), totalFrames - 1));
+      const endFrameExclusive = Math.max(
+        startFrame + 1,
+        Math.min(formatFrame(next.endFrameExclusive), totalFrames)
+      );
+      return {
+        ...next,
+        startFrame,
+        endFrameExclusive,
+        playbackRate: Math.max(0.01, Number(next.playbackRate) || 1),
+        audio: next.audio ?? "preserve",
+      };
+    });
+    applySourceSegments(nextSegments);
+  }
+
+  function removeSourceSegment(id: string) {
+    applySourceSegments(sourceSegments.filter((segment) => segment.id !== id));
+  }
+
+  function moveSourceSegment(id: string, direction: -1 | 1) {
+    const index = sourceSegments.findIndex((segment) => segment.id === id);
+    const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= sourceSegments.length) return;
+    const nextSegments = [...sourceSegments];
+    const [segment] = nextSegments.splice(index, 1);
+    nextSegments.splice(nextIndex, 0, segment);
+    applySourceSegments(nextSegments);
+  }
+
+  function addSourceSegment() {
+    if (!project) return;
+    setSourceSegmentsOpen(true);
+    const startFrame = currentFrame;
+    const endFrameExclusive = Math.min(totalFrames, startFrame + Math.max(1, Math.round(fps * 5)));
+    applySourceSegments([
+      ...sourceSegments,
+      {
+        id: crypto.randomUUID(),
+        label: "Manual segment",
+        startFrame,
+        endFrameExclusive,
+        playbackRate: 1,
+        audio: "preserve",
+        transition: { type: "cut", durationFrames: 0 },
+      },
+    ]);
+  }
+
+  async function parseSourceTimelineRecipe(apply: boolean) {
+    if (!project) return;
+    try {
+      const parsed = await parseSourceTimeline(project.id, sourceTimelineText, {
+        defaultAudio: "preserve",
+      });
+      setSourceTimelineWarnings(parsed.warnings);
+      setSourceTimelineOutput({
+        outputDurationSeconds: parsed.outputDurationSeconds,
+        outputFrames: parsed.outputFrames,
+      });
+      setSourceSegmentsOpen(true);
+      if (apply) {
+        applySourceSegments(parsed.segments);
+        setStatus(`Applied ${parsed.segments.length} source segments.`);
+      } else {
+        setStatus(`Parsed ${parsed.segments.length} source segments.`);
+      }
+    } catch (error) {
+      setStatus((error as Error).message);
+    }
+  }
+
   function applySlugSelection(slugId: string) {
     if (!project) return;
-    const slugOption = SLUG_OPTIONS.find((option) => option.id === slugId) ?? null;
+    const slugOption = slugLibrary.find((option) => option.id === slugId) ?? null;
     if (!slugOption) {
       setRenderOptions((prev) => ({
         ...prev,
@@ -837,7 +1045,10 @@ export default function App() {
         slug: {
           introPath: slugOption.path,
           outroPath: slugOption.path,
-          fps: slugOption.fps,
+          fps:
+            slugOption.video.fpsDen === 0
+              ? 30
+              : slugOption.video.fpsNum / slugOption.video.fpsDen,
           transition: project.slug?.transition ?? {
             type: "cut",
             durationFrames: 0,
@@ -1547,6 +1758,86 @@ export default function App() {
                 )}
               </div>
 
+              <div className="media-section">
+                <h3>Project bundle</h3>
+                <label htmlFor="bundle-mode">Export mode</label>
+                <select
+                  id="bundle-mode"
+                  value={bundleMode}
+                  onChange={(event) => setBundleMode(event.target.value as ProjectBundleMode)}
+                  disabled={!project}
+                >
+                  <option value="project-media">Project + source media</option>
+                  <option value="project">Project document only</option>
+                  <option value="full">Full workspace</option>
+                </select>
+                <div className="actions">
+                  {project ? (
+                    <a
+                      className="button-link"
+                      href={projectBundleUrl(project.id, bundleMode)}
+                    >
+                      Export bundle
+                    </a>
+                  ) : (
+                    <button disabled>Export bundle</button>
+                  )}
+                </div>
+                <label>Import bundle</label>
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) void handleImportBundle(file);
+                  }}
+                />
+              </div>
+
+              <div className="media-section">
+                <h3>Slug library</h3>
+                <label>Import slug MP4</label>
+                <input
+                  type="file"
+                  accept="video/mp4,.mp4"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) void handleImportSlug(file);
+                  }}
+                />
+                <div className="slug-library-list">
+                  {slugLibrary.map((slug) => (
+                    <div className="slug-library-item" key={slug.id}>
+                      <video
+                        className="slug-preview"
+                        src={slugMediaUrl(slug.id)}
+                        controls
+                        muted
+                        preload="metadata"
+                      />
+                      <div>
+                        <strong>{slug.label}</strong>
+                        <div className="details">
+                          {formatSeconds(slug.video.durationMs / 1000)} · {slug.video.width}×
+                          {slug.video.height} · {slug.usageCount ?? 0} project
+                          {(slug.usageCount ?? 0) === 1 ? "" : "s"}
+                        </div>
+                      </div>
+                      <button
+                        className="danger"
+                        disabled={(slug.usageCount ?? 0) > 0}
+                        onClick={() => handleDeleteSlug(slug)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  ))}
+                  {!slugLibrary.length && <div className="details">No slug videos imported.</div>}
+                </div>
+              </div>
+
               <div className="asset-section">
                 <h3>Card templates</h3>
                 <div className="asset-grid">
@@ -2148,42 +2439,62 @@ export default function App() {
                   className="track-playhead"
                   style={{ left: `${(currentFrame / totalFrames) * 100}%` }}
                 />
-                {trimRange.start > 0 && (
-                  <div
-                    className="track-trim"
-                    style={{
-                      left: "0%",
-                      width: `${Math.max(0.5, (trimRange.start / totalFrames) * 100)}%`,
-                    }}
-                    title={`Trimmed start 0 → ${trimRange.start}`}
-                  />
+                {hasSourceSegments ? (
+                  sourceSegments.map((segment, index) => {
+                    const length = Math.max(1, segment.endFrameExclusive - segment.startFrame);
+                    const left = (segment.startFrame / totalFrames) * 100;
+                    const width = (length / totalFrames) * 100;
+                    return (
+                      <div
+                        key={segment.id}
+                        className="track-segment"
+                        style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%` }}
+                        title={`${segment.label || `Segment ${index + 1}`} · ${segment.playbackRate.toFixed(2)}x`}
+                      >
+                        {index + 1}
+                      </div>
+                    );
+                  })
+                ) : (
+                  <>
+                    {trimRange.start > 0 && (
+                      <div
+                        className="track-trim"
+                        style={{
+                          left: "0%",
+                          width: `${Math.max(0.5, (trimRange.start / totalFrames) * 100)}%`,
+                        }}
+                        title={`Trimmed start 0 → ${trimRange.start}`}
+                      />
+                    )}
+                    {trimRange.end < totalFrames && (
+                      <div
+                        className="track-trim"
+                        style={{
+                          left: `${(trimRange.end / totalFrames) * 100}%`,
+                          width: `${Math.max(
+                            0.5,
+                            ((totalFrames - trimRange.end) / totalFrames) * 100
+                          )}%`,
+                        }}
+                        title={`Trimmed end ${trimRange.end} → ${totalFrames}`}
+                      />
+                    )}
+                    {(edits.cuts ?? []).map((cut) => {
+                      const length = Math.max(1, cut.endFrame - cut.startFrame + 1);
+                      const left = (cut.startFrame / totalFrames) * 100;
+                      const width = (length / totalFrames) * 100;
+                      return (
+                        <div
+                          key={cut.id}
+                          className="track-cut"
+                          style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%` }}
+                          title={`Cut ${cut.startFrame} → ${cut.endFrame}`}
+                        />
+                      );
+                    })}
+                  </>
                 )}
-                {trimRange.end < totalFrames && (
-                  <div
-                    className="track-trim"
-                    style={{
-                      left: `${(trimRange.end / totalFrames) * 100}%`,
-                      width: `${Math.max(
-                        0.5,
-                        ((totalFrames - trimRange.end) / totalFrames) * 100
-                      )}%`,
-                    }}
-                    title={`Trimmed end ${trimRange.end} → ${totalFrames}`}
-                  />
-                )}
-                {(edits.cuts ?? []).map((cut) => {
-                  const length = Math.max(1, cut.endFrame - cut.startFrame + 1);
-                  const left = (cut.startFrame / totalFrames) * 100;
-                  const width = (length / totalFrames) * 100;
-                  return (
-                    <div
-                      key={cut.id}
-                      className="track-cut"
-                      style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%` }}
-                      title={`Cut ${cut.startFrame} → ${cut.endFrame}`}
-                    />
-                  );
-                })}
               </div>
             </div>
               <div className="track-row">
@@ -2330,7 +2641,7 @@ export default function App() {
             <select
               id="speed"
               value={renderOptions.speed}
-              disabled={!project}
+              disabled={!project || hasSourceSegments}
               onChange={(event) => {
                 const nextSpeed = Number(event.target.value) as 1 | 2;
                 setRenderOptions((prev) => ({ ...prev, speed: nextSpeed }));
@@ -2365,16 +2676,17 @@ export default function App() {
             <select
               id="slug-select"
               value={selectedSlugOption?.id ?? ""}
-              disabled={!project}
+              disabled={!project || !slugLibrary.length}
               onChange={(event) => applySlugSelection(event.target.value)}
             >
               <option value="">No slug</option>
-              {SLUG_OPTIONS.map((option) => (
+              {slugLibrary.map((option) => (
                 <option key={option.id} value={option.id}>
                   {option.label}
                 </option>
               ))}
             </select>
+            {!slugLibrary.length && <div className="details">Import a slug MP4 to enable slugs.</div>}
           </div>
           <div className="render-setting">
             <label>Include slug</label>
@@ -2435,6 +2747,179 @@ export default function App() {
               }
             />
           </div>
+        </div>
+        <div className="render-divider" />
+        <div className={`segment-section ${sourceSegmentsOpen ? "open" : ""}`}>
+          <div className="segment-header">
+            <button
+              className="segment-toggle"
+              type="button"
+              aria-expanded={sourceSegmentsOpen}
+              aria-controls="source-segments-panel"
+              onClick={() => setSourceSegmentsOpen((value) => !value)}
+            >
+              <span className="segment-chevron" aria-hidden="true" />
+              <span>
+                <span className="segment-title">Source segments</span>
+                <span className="details">
+                  {hasSourceSegments
+                    ? `${sourceSegments.length} kept, ${formatSeconds(sourceSegmentsOutput.seconds)} output`
+                    : "No source segments"}
+                </span>
+              </span>
+            </button>
+            <button className="secondary" onClick={addSourceSegment} disabled={!hasMedia}>
+              Add segment
+            </button>
+          </div>
+          {sourceSegmentsOpen && (
+            <div id="source-segments-panel" className="segment-panel">
+              <textarea
+                className="timeline-recipe"
+                disabled={!hasMedia}
+                value={sourceTimelineText}
+                onChange={(event) => setSourceTimelineText(event.target.value)}
+                placeholder="0s-20s (2x speed) = Opening"
+              />
+              <div className="segment-actions">
+                <button
+                  className="secondary"
+                  disabled={!hasMedia || !sourceTimelineText.trim()}
+                  onClick={() => parseSourceTimelineRecipe(false)}
+                >
+                  Preview recipe
+                </button>
+                <button
+                  disabled={!hasMedia || !sourceTimelineText.trim()}
+                  onClick={() => parseSourceTimelineRecipe(true)}
+                >
+                  Apply recipe
+                </button>
+                {hasSourceSegments && (
+                  <button className="danger" onClick={() => applySourceSegments([])}>
+                    Clear segments
+                  </button>
+                )}
+              </div>
+              {sourceTimelineOutput && (
+                <div className="details">
+                  Preview output {formatSeconds(sourceTimelineOutput.outputDurationSeconds)} ·{" "}
+                  {sourceTimelineOutput.outputFrames} frames
+                </div>
+              )}
+              {sourceTimelineWarnings.map((warning) => (
+                <div key={warning} className="details warning">
+                  {warning}
+                </div>
+              ))}
+              <div className="segment-list">
+            {sourceSegments.map((segment, index) => {
+              const sourceFrames = Math.max(1, segment.endFrameExclusive - segment.startFrame);
+              const outputSeconds = sourceFrames / Math.max(0.01, segment.playbackRate) / fps;
+              return (
+                <div key={segment.id} className="segment-card">
+                  <div className="segment-card-header">
+                    <input
+                      value={segment.label ?? ""}
+                      disabled={!hasMedia}
+                      placeholder={`Segment ${index + 1}`}
+                      onChange={(event) =>
+                        updateSourceSegment(segment.id, { label: event.target.value })
+                      }
+                    />
+                    <div className="segment-move">
+                      <button
+                        className="secondary"
+                        disabled={index === 0}
+                        onClick={() => moveSourceSegment(segment.id, -1)}
+                      >
+                        Up
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={index === sourceSegments.length - 1}
+                        onClick={() => moveSourceSegment(segment.id, 1)}
+                      >
+                        Down
+                      </button>
+                    </div>
+                  </div>
+                  <div className="segment-grid">
+                    <label>
+                      Start
+                      <input
+                        type="number"
+                        min={0}
+                        max={Math.max(0, totalFrames - 1)}
+                        value={segment.startFrame}
+                        disabled={!hasMedia}
+                        onChange={(event) =>
+                          updateSourceSegment(segment.id, {
+                            startFrame: Number(event.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      End
+                      <input
+                        type="number"
+                        min={1}
+                        max={totalFrames}
+                        value={segment.endFrameExclusive}
+                        disabled={!hasMedia}
+                        onChange={(event) =>
+                          updateSourceSegment(segment.id, {
+                            endFrameExclusive: Number(event.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      Speed
+                      <input
+                        type="number"
+                        min={0.01}
+                        step={0.01}
+                        value={Number(segment.playbackRate.toFixed(3))}
+                        disabled={!hasMedia}
+                        onChange={(event) =>
+                          updateSourceSegment(segment.id, {
+                            playbackRate: Number(event.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      Audio
+                      <select
+                        value={segment.audio ?? "preserve"}
+                        disabled={!hasMedia || !hasAudio}
+                        onChange={(event) =>
+                          updateSourceSegment(segment.id, {
+                            audio: event.target.value as "preserve" | "mute",
+                          })
+                        }
+                      >
+                        <option value="preserve">Preserve</option>
+                        <option value="mute">Mute</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="segment-meta">
+                    {formatTimecode(segment.startFrame, fps)} →{" "}
+                    {formatTimecode(segment.endFrameExclusive, fps)} ·{" "}
+                    {formatSeconds(outputSeconds)}
+                  </div>
+                  <button className="danger" onClick={() => removeSourceSegment(segment.id)}>
+                    Remove segment
+                  </button>
+                </div>
+              );
+            })}
+              </div>
+            </div>
+          )}
         </div>
         <div className="render-divider" />
         <div className="trim-section">
@@ -2600,6 +3085,7 @@ export default function App() {
         </div>
       </section>
 
+      {toast && <div className="toast" role="status">{toast}</div>}
       {status && <div className="status">{status}</div>}
       {showHotkeys && (
         <div className="hotkey-overlay" onClick={() => setShowHotkeys(false)}>

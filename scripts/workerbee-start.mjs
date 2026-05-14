@@ -123,6 +123,7 @@ const server = createServer((req, res) => {
     pathname.startsWith("/docs") ||
     pathname.startsWith("/automation") ||
     pathname.startsWith("/projects") ||
+    pathname.startsWith("/slugs") ||
     pathname.startsWith("/templates")
   ) {
     proxyToBackend(req, res);

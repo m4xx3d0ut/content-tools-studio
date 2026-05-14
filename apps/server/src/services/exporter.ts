@@ -1,7 +1,7 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
-import type { Overlay, Project } from "@content-tools/shared";
+import type { Overlay, Project, SourceSegment } from "@content-tools/shared";
 import { DEFAULT_PRESET_ID, EXPORT_PRESETS } from "@content-tools/shared";
 import { FFMPEG_PATH, REPO_ROOT, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
@@ -49,6 +49,8 @@ type ExportManifest = {
   outputFps?: number;
   outputWidth?: number;
   outputHeight?: number;
+  sourceSegmentOutputFrames?: number;
+  sourceSegmentOutputDurationSec?: number;
 };
 
 type FilterResult = {
@@ -90,6 +92,8 @@ type TimelineSegment = {
   endFrame: number;
   durationFrames: number;
   outputStartFrame: number;
+  playbackRate: number;
+  audio: "preserve" | "mute";
 };
 
 const DEFAULT_VIDEO_WIDTH = 1920;
@@ -450,6 +454,7 @@ function buildFilterScript(
     outputFps?: number;
     outputWidth?: number;
     outputHeight?: number;
+    maxDurationSec?: number;
   },
   audioPlan?: AudioPlan
 ): FilterResult {
@@ -467,6 +472,10 @@ function buildFilterScript(
   }
   if (renderTuning?.outputWidth && renderTuning?.outputHeight) {
     baseChain.push(`scale=${renderTuning.outputWidth}:${renderTuning.outputHeight}`);
+  }
+  if (renderTuning?.maxDurationSec && renderTuning.maxDurationSec > 0) {
+    baseChain.push(`trim=duration=${formatNumber(renderTuning.maxDurationSec)}`);
+    baseChain.push("setpts=PTS-STARTPTS");
   }
   lines.push(`${baseChain.join(",")}[v0]`);
 
@@ -530,6 +539,315 @@ function normalizeTransition(input?: {
   return { type: "cut", durationFrames: 0 };
 }
 
+function outputFramesForSegment(segment: Pick<TimelineSegment, "durationFrames" | "playbackRate">): number {
+  return Math.max(1, Math.round(segment.durationFrames / Math.max(0.01, segment.playbackRate)));
+}
+
+function scaleFrameCount(value: number | undefined, playbackRate: number, minimum = 0): number | undefined {
+  if (typeof value !== "number") return undefined;
+  return Math.max(minimum, Math.round(value / Math.max(0.01, playbackRate)));
+}
+
+function buildAtempoFilters(playbackRate: number): string {
+  if (Math.abs(playbackRate - 1) < 0.0001) return "";
+  const filters: number[] = [];
+  let remaining = playbackRate;
+  while (remaining > 2) {
+    filters.push(2);
+    remaining /= 2;
+  }
+  while (remaining < 0.5) {
+    filters.push(0.5);
+    remaining /= 0.5;
+  }
+  if (Math.abs(remaining - 1) >= 0.0001) {
+    filters.push(remaining);
+  }
+  return filters.map((rate) => `,atempo=${formatNumber(rate)}`).join("");
+}
+
+function adjustOverlaysForSegments(project: Project, segments: TimelineSegment[]): Overlay[] {
+  const mapFrame = (frame: number) => {
+    for (const segment of segments) {
+      if (frame >= segment.startFrame && frame < segment.endFrame) {
+        return {
+          outputFrame:
+            segment.outputStartFrame +
+            (frame - segment.startFrame) / Math.max(0.01, segment.playbackRate),
+          segment,
+        };
+      }
+    }
+    return null;
+  };
+
+  const adjustedOverlays: Overlay[] = [];
+  for (const overlay of project.overlays) {
+    const start = mapFrame(overlay.startFrame);
+    if (!start) continue;
+    const segment = start.segment;
+    const segmentOutputFrames = outputFramesForSegment(segment);
+    const segmentEndOutput = segment.outputStartFrame + segmentOutputFrames;
+    const mappedEnd = mapFrame(overlay.endFrame);
+    const nextEnd = mappedEnd
+      ? Math.min(mappedEnd.outputFrame, segmentEndOutput)
+      : segmentEndOutput;
+
+    if (nextEnd <= start.outputFrame) continue;
+    const outputStartFrame = Math.floor(start.outputFrame);
+    const outputEndFrame = Math.max(outputStartFrame, Math.ceil(nextEnd));
+    const nextOverlay: Overlay = {
+      ...overlay,
+      startFrame: outputStartFrame,
+      endFrame: outputEndFrame,
+    };
+
+    if (overlay.motion) {
+      const motion = { ...overlay.motion };
+      if (typeof motion.visibleStartFrame === "number") {
+        const visStart = mapFrame(motion.visibleStartFrame);
+        motion.visibleStartFrame = visStart
+          ? Math.floor(visStart.outputFrame)
+          : nextOverlay.startFrame;
+      }
+      if (typeof motion.visibleEndFrame === "number") {
+        const visEnd = mapFrame(motion.visibleEndFrame);
+        motion.visibleEndFrame = visEnd
+          ? Math.min(Math.ceil(visEnd.outputFrame), nextOverlay.endFrame)
+          : nextOverlay.endFrame;
+      }
+      motion.slideInFrames = scaleFrameCount(motion.slideInFrames, segment.playbackRate);
+      motion.slideOutFrames = scaleFrameCount(motion.slideOutFrames, segment.playbackRate);
+      motion.pulsePeriodFrames = scaleFrameCount(
+        motion.pulsePeriodFrames,
+        segment.playbackRate,
+        1
+      );
+      motion.bouncePeriodFrames = scaleFrameCount(
+        motion.bouncePeriodFrames,
+        segment.playbackRate,
+        1
+      );
+      const scaledDisplayFrames = scaleFrameCount(
+        motion.displayFrames,
+        segment.playbackRate
+      );
+      if (!isArrowOverlay(overlay) && typeof scaledDisplayFrames === "number") {
+        const slideIn = motion.slideInFrames ?? 0;
+        const slideOut = motion.slideOutFrames ?? 0;
+        const available = Math.max(0, segmentEndOutput - outputStartFrame - slideIn - slideOut);
+        motion.displayFrames = Math.min(scaledDisplayFrames, available);
+      } else {
+        motion.displayFrames = scaledDisplayFrames;
+      }
+      nextOverlay.motion = motion;
+    }
+    adjustedOverlays.push(nextOverlay);
+  }
+  return adjustedOverlays;
+}
+
+function normalizeSourceSegmentsForRender(project: Project): SourceSegment[] {
+  const totalFrames = Math.max(
+    1,
+    Math.floor((project.video.durationMs / 1000) * (project.video.fpsNum / project.video.fpsDen))
+  );
+  return (project.edits?.sourceSegments ?? [])
+    .map((segment) => {
+      const startFrame = clampNumber(segment.startFrame, 0, totalFrames - 1);
+      const endFrameExclusive = clampNumber(segment.endFrameExclusive, startFrame + 1, totalFrames);
+      return {
+        ...segment,
+        startFrame,
+        endFrameExclusive,
+        playbackRate: Math.max(0.01, segment.playbackRate),
+        audio: segment.audio ?? "preserve",
+        transition: normalizeTransition(segment.transition),
+      };
+    })
+    .filter((segment) => segment.endFrameExclusive > segment.startFrame);
+}
+
+function combineVideoSegments(
+  baseLines: string[],
+  segments: TimelineSegment[],
+  transitions: TimelineTransition[],
+  segmentLabelPrefix: string,
+  concatLabelPrefix: string,
+  xfadeLabelPrefix: string,
+  fps: number
+): { label: string; outputFrames: number } {
+  let currentLabel = `[${segmentLabelPrefix}0]`;
+  let currentDurationFrames = outputFramesForSegment(segments[0]);
+
+  segments.slice(1).forEach((segment, index) => {
+    const nextLabel = `[${segmentLabelPrefix}${index + 1}]`;
+    const transition = transitions[index] ?? { type: "cut", durationFrames: 0 };
+    if (transition.type === "crossfade" && transition.durationFrames > 0) {
+      const durationFrames = transition.durationFrames;
+      const offsetFrames = Math.max(0, currentDurationFrames - durationFrames);
+      const outLabel = `[${xfadeLabelPrefix}${index + 1}]`;
+      baseLines.push(
+        `${currentLabel}${nextLabel}xfade=transition=fade:duration=${formatNumber(
+          durationFrames / fps
+        )}:offset=${formatNumber(offsetFrames / fps)},setpts=PTS-STARTPTS${outLabel}`
+      );
+      currentDurationFrames =
+        currentDurationFrames + outputFramesForSegment(segment) - durationFrames;
+      currentLabel = outLabel;
+      return;
+    }
+
+    const outLabel = `[${concatLabelPrefix}${index + 1}]`;
+    baseLines.push(
+      `${currentLabel}${nextLabel}concat=n=2:v=1:a=0,setpts=PTS-STARTPTS${outLabel}`
+    );
+    currentDurationFrames += outputFramesForSegment(segment);
+    currentLabel = outLabel;
+  });
+
+  return { label: currentLabel, outputFrames: Math.max(1, currentDurationFrames) };
+}
+
+function combineAudioSegments(
+  audioLines: string[],
+  segments: TimelineSegment[],
+  transitions: TimelineTransition[],
+  fps: number
+): string {
+  let currentAudioLabel = "[a0]";
+
+  segments.slice(1).forEach((segment, index) => {
+    const nextLabel = `[a${index + 1}]`;
+    const transition = transitions[index] ?? { type: "cut", durationFrames: 0 };
+    if (transition.type === "crossfade" && transition.durationFrames > 0) {
+      const durationSec = transition.durationFrames / fps;
+      const outLabel = `[ax${index + 1}]`;
+      audioLines.push(
+        `${currentAudioLabel}${nextLabel}acrossfade=d=${formatNumber(
+          durationSec
+        )}:c1=tri:c2=tri,asetpts=PTS-STARTPTS${outLabel}`
+      );
+      currentAudioLabel = outLabel;
+      return;
+    }
+
+    const outLabel = `[ac${index + 1}]`;
+    audioLines.push(
+      `${currentAudioLabel}${nextLabel}concat=n=2:v=0:a=1,asetpts=PTS-STARTPTS${outLabel}`
+    );
+    currentAudioLabel = outLabel;
+  });
+
+  return currentAudioLabel;
+}
+
+function buildSourceSegmentTimelinePlan(project: Project): {
+  project: Project;
+  baseLabel: string;
+  baseLines: string[];
+  outputFrames: number;
+  audioLabel?: string;
+  audioLines?: string[];
+  usesSourceSegments: boolean;
+} {
+  const fps = project.video.fpsNum / project.video.fpsDen;
+  const hasAudio = Boolean(project.video.audio?.hasAudio);
+  const sourceSegments = normalizeSourceSegmentsForRender(project);
+  if (!sourceSegments.length) {
+    throw new Error("No source segments remain after normalization");
+  }
+
+  const timelineSegments: TimelineSegment[] = [];
+  const transitions = sourceSegments.slice(0, -1).map((segment, index) => {
+    const transition = normalizeTransition(segment.transition);
+    const maxDuration = Math.min(
+      transition.durationFrames,
+      Math.max(1, Math.round((sourceSegments[index].endFrameExclusive - sourceSegments[index].startFrame) / sourceSegments[index].playbackRate)),
+      Math.max(1, Math.round((sourceSegments[index + 1].endFrameExclusive - sourceSegments[index + 1].startFrame) / sourceSegments[index + 1].playbackRate))
+    );
+    return transition.type === "crossfade" && maxDuration > 0
+      ? { type: "crossfade" as const, durationFrames: maxDuration }
+      : { type: "cut" as const, durationFrames: 0 };
+  });
+
+  let outputCursor = 0;
+  sourceSegments.forEach((segment, index) => {
+    const timelineSegment: TimelineSegment = {
+      startFrame: segment.startFrame,
+      endFrame: segment.endFrameExclusive,
+      durationFrames: segment.endFrameExclusive - segment.startFrame,
+      outputStartFrame: outputCursor,
+      playbackRate: segment.playbackRate,
+      audio: segment.audio,
+    };
+    timelineSegments.push(timelineSegment);
+    outputCursor += outputFramesForSegment(timelineSegment);
+    const transition = transitions[index];
+    if (transition?.type === "crossfade") {
+      outputCursor -= transition.durationFrames;
+    }
+  });
+
+  const baseLines: string[] = [];
+  timelineSegments.forEach((segment, index) => {
+    const setpts =
+      Math.abs(segment.playbackRate - 1) < 0.0001
+        ? "PTS-STARTPTS"
+        : `(PTS-STARTPTS)/${formatNumber(segment.playbackRate)}`;
+    baseLines.push(
+      `[0:v]trim=start_frame=${segment.startFrame}:end_frame=${segment.endFrame},setpts=${setpts},fps=${formatNumber(fps)},setpts=PTS-STARTPTS[ss${index}]`
+    );
+  });
+
+  const combined = combineVideoSegments(
+    baseLines,
+    timelineSegments,
+    transitions,
+    "ss",
+    "sc",
+    "sx",
+    fps
+  );
+
+  const audioLines: string[] = [];
+  let audioLabel: string | undefined;
+  if (hasAudio) {
+    const sampleRate = project.video.audio?.sampleRate ?? 48000;
+    timelineSegments.forEach((segment, index) => {
+      const outputDurationSec = outputFramesForSegment(segment) / fps;
+      if (segment.audio === "mute") {
+        audioLines.push(
+          `anullsrc=channel_layout=stereo:sample_rate=${sampleRate},atrim=duration=${formatNumber(
+            outputDurationSec
+          )},asetpts=PTS-STARTPTS[a${index}]`
+        );
+        return;
+      }
+
+      const startSec = segment.startFrame / fps;
+      const endSec = segment.endFrame / fps;
+      audioLines.push(
+        `[0:a]atrim=start=${formatNumber(startSec)}:end=${formatNumber(
+          endSec
+        )},asetpts=PTS-STARTPTS${buildAtempoFilters(segment.playbackRate)},asetpts=PTS-STARTPTS[a${index}]`
+      );
+    });
+
+    audioLabel = combineAudioSegments(audioLines, timelineSegments, transitions, fps);
+  }
+
+  return {
+    project: { ...project, overlays: adjustOverlaysForSegments(project, timelineSegments) },
+    baseLabel: combined.label,
+    baseLines,
+    outputFrames: combined.outputFrames,
+    audioLabel,
+    audioLines: audioLines.length ? audioLines : undefined,
+    usesSourceSegments: true,
+  };
+}
+
 function buildTimelinePlan(project: Project): {
   project: Project;
   baseLabel: string;
@@ -537,7 +855,12 @@ function buildTimelinePlan(project: Project): {
   outputFrames: number;
   audioLabel?: string;
   audioLines?: string[];
+  usesSourceSegments?: boolean;
 } {
+  if (project.edits?.sourceSegments?.length) {
+    return buildSourceSegmentTimelinePlan(project);
+  }
+
   const fps = project.video.fpsNum / project.video.fpsDen;
   const hasAudio = Boolean(project.video.audio?.hasAudio);
   const totalFrames = Math.max(
@@ -599,6 +922,8 @@ function buildTimelinePlan(project: Project): {
         endFrame: cutStart,
         durationFrames: cutStart - cursor,
         outputStartFrame: 0,
+        playbackRate: 1,
+        audio: "preserve",
       });
       if (pendingTransition) {
         transitions.push(pendingTransition);
@@ -617,6 +942,8 @@ function buildTimelinePlan(project: Project): {
       endFrame: keepEnd,
       durationFrames: keepEnd - cursor,
       outputStartFrame: 0,
+      playbackRate: 1,
+      audio: "preserve",
     });
     if (pendingTransition) {
       transitions.push(pendingTransition);
@@ -734,7 +1061,7 @@ function buildTimelinePlan(project: Project): {
       baseLines.push(
         `${currentLabel}${nextLabel}xfade=transition=fade:duration=${formatNumber(
           durationFrames / fps
-        )}:offset=${formatNumber(offsetFrames / fps)}${outLabel}`
+        )}:offset=${formatNumber(offsetFrames / fps)},setpts=PTS-STARTPTS${outLabel}`
       );
       currentDurationFrames =
         currentDurationFrames + segment.durationFrames - durationFrames;
@@ -742,7 +1069,9 @@ function buildTimelinePlan(project: Project): {
       return;
     }
     const outLabel = `[c${index + 1}]`;
-    baseLines.push(`${currentLabel}${nextLabel}concat=n=2:v=1:a=0${outLabel}`);
+    baseLines.push(
+      `${currentLabel}${nextLabel}concat=n=2:v=1:a=0,setpts=PTS-STARTPTS${outLabel}`
+    );
     currentDurationFrames += segment.durationFrames;
     currentLabel = outLabel;
   });
@@ -770,13 +1099,15 @@ function buildTimelinePlan(project: Project): {
         audioLines.push(
           `${currentAudioLabel}${nextLabel}acrossfade=d=${formatNumber(
             durationSec
-          )}:c1=tri:c2=tri${outLabel}`
+          )}:c1=tri:c2=tri,asetpts=PTS-STARTPTS${outLabel}`
         );
         currentAudioLabel = outLabel;
         return;
       }
       const outLabel = `[ac${index + 1}]`;
-      audioLines.push(`${currentAudioLabel}${nextLabel}concat=n=2:v=0:a=1${outLabel}`);
+      audioLines.push(
+        `${currentAudioLabel}${nextLabel}concat=n=2:v=0:a=1,asetpts=PTS-STARTPTS${outLabel}`
+      );
       currentAudioLabel = outLabel;
     });
     audioLabel = currentAudioLabel;
@@ -942,6 +1273,8 @@ async function resolveSlugPath(projectRoot: string, inputPath?: string): Promise
   if (path.isAbsolute(inputPath)) return inputPath;
   const projectCandidate = path.join(projectRoot, inputPath);
   if (await fileExists(projectCandidate)) return projectCandidate;
+  const workspaceCandidate = path.join(WORKSPACE_ROOT, inputPath);
+  if (await fileExists(workspaceCandidate)) return workspaceCandidate;
   const repoCandidate = path.join(REPO_ROOT, inputPath);
   if (await fileExists(repoCandidate)) return repoCandidate;
   return null;
@@ -967,7 +1300,8 @@ export async function writeExportBundle(
   const exportId = new Date().toISOString().replace(/[:.]/g, "-");
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const exportDir = path.join(projectRoot, "exports", exportId);
-  const speed = options.speed ?? project.exportOptions?.speed ?? 1;
+  const requestedSpeed = options.speed ?? project.exportOptions?.speed ?? 1;
+  const speed = timelinePlan.usesSourceSegments ? 1 : requestedSpeed;
   const hasAudio = Boolean(project.video.audio?.hasAudio);
   const includeAudio =
     (typeof options.includeAudio === "boolean"
@@ -987,12 +1321,17 @@ export async function writeExportBundle(
       : includeSlug || project.exportOptions?.includeSlugEnd || false;
   const presetId = renderTuning.presetId;
 
+  const sourceFps = project.video.fpsNum / project.video.fpsDen;
+  const sourceSegmentOutputDurationSec = timelinePlan.usesSourceSegments
+    ? timelinePlan.outputFrames / sourceFps
+    : undefined;
   const filterTuning =
-    renderTuning.mode === "rough"
+    renderTuning.mode === "rough" || sourceSegmentOutputDurationSec
       ? {
           outputFps: renderTuning.outputFps,
           outputWidth: renderTuning.outputWidth,
           outputHeight: renderTuning.outputHeight,
+          maxDurationSec: sourceSegmentOutputDurationSec,
         }
       : undefined;
 
@@ -1067,6 +1406,8 @@ export async function writeExportBundle(
     outputFps: renderTuning.outputFps,
     outputWidth: renderTuning.outputWidth,
     outputHeight: renderTuning.outputHeight,
+    sourceSegmentOutputFrames: timelinePlan.usesSourceSegments ? timelinePlan.outputFrames : undefined,
+    sourceSegmentOutputDurationSec,
   };
 
   const readme = buildReadme(exportDir, manifest, cardInputs, arrowInputs);
@@ -1148,7 +1489,7 @@ export async function renderFinal(
   );
 
   const fps = project.video.fpsNum / project.video.fpsDen;
-  const durationSec = outputFrames / fps / (options.speed ?? 1);
+  const durationSec = outputFrames / fps / manifest.speed;
   await runFfmpeg(args, exportDir, onProgress, durationSec, "ffmpeg-main");
 
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);

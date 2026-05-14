@@ -1,5 +1,13 @@
 import type { CommandResult, EditorCommand, OverlayPatch } from "./automation.js";
-import { ProjectSchema, type Overlay, type Project, type VideoInfo } from "./project.js";
+import {
+  ProjectSchema,
+  SourceSegmentSchema,
+  type Overlay,
+  type Project,
+  type SourceSegment,
+  type VideoInfo,
+} from "./project.js";
+import { parseSourceTimelineText } from "./source-timeline.js";
 
 export const DEFAULT_CARD_SIZE = { w: 1100, h: 180 };
 export const DEFAULT_ARROW_SIZE = { w: 128, h: 128 };
@@ -254,6 +262,7 @@ function getCompleteEdits(project: Project): NonNullable<Project["edits"]> {
     trimStartFrames: project.edits?.trimStartFrames ?? 0,
     trimEndFrames: project.edits?.trimEndFrames ?? 0,
     cuts: project.edits?.cuts ?? [],
+    sourceSegments: project.edits?.sourceSegments ?? [],
   };
 }
 
@@ -265,6 +274,36 @@ function getCompleteExportOptions(project: Project): NonNullable<Project["export
     includeSlugStart: project.exportOptions?.includeSlugStart ?? false,
     includeSlugEnd: project.exportOptions?.includeSlugEnd ?? false,
   };
+}
+
+function normalizeSourceSegment(
+  input: {
+    id?: string;
+    label?: string;
+    startFrame: number;
+    endFrameExclusive: number;
+    playbackRate: number;
+    audio?: SourceSegment["audio"];
+    transition?: { type?: "cut" | "crossfade"; durationFrames?: number };
+  },
+  totalFrames: number,
+  createId: () => string
+): SourceSegment {
+  const startFrame = clampNumber(input.startFrame, 0, totalFrames - 1);
+  const endFrameExclusive = clampNumber(
+    input.endFrameExclusive,
+    startFrame + 1,
+    totalFrames
+  );
+  return SourceSegmentSchema.parse({
+    ...input,
+    id: input.id ?? createId(),
+    startFrame,
+    endFrameExclusive,
+    playbackRate: Math.max(0.01, input.playbackRate),
+    audio: input.audio ?? "preserve",
+    transition: normalizeTransition(input.transition),
+  });
 }
 
 export function applyEditorCommands(
@@ -410,6 +449,114 @@ export function applyEditorCommands(
       }
       next = { ...next, edits: { ...edits, cuts } };
       results.push({ index, type: command.type, cutId: command.id });
+      return;
+    }
+
+    if (command.type === "setSourceSegments") {
+      const totalFrames = getProjectTotalFrames(next);
+      const edits = getCompleteEdits(next);
+      const segments = command.segments.map((segment) =>
+        normalizeSourceSegment(segment, totalFrames, context.createId)
+      );
+      next = {
+        ...next,
+        edits: { ...edits, sourceSegments: segments },
+        exportOptions: { ...getCompleteExportOptions(next), speed: 1 },
+      };
+      results.push({ index, type: command.type });
+      return;
+    }
+
+    if (command.type === "addSourceSegment") {
+      const totalFrames = getProjectTotalFrames(next);
+      const edits = getCompleteEdits(next);
+      const segment = normalizeSourceSegment(
+        command.segment,
+        totalFrames,
+        context.createId
+      );
+      next = {
+        ...next,
+        edits: { ...edits, sourceSegments: [...edits.sourceSegments, segment] },
+        exportOptions: { ...getCompleteExportOptions(next), speed: 1 },
+      };
+      results.push({ index, type: command.type, sourceSegmentId: segment.id });
+      return;
+    }
+
+    if (command.type === "updateSourceSegment") {
+      const totalFrames = getProjectTotalFrames(next);
+      const edits = getCompleteEdits(next);
+      let found = false;
+      const sourceSegments = edits.sourceSegments.map((segment) => {
+        if (segment.id !== command.id) return segment;
+        found = true;
+        return normalizeSourceSegment(
+          { ...segment, ...command.patch, id: segment.id },
+          totalFrames,
+          context.createId
+        );
+      });
+      if (!found) throw new Error(`source segment not found: ${command.id}`);
+      next = {
+        ...next,
+        edits: { ...edits, sourceSegments },
+        exportOptions: { ...getCompleteExportOptions(next), speed: 1 },
+      };
+      results.push({ index, type: command.type, sourceSegmentId: command.id });
+      return;
+    }
+
+    if (command.type === "removeSourceSegment") {
+      const edits = getCompleteEdits(next);
+      const sourceSegments = edits.sourceSegments.filter((segment) => segment.id !== command.id);
+      if (sourceSegments.length === edits.sourceSegments.length) {
+        throw new Error(`source segment not found: ${command.id}`);
+      }
+      next = {
+        ...next,
+        edits: { ...edits, sourceSegments },
+        exportOptions: { ...getCompleteExportOptions(next), speed: 1 },
+      };
+      results.push({ index, type: command.type, sourceSegmentId: command.id });
+      return;
+    }
+
+    if (command.type === "reorderSourceSegments") {
+      const edits = getCompleteEdits(next);
+      const byId = new Map(edits.sourceSegments.map((segment) => [segment.id, segment]));
+      const ordered = command.segmentIds.map((id) => {
+        const segment = byId.get(id);
+        if (!segment) throw new Error(`source segment not found: ${id}`);
+        byId.delete(id);
+        return segment;
+      });
+      next = {
+        ...next,
+        edits: { ...edits, sourceSegments: [...ordered, ...byId.values()] },
+        exportOptions: { ...getCompleteExportOptions(next), speed: 1 },
+      };
+      results.push({ index, type: command.type });
+      return;
+    }
+
+    if (command.type === "setSourceSegmentsFromText") {
+      const fps = getVideoFps(next.video);
+      const totalFrames = getProjectTotalFrames(next);
+      const parsed = parseSourceTimelineText(command.text, {
+        fps,
+        totalFrames,
+        createId: context.createId,
+        defaultAudio: command.defaultAudio,
+        fastAudio: command.fastAudio,
+      });
+      const edits = getCompleteEdits(next);
+      next = {
+        ...next,
+        edits: { ...edits, sourceSegments: parsed.segments },
+        exportOptions: { ...getCompleteExportOptions(next), speed: 1 },
+      };
+      results.push({ index, type: command.type });
       return;
     }
 

@@ -7,6 +7,11 @@ import {
   EditorCommandSchema,
   OverlaySchema,
   ProjectSchema,
+  SourceSegmentSchema,
+  SourceTimelineParseRequestSchema,
+  SourceTimelineParseResponseSchema,
+  SlugAssetSchema,
+  SlugListResponseSchema,
   VideoSchema,
 } from "@content-tools/shared";
 import type { ZodTypeAny } from "zod";
@@ -25,6 +30,17 @@ export const openApiSchemas = {
   Overlay: componentFromZod("Overlay", OverlaySchema),
   VideoInfo: componentFromZod("VideoInfo", VideoSchema),
   EditorCommand: componentFromZod("EditorCommand", EditorCommandSchema),
+  SourceSegment: componentFromZod("SourceSegment", SourceSegmentSchema),
+  SlugAsset: componentFromZod("SlugAsset", SlugAssetSchema),
+  SlugListResponse: componentFromZod("SlugListResponse", SlugListResponseSchema),
+  SourceTimelineParseRequest: componentFromZod(
+    "SourceTimelineParseRequest",
+    SourceTimelineParseRequestSchema
+  ),
+  SourceTimelineParseResponse: componentFromZod(
+    "SourceTimelineParseResponse",
+    SourceTimelineParseResponseSchema
+  ),
   CommandBatchRequest: componentFromZod("CommandBatchRequest", CommandBatchRequestSchema),
   CommandBatchResponse: componentFromZod("CommandBatchResponse", CommandBatchResponseSchema),
   AutomationCapabilities: componentFromZod(
@@ -41,6 +57,24 @@ export const openApiSchemas = {
       includeSlugEnd: { type: "boolean" },
       speed: { type: "integer", enum: [1, 2] },
       renderMode: { type: "string", enum: ["final", "rough"] },
+    },
+  },
+  ProjectBundleMode: {
+    type: "string",
+    enum: ["project", "project-media", "full"],
+  },
+  ProjectBundleImport: {
+    type: "object",
+    required: ["file"],
+    properties: {
+      file: { type: "string", format: "binary" },
+    },
+  },
+  SlugImport: {
+    type: "object",
+    required: ["file"],
+    properties: {
+      file: { type: "string", format: "binary" },
     },
   },
   TemplateInfo: {
@@ -154,6 +188,23 @@ function patchJsonRequestBody(
   };
 }
 
+function patchMultipartRequestBody(
+  document: Record<string, unknown>,
+  path: string,
+  method: string,
+  schema: unknown
+) {
+  const paths = document.paths as Record<string, Record<string, Record<string, unknown>>>;
+  const operation = paths?.[path]?.[method];
+  if (!operation) return;
+  operation.requestBody = {
+    required: true,
+    content: {
+      "multipart/form-data": { schema },
+    },
+  };
+}
+
 function patchJsonResponse(
   document: Record<string, unknown>,
   path: string,
@@ -177,12 +228,27 @@ export function openApiDocument(app: FastifyInstance): Record<string, unknown> {
     },
   });
   patchJsonResponse(document, "/projects", "post", "201", ref("Project"));
+  patchMultipartRequestBody(document, "/projects/import-bundle", "post", ref("ProjectBundleImport"));
+  patchJsonResponse(document, "/projects/import-bundle", "post", "201", ref("Project"));
   patchJsonResponse(document, "/projects/{id}", "get", "200", ref("Project"));
   patchJsonRequestBody(document, "/projects/{id}", "put", ref("Project"));
   patchJsonResponse(document, "/projects/{id}", "put", "200", ref("Project"));
   patchJsonResponse(document, "/projects/{id}/import", "post", "200", ref("Project"));
   patchJsonRequestBody(document, "/projects/{id}/commands", "post", ref("CommandBatchRequest"));
   patchJsonResponse(document, "/projects/{id}/commands", "post", "200", ref("CommandBatchResponse"));
+  patchJsonRequestBody(
+    document,
+    "/projects/{id}/timeline/parse",
+    "post",
+    ref("SourceTimelineParseRequest")
+  );
+  patchJsonResponse(
+    document,
+    "/projects/{id}/timeline/parse",
+    "post",
+    "200",
+    ref("SourceTimelineParseResponse")
+  );
   patchJsonResponse(
     document,
     "/automation/capabilities",
@@ -190,9 +256,20 @@ export function openApiDocument(app: FastifyInstance): Record<string, unknown> {
     "200",
     ref("AutomationCapabilities")
   );
+  patchJsonResponse(document, "/slugs", "get", "200", ref("SlugListResponse"));
+  patchMultipartRequestBody(document, "/slugs", "post", ref("SlugImport"));
+  patchJsonResponse(document, "/slugs", "post", "201", ref("SlugAsset"));
+  patchPathContent(document, "/slugs/{id}/media", "get", "200", "video/mp4", {
+    type: "string",
+    format: "binary",
+  });
   patchJsonRequestBody(document, "/projects/{id}/export", "post", ref("ExportOptions"));
   patchJsonRequestBody(document, "/projects/{id}/render", "post", ref("ExportOptions"));
   patchPathContent(document, "/projects/{id}/media", "get", "200", "video/mp4", {
+    type: "string",
+    format: "binary",
+  });
+  patchPathContent(document, "/projects/{id}/bundle", "get", "200", "application/zip", {
     type: "string",
     format: "binary",
   });

@@ -5,7 +5,9 @@ import {
   ProjectSchema,
   RectSchema,
   SlugSchema,
+  SourceSegmentSchema,
 } from "./project.js";
+import { SourceSegmentAudioSchema } from "./source-timeline.js";
 
 const FieldValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
@@ -101,6 +103,58 @@ const RemoveCutCommandSchema = z.object({
   id: z.string().min(1),
 });
 
+const SourceSegmentInputSchema = z.object({
+  id: z.string().min(1).optional(),
+  label: z.string().optional(),
+  startFrame: z.number().int().nonnegative(),
+  endFrameExclusive: z.number().int().positive(),
+  playbackRate: z.number().finite().positive(),
+  audio: SourceSegmentAudioSchema.optional(),
+  transition: TransitionInputSchema,
+});
+
+const SourceSegmentPatchSchema = z.object({
+  label: z.string().optional(),
+  startFrame: z.number().int().nonnegative().optional(),
+  endFrameExclusive: z.number().int().positive().optional(),
+  playbackRate: z.number().finite().positive().optional(),
+  audio: SourceSegmentAudioSchema.optional(),
+  transition: TransitionInputSchema,
+});
+
+const SetSourceSegmentsCommandSchema = z.object({
+  type: z.literal("setSourceSegments"),
+  segments: z.array(SourceSegmentSchema),
+});
+
+const AddSourceSegmentCommandSchema = z.object({
+  type: z.literal("addSourceSegment"),
+  segment: SourceSegmentInputSchema,
+});
+
+const UpdateSourceSegmentCommandSchema = z.object({
+  type: z.literal("updateSourceSegment"),
+  id: z.string().min(1),
+  patch: SourceSegmentPatchSchema,
+});
+
+const RemoveSourceSegmentCommandSchema = z.object({
+  type: z.literal("removeSourceSegment"),
+  id: z.string().min(1),
+});
+
+const ReorderSourceSegmentsCommandSchema = z.object({
+  type: z.literal("reorderSourceSegments"),
+  segmentIds: z.array(z.string().min(1)),
+});
+
+const SetSourceSegmentsFromTextCommandSchema = z.object({
+  type: z.literal("setSourceSegmentsFromText"),
+  text: z.string().min(1),
+  defaultAudio: SourceSegmentAudioSchema.optional(),
+  fastAudio: SourceSegmentAudioSchema.optional(),
+});
+
 const SetSlugCommandSchema = z.object({
   type: z.literal("setSlug"),
   slug: SlugSchema.unwrap().nullable(),
@@ -121,12 +175,20 @@ export const EditorCommandSchema = z.discriminatedUnion("type", [
   AddCutCommandSchema,
   UpdateCutCommandSchema,
   RemoveCutCommandSchema,
+  SetSourceSegmentsCommandSchema,
+  AddSourceSegmentCommandSchema,
+  UpdateSourceSegmentCommandSchema,
+  RemoveSourceSegmentCommandSchema,
+  ReorderSourceSegmentsCommandSchema,
+  SetSourceSegmentsFromTextCommandSchema,
   SetSlugCommandSchema,
   SetExportOptionsCommandSchema,
 ]);
 
 export const CommandBatchRequestSchema = z.object({
   baseRevision: z.number().int().nonnegative().optional(),
+  actor: z.string().min(1).optional(),
+  summary: z.string().min(1).optional(),
   commands: z.array(EditorCommandSchema).min(1),
 });
 
@@ -135,6 +197,7 @@ export const CommandResultSchema = z.object({
   type: z.string().min(1),
   overlayId: z.string().optional(),
   cutId: z.string().optional(),
+  sourceSegmentId: z.string().optional(),
 });
 
 export const CommandBatchResponseSchema = z.object({
@@ -151,8 +214,15 @@ export const AutomationCapabilitiesSchema = z.object({
     overlays: z.literal("endFrame-inclusive"),
     cuts: z.literal("endFrame-inclusive"),
     trim: z.literal("endFrameExclusive"),
+    sourceSegments: z.literal("endFrameExclusive"),
   }),
   commands: z.array(z.string()),
+  slugLibrary: z.object({
+    list: z.string(),
+    import: z.string(),
+    media: z.string(),
+    delete: z.string(),
+  }),
 });
 
 export type OverlayPatch = z.infer<typeof OverlayPatchSchema>;

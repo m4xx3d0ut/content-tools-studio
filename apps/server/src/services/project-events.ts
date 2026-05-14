@@ -7,6 +7,9 @@ export type ProjectEvent = {
   revision?: number;
   source: string;
   at: string;
+  actor?: string;
+  summary?: string;
+  commands?: string[];
 };
 
 const projectEvents = new EventEmitter();
@@ -20,13 +23,18 @@ export function onProjectEvent(
   return () => projectEvents.off(projectId, listener);
 }
 
-export function emitProjectUpdated(project: Project, source: string): void {
+export function emitProjectUpdated(
+  project: Project,
+  source: string,
+  details: Pick<ProjectEvent, "actor" | "summary" | "commands"> = {}
+): void {
   const event: ProjectEvent = {
     type: "project-updated",
     projectId: project.id,
     revision: project.revision,
     source,
     at: new Date().toISOString(),
+    ...details,
   };
   projectEvents.emit(project.id, event);
 }

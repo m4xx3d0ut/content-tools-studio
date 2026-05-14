@@ -1,9 +1,14 @@
 import type { FastifyPluginAsync, FastifyReply } from "fastify";
-import type { Project, VideoInfo } from "@content-tools/shared";
+import type { Project, SlugAsset, VideoInfo } from "@content-tools/shared";
 import {
   applyEditorCommands,
   CommandBatchRequestSchema,
+  getProjectTotalFrames,
+  getVideoFps,
+  parseSourceTimelineText,
   ProjectSchema,
+  SlugAssetSchema,
+  SourceTimelineParseRequestSchema,
   type ArrowForEditing,
   type TemplateForEditing,
 } from "@content-tools/shared";
@@ -12,10 +17,12 @@ import { promises as fs, createWriteStream, createReadStream } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
+import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 import {
   createProject,
   deleteProject,
   listProjects,
+  projectDir,
   readProject,
   writeProject,
 } from "../services/workspace.js";
@@ -26,6 +33,12 @@ import { ensureDir, fileExists } from "../utils/fs.js";
 import { ensureThumbnail } from "../services/thumbnails.js";
 import { getTemplateCrop } from "../services/template-assets.js";
 import { listTemplates } from "../services/templates.js";
+import {
+  getSlugAssetByPath,
+  isManagedSlugPath,
+  slugAssetFilePath,
+  upsertSlugAssets,
+} from "../services/slugs.js";
 import {
   emitProjectDeleted,
   emitProjectUpdated,
@@ -42,6 +55,10 @@ import {
 
 const NORMALIZED_WIDTH = 1920;
 const NORMALIZED_HEIGHT = 1080;
+const BUNDLE_MANIFEST_FILENAME = "manifest.json";
+const BUNDLE_PROJECT_FILENAME = "project.json";
+const BUNDLE_MODE_VALUES = ["project", "project-media", "full"] as const;
+type BundleMode = (typeof BUNDLE_MODE_VALUES)[number];
 
 async function runFfmpeg(args: string[]): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -141,6 +158,226 @@ function sendProjectEvent(reply: FastifyReply, event: ProjectEvent): void {
   reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
+function sanitizeArchiveName(value: string): string {
+  return value.replace(/[^a-z0-9-_]+/gi, "_") || "project";
+}
+
+function toPosix(inputPath: string): string {
+  return inputPath.replace(/\\/g, "/");
+}
+
+function resolveBundleMode(raw: unknown): BundleMode {
+  return typeof raw === "string" && (BUNDLE_MODE_VALUES as readonly string[]).includes(raw)
+    ? (raw as BundleMode)
+    : "project-media";
+}
+
+function normalizeBundleEntryPath(entryPath: string): string | null {
+  const normalized = path.posix.normalize(entryPath.replace(/\\/g, "/"));
+  if (
+    !normalized ||
+    normalized === "." ||
+    normalized === ".." ||
+    normalized.startsWith("../") ||
+    normalized.includes("/../")
+  ) {
+    return null;
+  }
+  if (path.posix.isAbsolute(normalized)) return null;
+  return normalized;
+}
+
+function isAllowedBundleEntry(entryPath: string): boolean {
+  return (
+    entryPath === BUNDLE_MANIFEST_FILENAME ||
+    entryPath === BUNDLE_PROJECT_FILENAME ||
+    entryPath.startsWith("media/") ||
+    entryPath.startsWith("render/") ||
+    entryPath.startsWith("exports/") ||
+    entryPath.startsWith("slugs/media/")
+  );
+}
+
+async function addBundleFile(
+  entries: Record<string, Uint8Array>,
+  rootDir: string,
+  relativePath: string
+): Promise<void> {
+  const filePath = path.join(rootDir, relativePath);
+  if (!(await fileExists(filePath))) return;
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile()) return;
+  entries[toPosix(relativePath)] = new Uint8Array(await fs.readFile(filePath));
+}
+
+async function addBundleDirectory(
+  entries: Record<string, Uint8Array>,
+  rootDir: string,
+  relativeDir: string
+): Promise<void> {
+  const directory = path.join(rootDir, relativeDir);
+  if (!(await fileExists(directory))) return;
+  const dirEntries = await fs.readdir(directory, { withFileTypes: true });
+  for (const entry of dirEntries) {
+    const childRelative = path.join(relativeDir, entry.name);
+    if (entry.isDirectory()) {
+      await addBundleDirectory(entries, rootDir, childRelative);
+      continue;
+    }
+    if (entry.isFile()) {
+      await addBundleFile(entries, rootDir, childRelative);
+    }
+  }
+}
+
+function getProjectManagedSlugPaths(project: Project): string[] {
+  return [
+    project.slug?.introPath,
+    project.slug?.outroPath,
+  ].filter((value): value is string => Boolean(value && isManagedSlugPath(value)));
+}
+
+async function collectProjectSlugAssets(
+  entries: Record<string, Uint8Array>,
+  project: Project
+): Promise<SlugAsset[]> {
+  const assets: SlugAsset[] = [];
+  const seenPaths = new Set<string>();
+  for (const slugPath of getProjectManagedSlugPaths(project)) {
+    if (seenPaths.has(slugPath)) continue;
+    seenPaths.add(slugPath);
+    const asset = await getSlugAssetByPath(slugPath);
+    if (!asset) continue;
+    if (!(await fileExists(slugAssetFilePath(asset)))) continue;
+    await addBundleFile(entries, WORKSPACE_ROOT, asset.path);
+    assets.push(asset);
+  }
+  return assets;
+}
+
+async function buildProjectBundle(project: Project, mode: BundleMode): Promise<Buffer> {
+  const rootDir = projectDir(project.id);
+  const entries: Record<string, Uint8Array> = {
+    [BUNDLE_PROJECT_FILENAME]: strToU8(JSON.stringify(project, null, 2)),
+  };
+
+  if (mode === "project-media") {
+    await addBundleFile(entries, rootDir, path.join("media", project.source.filename));
+  }
+
+  if (mode === "full") {
+    await addBundleDirectory(entries, rootDir, "media");
+    await addBundleDirectory(entries, rootDir, "render");
+    await addBundleDirectory(entries, rootDir, "exports");
+  }
+
+  const slugAssets = mode === "project-media" || mode === "full"
+    ? await collectProjectSlugAssets(entries, project)
+    : [];
+  entries[BUNDLE_MANIFEST_FILENAME] = strToU8(
+    JSON.stringify(
+      {
+        apiVersion: "content-tools.bundle/v1",
+        projectId: project.id,
+        projectName: project.name,
+        mode,
+        createdAt: new Date().toISOString(),
+        slugAssets,
+      },
+      null,
+      2
+    )
+  );
+
+  return Buffer.from(zipSync(entries, { level: 6 }));
+}
+
+async function importProjectBundleFromZip(payload: Buffer): Promise<Project> {
+  let archive: Record<string, Uint8Array>;
+  try {
+    archive = unzipSync(new Uint8Array(payload));
+  } catch (error) {
+    throw new Error(`invalid project bundle: ${(error as Error).message}`);
+  }
+
+  const safeEntries = Object.entries(archive)
+    .map(([entryPath, value]) => [normalizeBundleEntryPath(entryPath), value] as const)
+    .filter((entry): entry is readonly [string, Uint8Array] => Boolean(entry[0]));
+
+  const projectEntry = safeEntries.find(([entryPath]) => entryPath === BUNDLE_PROJECT_FILENAME);
+  if (!projectEntry) {
+    throw new Error("project bundle is missing project.json");
+  }
+  const manifestEntry = safeEntries.find(
+    ([entryPath]) => entryPath === BUNDLE_MANIFEST_FILENAME
+  );
+  const bundledSlugAssets = manifestEntry
+    ? ((JSON.parse(strFromU8(manifestEntry[1])) as { slugAssets?: unknown[] }).slugAssets ?? [])
+        .map((asset) => SlugAssetSchema.safeParse(asset))
+        .filter((result) => result.success)
+        .map((result) => result.data)
+    : [];
+
+  const sourceProject = ProjectSchema.parse(JSON.parse(strFromU8(projectEntry[1])));
+  const newProjectId = randomUUID();
+  const newProjectRoot = projectDir(newProjectId);
+  await ensureDir(newProjectRoot);
+  const resolvedRoot = path.resolve(newProjectRoot);
+  const resolvedWorkspaceRoot = path.resolve(WORKSPACE_ROOT);
+
+  for (const [entryPath, value] of safeEntries) {
+    if (!isAllowedBundleEntry(entryPath)) continue;
+    if (entryPath === BUNDLE_PROJECT_FILENAME || entryPath === BUNDLE_MANIFEST_FILENAME) continue;
+    const targetBase = entryPath.startsWith("slugs/") ? WORKSPACE_ROOT : newProjectRoot;
+    const resolvedBase = entryPath.startsWith("slugs/") ? resolvedWorkspaceRoot : resolvedRoot;
+    const targetPath = path.resolve(targetBase, entryPath);
+    if (targetPath !== resolvedBase && !targetPath.startsWith(`${resolvedBase}${path.sep}`)) {
+      throw new Error(`unsafe bundle entry path: ${entryPath}`);
+    }
+    await ensureDir(path.dirname(targetPath));
+    await fs.writeFile(targetPath, Buffer.from(value));
+  }
+
+  if (bundledSlugAssets.length) {
+    await upsertSlugAssets(bundledSlugAssets);
+  }
+
+  let source: Project["source"] = { filename: sourceProject.source.filename };
+  const sourcePath = path.join(newProjectRoot, "media", sourceProject.source.filename);
+  if (await fileExists(sourcePath)) {
+    const stat = await fs.stat(sourcePath);
+    source = {
+      filename: sourceProject.source.filename,
+      sizeBytes: stat.size,
+      sha256: await hashFile(sourcePath),
+    };
+  }
+
+  const now = new Date().toISOString();
+  const importedProject = ProjectSchema.parse({
+    ...sourceProject,
+    id: newProjectId,
+    revision: 1,
+    createdAt: now,
+    updatedAt: now,
+    source,
+    renderCache: { overlayAssetHash: {} },
+  });
+  await writeProject(importedProject);
+  return importedProject;
+}
+
+function summarizeCommands(project: Project, commandTypes: string[]): string {
+  if (commandTypes.includes("setSourceSegmentsFromText") || commandTypes.includes("setSourceSegments")) {
+    const count = project.edits?.sourceSegments?.length ?? 0;
+    return `Agent applied ${count} source segment${count === 1 ? "" : "s"}.`;
+  }
+  if (commandTypes.length === 1) {
+    return `Agent applied ${commandTypes[0]}.`;
+  }
+  return `Agent applied ${commandTypes.length} commands.`;
+}
+
 export const projectsRoutes: FastifyPluginAsync = async (app) => {
   app.get(
     "/",
@@ -197,6 +434,36 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return reply.code(201).send(project);
   });
 
+  app.post(
+    "/import-bundle",
+    routeDoc(["Projects"], "Import a project bundle", {
+      consumes: ["multipart/form-data"],
+      response: { 201: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
+      const data = await request.file();
+      if (!data) {
+        return reply.code(400).send({ error: "file is required" });
+      }
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of data.file) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+
+      try {
+        const project = await importProjectBundleFromZip(Buffer.concat(chunks));
+        emitProjectUpdated(project, "bundle-import", {
+          actor: "api",
+          summary: `Imported project bundle ${project.name}.`,
+        });
+        return reply.code(201).send(project);
+      } catch (error) {
+        return reply.code(400).send({ error: (error as Error).message });
+      }
+    }
+  );
+
   app.get(
     "/:id",
     routeDoc(["Projects"], "Get a project", {
@@ -211,6 +478,37 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     }
     return project;
   });
+
+  app.get(
+    "/:id/bundle",
+    routeDoc(["Projects"], "Download a project bundle", {
+      params: projectIdParamsSchema,
+      querystring: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: [...BUNDLE_MODE_VALUES] },
+        },
+      },
+      response: { 200: { type: "string", format: "binary" }, ...errorResponses },
+      produces: ["application/zip"],
+    }),
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const project = await readProject(id);
+      if (!project) {
+        return reply.code(404).send({ error: "project not found" });
+      }
+
+      const mode = resolveBundleMode((request.query as { mode?: string }).mode);
+      const bundle = await buildProjectBundle(project, mode);
+      const filename = `${sanitizeArchiveName(project.name)}-${project.id}-${mode}.zip`;
+      reply
+        .header("Content-Length", bundle.length)
+        .header("Content-Disposition", `attachment; filename="${filename}"`)
+        .type("application/zip");
+      return reply.send(bundle);
+    }
+  );
 
   app.delete(
     "/:id",
@@ -276,7 +574,10 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     await writeProject(project);
-    emitProjectUpdated(project, "put");
+    emitProjectUpdated(project, "put", {
+      actor: "api",
+      summary: "Project document was replaced through the API.",
+    });
     return project;
   });
 
@@ -344,7 +645,10 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     await writeProject(updatedProject);
-    emitProjectUpdated(updatedProject, "import");
+    emitProjectUpdated(updatedProject, "import", {
+      actor: "api",
+      summary: `Imported source video ${finalFilename}.`,
+    });
     return updatedProject;
   });
 
@@ -591,6 +895,38 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
   });
 
   app.post(
+    "/:id/timeline/parse",
+    routeDoc(["Automation"], "Preview source timeline shorthand as kept segments", {
+      params: projectIdParamsSchema,
+      body: { type: "object", additionalProperties: true },
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const project = await readProject(id);
+      if (!project) {
+        return reply.code(404).send({ error: "project not found" });
+      }
+
+      const parsed = SourceTimelineParseRequestSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({
+          error: "invalid timeline parse request",
+          message: parsed.error.message,
+        });
+      }
+
+      return parseSourceTimelineText(parsed.data.text, {
+        fps: getVideoFps(project.video),
+        totalFrames: getProjectTotalFrames(project),
+        createId: randomUUID,
+        defaultAudio: parsed.data.defaultAudio,
+        fastAudio: parsed.data.fastAudio,
+      });
+    }
+  );
+
+  app.post(
     "/:id/commands",
     routeDoc(["Automation"], "Apply external editor commands atomically", {
       params: projectIdParamsSchema,
@@ -635,7 +971,12 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
           updatedAt: now,
         });
         await writeProject(updatedProject);
-        emitProjectUpdated(updatedProject, "commands");
+        const commandTypes = parsed.data.commands.map((command) => command.type);
+        emitProjectUpdated(updatedProject, "commands", {
+          actor: parsed.data.actor ?? "agent",
+          summary: parsed.data.summary ?? summarizeCommands(updatedProject, commandTypes),
+          commands: commandTypes,
+        });
         return { project: updatedProject, results: applied.results };
       } catch (error) {
         return reply.code(400).send({ error: (error as Error).message });
@@ -735,7 +1076,10 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     await writeProject(updatedProject);
-    emitProjectUpdated(updatedProject, "export");
+    emitProjectUpdated(updatedProject, "export", {
+      actor: "api",
+      summary: "Export bundle was written.",
+    });
 
     return {
       exportId: result.exportId,
@@ -801,7 +1145,10 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
           : project.exportOptions,
       });
       await writeProject(updatedProject);
-      emitProjectUpdated(updatedProject, "render");
+      emitProjectUpdated(updatedProject, "render", {
+        actor: "api",
+        summary: "Final render completed.",
+      });
 
       return {
         exportId: result.exportId,

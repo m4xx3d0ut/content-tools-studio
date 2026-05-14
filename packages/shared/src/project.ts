@@ -116,11 +116,22 @@ const CutSchema = z.object({
   transition: TransitionSchema,
 });
 
+export const SourceSegmentSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().optional(),
+  startFrame: z.number().int().nonnegative(),
+  endFrameExclusive: z.number().int().positive(),
+  playbackRate: z.number().finite().positive(),
+  audio: z.enum(["preserve", "mute"]).default("preserve"),
+  transition: TransitionSchema,
+});
+
 const TimelineEditsSchema = z
   .object({
     trimStartFrames: z.number().int().nonnegative().default(0),
     trimEndFrames: z.number().int().nonnegative().default(0),
     cuts: z.array(CutSchema).default([]),
+    sourceSegments: z.array(SourceSegmentSchema).default([]),
   })
   .optional();
 
@@ -148,6 +159,7 @@ export const ProjectSchema = z.object({
 
 export type Project = z.infer<typeof ProjectSchema>;
 export type Overlay = z.infer<typeof OverlaySchema>;
+export type SourceSegment = z.infer<typeof SourceSegmentSchema>;
 export type VideoInfo = z.infer<typeof VideoSchema>;
 
 export function validateProject(json: unknown): Project {

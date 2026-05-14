@@ -6,13 +6,16 @@ import swaggerUi from "@fastify/swagger-ui";
 import { UPLOAD_MAX_BYTES } from "./config.js";
 import { openApiDocument, openApiSchemas, routeDoc } from "./openapi.js";
 import { projectsRoutes } from "./routes/projects.js";
+import { slugsRoutes } from "./routes/slugs.js";
 import { templatesRoutes } from "./routes/templates.js";
+import { ensureSlugLibrary } from "./services/slugs.js";
 import { ensureWorkspaceRoot } from "./services/workspace.js";
 
 export async function buildApp() {
   const app = Fastify({ logger: true });
 
   await ensureWorkspaceRoot();
+  await ensureSlugLibrary();
 
   await app.register(swagger, {
     openapi: {
@@ -24,6 +27,7 @@ export async function buildApp() {
       tags: [
         { name: "System", description: "Health and discovery endpoints" },
         { name: "Templates", description: "Card and arrow template assets" },
+        { name: "Slugs", description: "Reusable intro/outro slug videos" },
         { name: "Projects", description: "Project CRUD, media, and assets" },
         { name: "Automation", description: "External editing commands and project events" },
         { name: "Rendering", description: "Export bundle and final render endpoints" },
@@ -58,6 +62,7 @@ export async function buildApp() {
   );
 
   await app.register(projectsRoutes, { prefix: "/projects" });
+  await app.register(slugsRoutes, { prefix: "/slugs" });
   await app.register(templatesRoutes, { prefix: "/templates" });
 
   app.get(
@@ -74,6 +79,7 @@ export async function buildApp() {
         overlays: "endFrame-inclusive",
         cuts: "endFrame-inclusive",
         trim: "endFrameExclusive",
+        sourceSegments: "endFrameExclusive",
       },
       commands: [
         "addCard",
@@ -85,9 +91,21 @@ export async function buildApp() {
         "addCut",
         "updateCut",
         "removeCut",
+        "setSourceSegments",
+        "addSourceSegment",
+        "updateSourceSegment",
+        "removeSourceSegment",
+        "reorderSourceSegments",
+        "setSourceSegmentsFromText",
         "setSlug",
         "setExportOptions",
       ],
+      slugLibrary: {
+        list: "GET /slugs",
+        import: "POST /slugs",
+        media: "GET /slugs/:id/media",
+        delete: "DELETE /slugs/:id",
+      },
     })
   );
 
