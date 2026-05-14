@@ -1,9 +1,15 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import type { Project, VideoInfo } from "@content-tools/shared";
-import { ProjectSchema } from "@content-tools/shared";
+import {
+  applyEditorCommands,
+  CommandBatchRequestSchema,
+  ProjectSchema,
+  type ArrowForEditing,
+  type TemplateForEditing,
+} from "@content-tools/shared";
 import path from "node:path";
 import { promises as fs, createWriteStream, createReadStream } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import {
@@ -18,6 +24,21 @@ import { renderFinal, writeExportBundle, type RenderProgress } from "../services
 import { FFMPEG_PATH, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { ensureThumbnail } from "../services/thumbnails.js";
+import { getTemplateCrop } from "../services/template-assets.js";
+import { listTemplates } from "../services/templates.js";
+import {
+  emitProjectDeleted,
+  emitProjectUpdated,
+  onProjectEvent,
+  type ProjectEvent,
+} from "../services/project-events.js";
+import {
+  assetParamsSchema,
+  errorResponses,
+  exportOptionsBodySchema,
+  projectIdParamsSchema,
+  routeDoc,
+} from "../openapi.js";
 
 const NORMALIZED_WIDTH = 1920;
 const NORMALIZED_HEIGHT = 1080;
@@ -96,12 +117,53 @@ async function normalizeVideoIfNeeded(
   return { filePath: outputPath, filename: normalizedName, video: normalizedVideo };
 }
 
+async function getEditingTemplates(): Promise<TemplateForEditing[]> {
+  return Promise.all(
+    listTemplates().map(async (template) => {
+      const crop = await getTemplateCrop(template.filePath);
+      return {
+        id: template.id,
+        bounds: crop.bounds,
+        sourceWidth: crop.sourceWidth,
+        sourceHeight: crop.sourceHeight,
+        align: template.align,
+      };
+    })
+  );
+}
+
+function getEditingArrows(): ArrowForEditing[] {
+  return [{ id: "arrow-right", sourceWidth: 128, sourceHeight: 128 }];
+}
+
+function sendProjectEvent(reply: FastifyReply, event: ProjectEvent): void {
+  reply.raw.write(`event: ${event.type}\n`);
+  reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
 export const projectsRoutes: FastifyPluginAsync = async (app) => {
-  app.get("/", async () => {
+  app.get(
+    "/",
+    routeDoc(["Projects"], "List projects", {
+      response: {
+        200: {
+          type: "object",
+          required: ["projects"],
+          properties: {
+            projects: {
+              type: "array",
+              items: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    }),
+    async () => {
     const projects = await listProjects();
     return {
       projects: projects.map((project) => ({
         id: project.id,
+        revision: project.revision,
         name: project.name,
         createdAt: project.createdAt,
         updatedAt: project.updatedAt,
@@ -111,7 +173,20 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  app.post("/", async (request, reply) => {
+  app.post(
+    "/",
+    routeDoc(["Projects"], "Create a project", {
+      body: {
+        type: "object",
+        required: ["name"],
+        properties: {
+          name: { type: "string" },
+          video: { type: "object", additionalProperties: true },
+        },
+      },
+      response: { 201: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
     const body = request.body as { name?: string; video?: Partial<VideoInfo> };
     const name = body?.name?.trim();
     if (!name) {
@@ -122,7 +197,13 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return reply.code(201).send(project);
   });
 
-  app.get("/:id", async (request, reply) => {
+  app.get(
+    "/:id",
+    routeDoc(["Projects"], "Get a project", {
+      params: projectIdParamsSchema,
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const project = await readProject(id);
     if (!project) {
@@ -131,16 +212,37 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return project;
   });
 
-  app.delete("/:id", async (request, reply) => {
+  app.delete(
+    "/:id",
+    routeDoc(["Projects"], "Delete a project", {
+      params: projectIdParamsSchema,
+      response: {
+        200: {
+          type: "object",
+          required: ["ok"],
+          properties: { ok: { type: "boolean" } },
+        },
+        ...errorResponses,
+      },
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const deleted = await deleteProject(id);
     if (!deleted) {
       return reply.code(404).send({ error: "project not found" });
     }
+    emitProjectDeleted(id, "delete");
     return { ok: true };
   });
 
-  app.put("/:id", async (request, reply) => {
+  app.put(
+    "/:id",
+    routeDoc(["Projects"], "Replace a project document", {
+      params: projectIdParamsSchema,
+      body: { type: "object", additionalProperties: true },
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const body = request.body as Project | undefined;
     if (!body) {
@@ -150,18 +252,42 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(400).send({ error: "project id mismatch" });
     }
 
+    const current = await readProject(id);
+    if (!current) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+    const bodyRevision =
+      typeof (request.body as { revision?: unknown })?.revision === "number"
+        ? (request.body as { revision: number }).revision
+        : undefined;
+    if (typeof bodyRevision === "number" && bodyRevision !== current.revision) {
+      return reply.code(409).send({
+        error: "project revision conflict",
+        project: current,
+      });
+    }
+
     const now = new Date().toISOString();
     const project = ProjectSchema.parse({
       ...body,
       id,
+      revision: (current.revision ?? 1) + 1,
       updatedAt: now,
     });
 
     await writeProject(project);
+    emitProjectUpdated(project, "put");
     return project;
   });
 
-  app.post("/:id/import", async (request, reply) => {
+  app.post(
+    "/:id/import",
+    routeDoc(["Projects"], "Import source video", {
+      params: projectIdParamsSchema,
+      consumes: ["multipart/form-data"],
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const project = await readProject(id);
     if (!project) {
@@ -207,6 +333,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     const now = new Date().toISOString();
     const updatedProject = ProjectSchema.parse({
       ...project,
+      revision: (project.revision ?? 1) + 1,
       updatedAt: now,
       source: {
         filename: finalFilename,
@@ -217,10 +344,18 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     await writeProject(updatedProject);
+    emitProjectUpdated(updatedProject, "import");
     return updatedProject;
   });
 
-  app.get("/:id/media", async (request, reply) => {
+  app.get(
+    "/:id/media",
+    routeDoc(["Projects"], "Stream project source media", {
+      params: projectIdParamsSchema,
+      response: { 200: { type: "string", format: "binary" }, ...errorResponses },
+      produces: ["video/mp4"],
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const project = await readProject(id);
     if (!project) {
@@ -284,7 +419,14 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return reply.send(createReadStream(videoPath));
   });
 
-  app.get("/:id/exports/latest", async (request, reply) => {
+  app.get(
+    "/:id/exports/latest",
+    routeDoc(["Rendering"], "Download latest final export", {
+      params: projectIdParamsSchema,
+      response: { 200: { type: "string", format: "binary" }, ...errorResponses },
+      produces: ["video/mp4"],
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const project = await readProject(id);
     if (!project) {
@@ -371,7 +513,21 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return reply.send(createReadStream(finalPath));
   });
 
-  app.get("/:id/thumbnail", async (request, reply) => {
+  app.get(
+    "/:id/thumbnail",
+    routeDoc(["Projects"], "Generate or read a frame thumbnail", {
+      params: projectIdParamsSchema,
+      querystring: {
+        type: "object",
+        properties: {
+          frame: { type: "string" },
+          width: { type: "string" },
+        },
+      },
+      response: { 200: { type: "string", format: "binary" }, ...errorResponses },
+      produces: ["image/jpeg"],
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const { frame, width } = request.query as { frame?: string; width?: string };
     const project = await readProject(id);
@@ -391,7 +547,21 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  app.post("/:id/assets/:kind/:overlayId", async (request, reply) => {
+  app.post(
+    "/:id/assets/:kind/:overlayId",
+    routeDoc(["Projects"], "Upload a rendered overlay or arrow asset", {
+      params: assetParamsSchema,
+      consumes: ["multipart/form-data"],
+      response: {
+        200: {
+          type: "object",
+          required: ["ok", "path"],
+          properties: { ok: { type: "boolean" }, path: { type: "string" } },
+        },
+        ...errorResponses,
+      },
+    }),
+    async (request, reply) => {
     const { id, kind, overlayId } = request.params as {
       id: string;
       kind: string;
@@ -420,7 +590,101 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true, path: targetPath };
   });
 
-  app.post("/:id/export", async (request, reply) => {
+  app.post(
+    "/:id/commands",
+    routeDoc(["Automation"], "Apply external editor commands atomically", {
+      params: projectIdParamsSchema,
+      body: { type: "object", additionalProperties: true },
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const project = await readProject(id);
+      if (!project) {
+        return reply.code(404).send({ error: "project not found" });
+      }
+
+      const parsed = CommandBatchRequestSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({
+          error: "invalid command batch",
+          message: parsed.error.message,
+        });
+      }
+
+      if (
+        typeof parsed.data.baseRevision === "number" &&
+        parsed.data.baseRevision !== project.revision
+      ) {
+        return reply.code(409).send({
+          error: "project revision conflict",
+          project,
+        });
+      }
+
+      try {
+        const applied = applyEditorCommands(project, parsed.data.commands, {
+          templates: await getEditingTemplates(),
+          arrows: getEditingArrows(),
+          createId: randomUUID,
+        });
+        const now = new Date().toISOString();
+        const updatedProject = ProjectSchema.parse({
+          ...applied.project,
+          revision: (project.revision ?? 1) + 1,
+          updatedAt: now,
+        });
+        await writeProject(updatedProject);
+        emitProjectUpdated(updatedProject, "commands");
+        return { project: updatedProject, results: applied.results };
+      } catch (error) {
+        return reply.code(400).send({ error: (error as Error).message });
+      }
+    }
+  );
+
+  app.get(
+    "/:id/events",
+    routeDoc(["Automation"], "Stream project update events", {
+      params: projectIdParamsSchema,
+      response: { 200: { type: "string" }, ...errorResponses },
+      produces: ["text/event-stream"],
+    }),
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const project = await readProject(id);
+      if (!project) {
+        return reply.code(404).send({ error: "project not found" });
+      }
+
+      reply.raw.setHeader("Access-Control-Allow-Origin", request.headers.origin ?? "*");
+      reply.raw.setHeader("Content-Type", "text/event-stream");
+      reply.raw.setHeader("Cache-Control", "no-cache");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.flushHeaders();
+      reply.hijack();
+
+      sendProjectEvent(reply, {
+        type: "project-updated",
+        projectId: project.id,
+        revision: project.revision,
+        source: "snapshot",
+        at: new Date().toISOString(),
+      });
+
+      const unsubscribe = onProjectEvent(id, (event) => sendProjectEvent(reply, event));
+      request.raw.on("close", unsubscribe);
+    }
+  );
+
+  app.post(
+    "/:id/export",
+    routeDoc(["Rendering"], "Write an export bundle without final render", {
+      params: projectIdParamsSchema,
+      body: exportOptionsBodySchema,
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const project = await readProject(id);
     if (!project) {
@@ -456,6 +720,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
         : includeSlug ?? project.exportOptions?.includeSlugEnd ?? false;
     const updatedProject = ProjectSchema.parse({
       ...project,
+      revision: (project.revision ?? 1) + 1,
       updatedAt: now,
       lastExportPresetId: body?.presetId ?? project.lastExportPresetId,
       exportOptions: body
@@ -470,6 +735,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     await writeProject(updatedProject);
+    emitProjectUpdated(updatedProject, "export");
 
     return {
       exportId: result.exportId,
@@ -478,7 +744,14 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  app.post("/:id/render", async (request, reply) => {
+  app.post(
+    "/:id/render",
+    routeDoc(["Rendering"], "Render a final MP4", {
+      params: projectIdParamsSchema,
+      body: exportOptionsBodySchema,
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const project = await readProject(id);
     if (!project) {
@@ -514,6 +787,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
           : includeSlug ?? project.exportOptions?.includeSlugEnd ?? false;
       const updatedProject = ProjectSchema.parse({
         ...project,
+        revision: (project.revision ?? 1) + 1,
         updatedAt: now,
         lastExportPresetId: body?.presetId ?? project.lastExportPresetId,
         exportOptions: body
@@ -527,6 +801,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
           : project.exportOptions,
       });
       await writeProject(updatedProject);
+      emitProjectUpdated(updatedProject, "render");
 
       return {
         exportId: result.exportId,
@@ -539,7 +814,26 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  app.get("/:id/render/stream", async (request, reply) => {
+  app.get(
+    "/:id/render/stream",
+    routeDoc(["Rendering"], "Stream final render progress with SSE", {
+      params: projectIdParamsSchema,
+      querystring: {
+        type: "object",
+        properties: {
+          presetId: { type: "string" },
+          includeAudio: { type: "string" },
+          includeSlug: { type: "string" },
+          includeSlugStart: { type: "string" },
+          includeSlugEnd: { type: "string" },
+          speed: { type: "string" },
+          renderMode: { type: "string", enum: ["final", "rough"] },
+        },
+      },
+      response: { 200: { type: "string" }, ...errorResponses },
+      produces: ["text/event-stream"],
+    }),
+    async (request, reply) => {
     const { id } = request.params as { id: string };
     const query = request.query as {
       presetId?: string;

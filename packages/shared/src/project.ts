@@ -126,6 +126,7 @@ const TimelineEditsSchema = z
 
 export const ProjectSchema = z.object({
   schemaVersion: z.literal(1).default(1),
+  revision: z.number().int().nonnegative().default(1),
   id: z.string().min(1),
   name: z.string().min(1),
   createdAt: z.string().min(1),

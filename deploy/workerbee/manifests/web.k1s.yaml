@@ -11,6 +11,9 @@ spec:
   image: content-tools-studio:workerbee
   imagePullPolicy: Never
   replicas: 1
+  env:
+    - name: WORKERBEE_DEPLOY_REV
+      value: openapi-v3
   ports:
     - name: http
       containerPort: 8080

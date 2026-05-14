@@ -117,7 +117,14 @@ const server = createServer((req, res) => {
     proxyHealth(res);
     return;
   }
-  if (pathname === "/health" || pathname.startsWith("/projects") || pathname.startsWith("/templates")) {
+  if (
+    pathname === "/health" ||
+    pathname === "/openapi.json" ||
+    pathname.startsWith("/docs") ||
+    pathname.startsWith("/automation") ||
+    pathname.startsWith("/projects") ||
+    pathname.startsWith("/templates")
+  ) {
     proxyToBackend(req, res);
     return;
   }

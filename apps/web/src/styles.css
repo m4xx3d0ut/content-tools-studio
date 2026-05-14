@@ -67,6 +67,10 @@ body {
   font-size: 0.9rem;
 }
 
+.hotkey-tip.warning {
+  color: #fca5a5;
+}
+
 .details.warning {
   color: #fca5a5;
 }

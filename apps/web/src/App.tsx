@@ -4,6 +4,14 @@ import type { Group as KonvaGroup } from "konva/lib/Group";
 import type { Transformer as KonvaTransformer } from "konva/lib/shapes/Transformer";
 import { Arrow, Group, Image as KonvaImage, Layer, Rect, Stage, Text, Transformer } from "react-konva";
 import {
+  buildArrowOverlay,
+  buildCardOverlay,
+  normalizeOverlayZIndexes,
+  normalizeRotation as normalizeSharedRotation,
+  syncArrowVisibility,
+} from "@content-tools/shared";
+import {
+  ApiError,
   assetUrl,
   createProject,
   deleteProject,
@@ -13,6 +21,7 @@ import {
   listProjects,
   listTemplates,
   mediaUrl,
+  projectEventsUrl,
   renderStreamUrl,
   thumbnailUrl,
   updateProject,
@@ -292,10 +301,14 @@ export default function App() {
   const [trimStartTime, setTrimStartTime] = useState("00:00:00.000");
   const [trimEndTime, setTrimEndTime] = useState("00:00:00.000");
   const [editorCenterHeight, setEditorCenterHeight] = useState<number | null>(null);
+  const [isDirty, setIsDirty] = useState(false);
+  const [externalUpdateAvailable, setExternalUpdateAvailable] = useState(false);
   const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
   const currentFrameRef = useRef(0);
   const totalFramesRef = useRef(0);
+  const isDirtyRef = useRef(false);
+  const projectRef = useRef<Project | null>(null);
   const historyRef = useRef<{ past: HistoryEntry[]; future: HistoryEntry[] }>({
     past: [],
     future: [],
@@ -433,6 +446,8 @@ export default function App() {
     if (!selectedId) {
       setProject(null);
       setSelectedOverlayId(null);
+      setIsDirty(false);
+      setExternalUpdateAvailable(false);
       historyRef.current = { past: [], future: [] };
       return;
     }
@@ -444,9 +459,53 @@ export default function App() {
           normalizedOverlays === data.overlays ? data : { ...data, overlays: normalizedOverlays };
         setProject(normalizedProject);
         setSelectedOverlayId(normalizedProject.overlays[0]?.id ?? null);
+        setIsDirty(false);
+        setExternalUpdateAvailable(false);
         historyRef.current = { past: [], future: [] };
       })
       .catch((error: unknown) => setStatus((error as Error).message));
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const events = new EventSource(projectEventsUrl(selectedId));
+
+    const refreshFromEvent = (event: MessageEvent<string>) => {
+      try {
+        const data = JSON.parse(event.data) as { revision?: number; source?: string };
+        const currentRevision = projectRef.current?.revision ?? 0;
+        if (data.source === "snapshot" || !data.revision || data.revision <= currentRevision) {
+          return;
+        }
+        if (isDirtyRef.current) {
+          setExternalUpdateAvailable(true);
+          setStatus("External project update available. Save will reload the latest version on conflict.");
+          return;
+        }
+        getProject(selectedId)
+          .then((latest) => {
+            setProject(latest);
+            setExternalUpdateAvailable(false);
+            setStatus("Project refreshed from external update.");
+          })
+          .catch((error: unknown) => setStatus((error as Error).message));
+      } catch {
+        return;
+      }
+    };
+
+    events.addEventListener("project-updated", refreshFromEvent);
+    events.addEventListener("project-deleted", () => {
+      refreshProjects();
+      setProject(null);
+      setSelectedOverlayId(null);
+      setStatus("Selected project was deleted externally.");
+    });
+    events.onerror = () => {
+      events.close();
+    };
+
+    return () => events.close();
   }, [selectedId]);
 
   useEffect(() => {
@@ -487,6 +546,14 @@ export default function App() {
   useEffect(() => {
     totalFramesRef.current = totalFrames;
   }, [totalFrames]);
+
+  useEffect(() => {
+    isDirtyRef.current = isDirty;
+  }, [isDirty]);
+
+  useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
 
   useEffect(() => {
     if (!templateLibrary.length) return;
@@ -631,9 +698,10 @@ export default function App() {
   function updateProjectState(
     next: Project,
     nextSelectedId?: string | null,
-    options: { pushHistory?: boolean } = {}
+    options: { pushHistory?: boolean; markDirty?: boolean } = {}
   ) {
     const shouldPush = options.pushHistory ?? true;
+    const shouldMarkDirty = options.markDirty ?? true;
     if (shouldPush && project) {
       historyRef.current.past.push({
         project: cloneProjectState(project),
@@ -646,6 +714,9 @@ export default function App() {
       historyRef.current.future = [];
     }
     setProject(next);
+    if (shouldMarkDirty) {
+      setIsDirty(true);
+    }
     if (typeof nextSelectedId !== "undefined") {
       setSelectedOverlayId(nextSelectedId);
       return;
@@ -657,7 +728,14 @@ export default function App() {
 
   function updateProjectExportOptions(patch: Partial<Project["exportOptions"]>) {
     if (!project) return;
-    const nextExportOptions = { ...project.exportOptions, ...patch };
+    const nextExportOptions = {
+      speed: project.exportOptions?.speed ?? 1,
+      includeAudio: project.exportOptions?.includeAudio ?? true,
+      includeSlug: project.exportOptions?.includeSlug ?? false,
+      includeSlugStart: project.exportOptions?.includeSlugStart ?? false,
+      includeSlugEnd: project.exportOptions?.includeSlugEnd ?? false,
+      ...patch,
+    };
     updateProjectState({ ...project, exportOptions: nextExportOptions }, undefined, {
       pushHistory: false,
     });
@@ -665,7 +743,12 @@ export default function App() {
 
   function updateEdits(patch: Partial<NonNullable<Project["edits"]>>) {
     if (!project) return;
-    const nextEdits = { ...project.edits, ...patch };
+    const nextEdits = {
+      trimStartFrames: project.edits?.trimStartFrames ?? 0,
+      trimEndFrames: project.edits?.trimEndFrames ?? 0,
+      cuts: project.edits?.cuts ?? [],
+      ...patch,
+    };
     updateProjectState({ ...project, edits: nextEdits }, undefined, { pushHistory: false });
   }
 
@@ -735,7 +818,8 @@ export default function App() {
           ...project,
           slug: undefined,
           exportOptions: {
-            ...project.exportOptions,
+            speed: project.exportOptions?.speed ?? 1,
+            includeAudio: project.exportOptions?.includeAudio ?? true,
             includeSlug: false,
             includeSlugStart: false,
             includeSlugEnd: false,
@@ -782,7 +866,11 @@ export default function App() {
     patch: Partial<{ type: "cut" | "crossfade"; durationFrames: number }>
   ) {
     if (!project?.slug) return;
-    const nextTransition = { ...project.slug.transition, ...patch };
+    const nextTransition = {
+      type: project.slug.transition?.type ?? "cut",
+      durationFrames: project.slug.transition?.durationFrames ?? 0,
+      ...patch,
+    };
     updateProjectState(
       {
         ...project,
@@ -806,6 +894,7 @@ export default function App() {
       currentFrame,
     });
     setProject(previous.project);
+    setIsDirty(true);
     setSelectedOverlayId(previous.selectedOverlayId);
     setCurrentFrame(previous.currentFrame);
   }, [project, selectedOverlayId, currentFrame]);
@@ -820,6 +909,7 @@ export default function App() {
       currentFrame,
     });
     setProject(next.project);
+    setIsDirty(true);
     setSelectedOverlayId(next.selectedOverlayId);
     setCurrentFrame(next.currentFrame);
   }, [project, selectedOverlayId, currentFrame]);
@@ -832,36 +922,6 @@ export default function App() {
     updateProjectState({ ...project, overlays });
   }
 
-  function syncArrowVisibility(overlay: Overlay, patch: Partial<Overlay>) {
-    const next = { ...overlay, ...patch };
-    if (!isArrow(overlay)) return next;
-    const motion = overlay.motion ?? {};
-    let nextMotion = motion;
-    let updated = false;
-
-    if (typeof patch.startFrame === "number") {
-      const shouldSync =
-        typeof motion.visibleStartFrame !== "number" ||
-        motion.visibleStartFrame === overlay.startFrame;
-      if (shouldSync) {
-        nextMotion = { ...nextMotion, visibleStartFrame: patch.startFrame };
-        updated = true;
-      }
-    }
-
-    if (typeof patch.endFrame === "number") {
-      const shouldSync =
-        typeof motion.visibleEndFrame !== "number" ||
-        motion.visibleEndFrame === overlay.endFrame;
-      if (shouldSync) {
-        nextMotion = { ...nextMotion, visibleEndFrame: patch.endFrame };
-        updated = true;
-      }
-    }
-
-    return updated ? { ...next, motion: nextMotion } : next;
-  }
-
   function updateOverlayMotion(id: string, patch: Partial<Overlay["motion"]>) {
     if (!project) return;
     const overlays = project.overlays.map((overlay: Overlay) => {
@@ -872,8 +932,7 @@ export default function App() {
   }
 
   function normalizeRotation(value: number) {
-    const next = value % 360;
-    return next < 0 ? next + 360 : next;
+    return normalizeSharedRotation(value);
   }
 
   function rotateOverlay(id: string, delta: number) {
@@ -920,9 +979,7 @@ export default function App() {
       if (!project) return;
       const index = project.overlays.findIndex((overlay) => overlay.id === id);
       if (index === -1) return;
-      const remaining = project.overlays
-        .filter((overlay) => overlay.id !== id)
-        .map((overlay, nextIndex) => ({ ...overlay, zIndex: nextIndex }));
+      const remaining = normalizeOverlayZIndexes(project.overlays.filter((overlay) => overlay.id !== id));
       const nextSelected =
         remaining.length > 0 ? remaining[Math.min(index, remaining.length - 1)].id : null;
       updateProjectState({ ...project, overlays: remaining }, nextSelected);
@@ -1000,87 +1057,43 @@ export default function App() {
 
   function createCardOverlay(templateId: string, x?: number, y?: number) {
     if (!project) return;
-    const id = crypto.randomUUID();
-    const start = currentFrame;
-    const end = start + Math.floor(fps * 5);
-    const template = templateMap[templateId];
-    const templateAlign = resolveTemplateAlign(templateId, template);
-    const slideDirection = templateAlign === "right" ? "fromRight" : "fromLeft";
-    const defaultMargins = getDefaultTextMargins(templateAlign);
-    const baseRect = getTemplateRect(templateId);
-    const rectX = typeof x === "number" ? Math.max(0, x) : baseRect.x;
-    const rectY = typeof y === "number" ? Math.max(0, y) : baseRect.y;
-    const overlay: Overlay = {
-      id,
-      templateId,
-      templateVersion: "1",
-      startFrame: start,
-      endFrame: end,
-      rect: {
-        x: rectX,
-        y: rectY,
-        w: baseRect.w,
-        h: baseRect.h,
+    const overlay = buildCardOverlay(
+      project,
+      {
+        type: "addCard",
+        id: crypto.randomUUID(),
+        templateId,
+        startFrame: currentFrame,
+        x,
+        y,
       },
-      rotationDeg: 0,
-      opacity: 1,
-      zIndex: project.overlays.length,
-      fields: {
-        title: "",
-        text: "",
-        titleScale: DEFAULT_TITLE_SCALE,
-        textScale: DEFAULT_TEXT_SCALE,
-        titleOffsetY: 0,
-        textOffsetY: 0,
-        [OFFSET_MODE_KEY]: OFFSET_MODE_DELTA,
-        textMarginLeft: defaultMargins.left,
-        textMarginRight: defaultMargins.right,
-      },
-      motion: {
-        slideInFrames: 12,
-        displayFrames: Math.floor(fps * 3),
-        slideOutFrames: 12,
-        slideDirection,
-      },
-    };
+      {
+        templates: templateLibrary,
+        createId: () => crypto.randomUUID(),
+      }
+    );
     updateProjectState({ ...project, overlays: [...project.overlays, overlay] });
-    setSelectedOverlayId(id);
+    setSelectedOverlayId(overlay.id);
   }
 
   function createArrowOverlay(x?: number, y?: number) {
     if (!project) return;
-    const id = crypto.randomUUID();
-    const start = currentFrame;
-    const end = start + Math.floor(fps * 2);
-    const size = getArrowSize();
-    const fallbackX = project ? project.video.width / 2 - size.w / 2 : 320;
-    const fallbackY = project ? project.video.height / 2 - size.h / 2 : 240;
-    const overlay: Overlay = {
-      id,
-      templateId: arrowTemplate?.id ?? "arrow-right",
-      templateVersion: "1",
-      startFrame: start,
-      endFrame: end,
-      rect: {
-        x: typeof x === "number" ? Math.max(0, x) : fallbackX,
-        y: typeof y === "number" ? Math.max(0, y) : fallbackY,
-        w: size.w,
-        h: size.h,
+    const overlay = buildArrowOverlay(
+      project,
+      {
+        type: "addArrow",
+        id: crypto.randomUUID(),
+        startFrame: currentFrame,
+        x,
+        y,
       },
-      rotationDeg: 0,
-      opacity: 1,
-      zIndex: project.overlays.length,
-      fields: {},
-      motion: {
-        visibleStartFrame: start,
-        visibleEndFrame: end,
-        pulsePeriodFrames: Math.floor(fps * 0.8),
-        pulseMinAlpha: 0.65,
-        pulseMaxAlpha: 1,
-      },
-    };
+      {
+        arrows: arrowTemplate ? [arrowTemplate] : undefined,
+        createId: () => crypto.randomUUID(),
+      }
+    );
     updateProjectState({ ...project, overlays: [...project.overlays, overlay] });
-    setSelectedOverlayId(id);
+    setSelectedOverlayId(overlay.id);
   }
 
   function addOverlayCard() {
@@ -1096,10 +1109,28 @@ export default function App() {
     setStatus("Saving project...");
     try {
       const saved = await updateProject(selectedId, project);
-      updateProjectState(saved, undefined, { pushHistory: false });
+      updateProjectState(saved, undefined, { pushHistory: false, markDirty: false });
+      setIsDirty(false);
+      setExternalUpdateAvailable(false);
       await refreshProjects(selectedId);
       setStatus("Project saved.");
     } catch (error) {
+      if (
+        error instanceof ApiError &&
+        error.status === 409 &&
+        error.payload &&
+        typeof error.payload === "object" &&
+        "project" in error.payload
+      ) {
+        const latest = (error.payload as { project: Project }).project;
+        setProject(latest);
+        setSelectedOverlayId(latest.overlays[0]?.id ?? null);
+        setIsDirty(false);
+        setExternalUpdateAvailable(false);
+        historyRef.current = { past: [], future: [] };
+        setStatus("Project changed externally. Reloaded the latest version.");
+        return;
+      }
       setStatus((error as Error).message);
     }
   }
@@ -1437,6 +1468,8 @@ export default function App() {
           </div>
         </div>
         <div className="topbar-actions">
+          {externalUpdateAvailable && <div className="hotkey-tip warning">External update pending</div>}
+          {isDirty && !externalUpdateAvailable && <div className="hotkey-tip">Unsaved changes</div>}
           <div className="hotkey-tip">Tip: Ctrl + / for hotkeys</div>
         </div>
       </header>

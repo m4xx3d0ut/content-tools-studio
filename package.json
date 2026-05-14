@@ -11,6 +11,7 @@
     "dev:server": "npm run dev -w @content-tools/server",
     "dev:web": "npm run dev -w @content-tools/web",
     "build": "npm run build -w @content-tools/shared && npm run build -w @content-tools/server && npm run build -w @content-tools/web",
+    "test": "npm run build && node --test apps/server/dist/**/*.test.js",
     "lint": "echo \"no lint configured\""
   }
 }

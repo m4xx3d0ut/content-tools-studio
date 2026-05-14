@@ -4,11 +4,33 @@ const fallbackBase =
     : "http://127.0.0.1:3033";
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? fallbackBase;
 
+export class ApiError extends Error {
+  status: number;
+  payload: unknown;
+
+  constructor(message: string, status: number, payload: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, options);
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `Request failed: ${response.status}`);
+    const text = await response.text();
+    let payload: unknown = text;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text;
+    }
+    const message =
+      payload && typeof payload === "object" && "error" in payload
+        ? String((payload as { error: unknown }).error)
+        : text || `Request failed: ${response.status}`;
+    throw new ApiError(message, response.status, payload);
   }
   return response.json() as Promise<T>;
 }
@@ -22,6 +44,7 @@ export function assetUrl(path: string): string {
 
 export type ProjectSummary = {
   id: string;
+  revision?: number;
   name: string;
   createdAt: string;
   updatedAt: string;
@@ -31,7 +54,7 @@ export type ProjectSummary = {
     height: number;
     fpsNum: number;
     fpsDen: number;
-    audio?: { hasAudio: boolean; sampleRate?: number; channels?: number };
+    audio: { hasAudio: boolean; sampleRate?: number; channels?: number };
   };
 };
 
@@ -94,7 +117,8 @@ export type ArrowInfo = {
 };
 
 export type Project = ProjectSummary & {
-  schemaVersion?: number;
+  schemaVersion: 1;
+  revision: number;
   source: { filename: string; sizeBytes?: number; sha256?: string };
   video: {
     width: number;
@@ -102,32 +126,43 @@ export type Project = ProjectSummary & {
     fpsNum: number;
     fpsDen: number;
     durationMs: number;
-    audio?: { hasAudio: boolean; sampleRate?: number; channels?: number };
+    audio: { hasAudio: boolean; sampleRate?: number; channels?: number };
+  };
+  proxy: {
+    enabled: boolean;
+    width?: number;
+    height?: number;
+    crf?: number;
+    preset?: string;
   };
   overlays: Overlay[];
   exportOptions?: {
-    speed?: 1 | 2;
-    includeAudio?: boolean;
-    includeSlug?: boolean;
-    includeSlugStart?: boolean;
-    includeSlugEnd?: boolean;
+    speed: 1 | 2;
+    includeAudio: boolean;
+    includeSlug: boolean;
+    includeSlugStart: boolean;
+    includeSlugEnd: boolean;
   };
   lastExportPresetId?: string;
   edits?: {
-    trimStartFrames?: number;
-    trimEndFrames?: number;
-    cuts?: Array<{
+    trimStartFrames: number;
+    trimEndFrames: number;
+    cuts: Array<{
       id: string;
       startFrame: number;
       endFrame: number;
-      transition?: { type?: "cut" | "crossfade"; durationFrames?: number };
+      transition?: { type: "cut" | "crossfade"; durationFrames: number };
     }>;
   };
   slug?: {
     introPath?: string;
     outroPath?: string;
     fps?: number;
-    transition?: { type?: "cut" | "crossfade"; durationFrames?: number };
+    transition?: { type: "cut" | "crossfade"; durationFrames: number };
+  };
+  renderCache: {
+    overlayAssetHash: Record<string, string>;
+    templatesVersion?: string;
   };
 };
 
@@ -248,4 +283,8 @@ export function thumbnailUrl(projectId: string, frame: number, width = 240): str
 
 export function exportLatestUrl(projectId: string): string {
   return `${API_BASE}/projects/${projectId}/exports/latest`;
+}
+
+export function projectEventsUrl(projectId: string): string {
+  return `${API_BASE}/projects/${projectId}/events`;
 }

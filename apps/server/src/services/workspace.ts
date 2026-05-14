@@ -82,6 +82,7 @@ export async function createProject(
 
   const project = ProjectSchema.parse({
     id,
+    revision: 1,
     name,
     createdAt: now,
     updatedAt: now,
