@@ -19,6 +19,8 @@ curl http://127.0.0.1:3033/openapi.json
 curl http://127.0.0.1:3033/automation/capabilities
 ```
 
+WorkerBee is the expected integration path for agent-driven validation. Build/deploy the repo through WorkerBee, probe the HTTPS app URL, and use project bundles to preserve editable review states before redeploying.
+
 ## Command Editing
 
 Use `POST /projects/:id/commands` to apply high-level edits atomically. Coordinates are source-video pixels. Overlay and cut `endFrame` values are inclusive. Trim uses `endFrameExclusive`.
@@ -102,6 +104,19 @@ curl -X POST "$API/projects/import-bundle" -F "file=@project.zip"
 
 Bundle modes are `project` for the JSON document, `project-media` for JSON plus source media, and `full` for media, render assets, and exports. Imported bundles receive a new project id and revision `1`.
 
+## Render Assets
+
+The web editor uploads rasterized card and arrow PNGs through:
+
+```text
+POST /projects/:id/assets/overlays/:overlayId
+POST /projects/:id/assets/arrows/:overlayId
+```
+
+The project `renderCache.overlayAssetHash` records which overlay state produced each asset. Final renders reuse matching uploaded assets so editor placement and text wrapping match the MP4 output. API-only render flows can skip these uploads; the server will generate fallback assets with Sharp.
+
+When source timeline segments are present, overlay frame positions are mapped from source-video frames into the flattened render timeline. Compare screenshots against output timecodes rather than raw source timecodes when still inserts, speed changes, or dropped gaps are active.
+
 ## Slug Library
 
 Slug videos are managed at runtime, so adding a new intro/outro MP4 does not require a rebuild. On first startup, repo files under `slug/*.mp4` are seeded into the runtime library.
@@ -146,3 +161,5 @@ await fetch(`${api}/projects/${projectId}/render`, {
 ```
 
 Use `GET /projects/:id/events` to subscribe to `project-updated` events when coordinating an open UI with external edits. Event payloads include `source`, `actor`, `summary`, `commands`, and `revision` when available; the web UI shows summaries as toast notifications.
+
+Autosave is a browser preference, not a server-side project field. The UI saves dirty projects on the configured interval and pauses autosave on revision conflict so local edits are not discarded.

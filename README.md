@@ -2,6 +2,14 @@
 
 Local-first video annotation and rendering pipeline for screencast overlays. Import MP4 footage, scrub frames, place branded cards and directional arrows, trim/cut sections, and render a final MP4 directly into a workspace export folder with FFmpeg.
 
+<p>
+  <a href="https://github.com/the-cm-collective/k1s-workerbee">
+    <img src="https://raw.githubusercontent.com/the-cm-collective/k1s-workerbee/dev/docs/assets/k1s-workerbee-hero.jpg" alt="K1S WorkerBee" width="140">
+  </a>
+</p>
+
+Optimized for [K1S WorkerBee](https://github.com/the-cm-collective/k1s-workerbee): the app is built to redeploy, probe, render, export, and restore editable video projects inside a project-scoped k1s workbench.
+
 ---
 
 ## What this app does
@@ -13,6 +21,8 @@ Local-first video annotation and rendering pipeline for screencast overlays. Imp
 - Place branded overlay cards and directional arrows on exact frames.
 - Configure per-overlay timing, animation, and layout settings.
 - Trim a clip (start/end) and cut out arbitrary sections.
+- Compose source timelines from shorthand recipes that mix video slices, speed changes, and still PNG slugs.
+- Overlay or replace audio with uploaded or URL-imported audio tracks, including tail fade-out.
 - Optionally prepend/append a slug clip.
 - Render the final MP4 via FFmpeg and track progress in the UI.
 - Download the final export or copy its full filesystem path.
@@ -27,10 +37,11 @@ Local-first video annotation and rendering pipeline for screencast overlays. Imp
 - **Arrow tools** with free rotation on-canvas, plus 45° rotate buttons.
 - **Text controls** per overlay: Title/Text sizes, text alignment, text margins, and vertical offsets.
 - **Timeline tracks** for video/cards/arrows with highlighted cut sections.
+- **Autosave** enabled by default, with a configurable interval and an off switch.
 - **Undo/redo** (Ctrl+Z / Ctrl+Y) and delete selected overlays with Delete.
 
 ### Rendering
-- Generates overlay and arrow PNG assets.
+- Generates editor-matched overlay and arrow PNG assets, with a server fallback for API-only renders.
 - Builds `filter_complex` scripts for FFmpeg.
 - Runs FFmpeg server-side and writes `final.mp4` into the project export folder.
 - Streams FFmpeg output into the UI for troubleshooting.
@@ -57,7 +68,7 @@ Local-first video annotation and rendering pipeline for screencast overlays. Imp
 **Backend** (`apps/server`)
 - Fastify API for projects, uploads, thumbnails, and exports
 - FFmpeg/FFprobe for media inspection and rendering
-- Sharp for overlay/arrow PNG generation
+- Sharp fallback for overlay/arrow PNG generation when no editor-rasterized assets exist
 
 **Shared** (`packages/shared`)
 - Zod schemas and shared types
@@ -77,6 +88,7 @@ Local-first video annotation and rendering pipeline for screencast overlays. Imp
 ├── 1920x1080/             # Card template assets
 ├── k1s-directional-arrows/# Arrow assets
 ├── slug/                  # Slug/intro/outro clips
+├── docs/                  # API and automation notes
 ├── CONTENT-PIPELINE.md    # High-level pipeline plan
 └── CONTENT-TOOLS-APP.md   # Detailed app spec + pipeline notes
 ```
@@ -113,6 +125,7 @@ workspace/<projectId>/
 
 - **Node.js 20+** (tested with Node 22)
 - **FFmpeg + FFprobe** installed and available on PATH
+- Optional: **K1S WorkerBee** for local k1s deployment, HTTPS ingress, probes, logs, security review, and project-scoped render validation.
 
 Optional environment variables:
 
@@ -121,6 +134,38 @@ Optional environment variables:
 - `FFPROBE_PATH` (default: `ffprobe`)
 - `HOST` (default: `127.0.0.1`)
 - `PORT` (default: `3033`)
+
+### WorkerBee runtime
+
+WorkerBee is the preferred local deployment loop for this project. It builds the app image, applies the repo manifests, exposes the UI through `*.workerbee.localhost`, and gives agents bounded tools for deploy, logs, probes, exports, and cleanup.
+
+Typical WorkerBee flow:
+
+```bash
+workerbee mcp start
+codex mcp add workerbee --url http://127.0.0.1:8765/mcp
+```
+
+Then ask the agent to bring the stack up in WorkerBee. The app should be validated through the WorkerBee HTTPS URL and the OpenAPI document at `/openapi.json`.
+
+### Podman on macOS
+
+Podman works through a Linux VM on macOS, so give the machine enough resources for FFmpeg renders and image builds before deploying through WorkerBee.
+
+```bash
+brew install podman
+podman machine init --cpus 6 --memory 12288 --disk-size 80
+podman machine start
+podman system connection list
+```
+
+Best-effort macOS notes:
+
+- Increase CPU, memory, and disk if final renders or image builds are killed under load.
+- Keep the repo under a path shared with the Podman machine.
+- If a tool expects Docker-compatible access, enable or export the Podman socket for that shell.
+- Trust the WorkerBee local CA in the browser or OS trust store when testing HTTPS ingress.
+- File sharing and VM I/O can be slower than native Linux; prefer WorkerBee probes and server logs when diagnosing render failures.
 
 ---
 
