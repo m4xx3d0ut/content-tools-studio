@@ -13,7 +13,7 @@ spec:
   replicas: 1
   env:
     - name: WORKERBEE_DEPLOY_REV
-      value: repo-root-assets-v1
+      value: render-memory-v1
   ports:
     - name: http
       containerPort: 8080
@@ -28,10 +28,10 @@ spec:
   resources:
     requests:
       cpu: 0.5
-      memory: 512Mi
+      memory: 1Gi
     limits:
       cpu: 2
-      memory: 2Gi
+      memory: 8Gi
   ingress:
     host: app.content-tools-studio-dev-6b01ab0b06.workerbee.localhost
     path: /
