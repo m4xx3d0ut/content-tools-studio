@@ -536,6 +536,26 @@ button.danger:hover {
   gap: 10px;
 }
 
+.autosave-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.autosave-interval {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.autosave-interval input {
+  width: 64px;
+}
+
 .render-settings-grid {
   display: grid;
   gap: 12px;

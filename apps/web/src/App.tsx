@@ -6,6 +6,7 @@ import { Arrow, Group, Image as KonvaImage, Layer, Rect, Stage, Text, Transforme
 import {
   buildArrowOverlay,
   buildCardOverlay,
+  getOverlayAssetHash,
   normalizeOverlayZIndexes,
   normalizeRotation as normalizeSharedRotation,
   syncArrowVisibility,
@@ -33,6 +34,7 @@ import {
   slugMediaUrl,
   thumbnailUrl,
   updateProject,
+  uploadAsset,
   uploadAudioAsset,
   type ArrowInfo,
   type AudioAsset,
@@ -128,6 +130,39 @@ function formatSeconds(seconds: number) {
   return `${Math.max(0, seconds).toFixed(3)}s`;
 }
 
+function getSourceSegmentOutputFrames(segment: SourceSegment): number {
+  if (segment.kind === "image") {
+    return Math.max(1, segment.durationFrames ?? 1);
+  }
+  const sourceFrames = Math.max(1, segment.endFrameExclusive - segment.startFrame);
+  return Math.max(1, Math.round(sourceFrames / Math.max(0.01, segment.playbackRate)));
+}
+
+function mapSourceFrameToOutputFrame(segments: SourceSegment[], frame: number): number | null {
+  let outputStart = 0;
+  for (const segment of segments) {
+    const outputFrames = getSourceSegmentOutputFrames(segment);
+    if (
+      segment.kind === "source" &&
+      frame >= segment.startFrame &&
+      frame < segment.endFrameExclusive
+    ) {
+      return Math.floor(
+        outputStart + (frame - segment.startFrame) / Math.max(0.01, segment.playbackRate)
+      );
+    }
+    outputStart += outputFrames;
+  }
+  return null;
+}
+
+function getMappedOverlayRange(overlay: Overlay, segments: SourceSegment[]) {
+  const start = mapSourceFrameToOutputFrame(segments, overlay.startFrame);
+  const end = mapSourceFrameToOutputFrame(segments, Math.max(overlay.startFrame, overlay.endFrame - 1));
+  if (start === null || end === null) return null;
+  return { start, end: Math.max(start, end) };
+}
+
 function pathBasename(inputPath: string) {
   return inputPath.split("/").filter(Boolean).at(-1) ?? inputPath;
 }
@@ -161,6 +196,11 @@ const BASE_TITLE_OFFSET = -13;
 const BASE_TEXT_OFFSET = -27;
 const OFFSET_MODE_KEY = "offsetMode";
 const OFFSET_MODE_DELTA = "delta-v1";
+const AUTOSAVE_ENABLED_KEY = "content-tools-studio.autosave.enabled";
+const AUTOSAVE_INTERVAL_KEY = "content-tools-studio.autosave.intervalSeconds";
+const DEFAULT_AUTOSAVE_INTERVAL_SEC = 10;
+const MIN_AUTOSAVE_INTERVAL_SEC = 5;
+const MAX_AUTOSAVE_INTERVAL_SEC = 300;
 
 const TEMPLATE_ALIGNMENTS: Record<string, TextAlignment> = {
   "card-lower-third-left": "left",
@@ -270,6 +310,188 @@ function cloneProjectState(value: Project): Project {
   return JSON.parse(JSON.stringify(value)) as Project;
 }
 
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const stored = window.localStorage.getItem(key);
+    if (stored === null) return fallback;
+    return stored === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function readStoredNumber(key: string, fallback: number): number {
+  try {
+    const stored = window.localStorage.getItem(key);
+    if (stored === null) return fallback;
+    const value = Number(stored);
+    return Number.isFinite(value) ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function clampAutosaveInterval(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_AUTOSAVE_INTERVAL_SEC;
+  return Math.min(MAX_AUTOSAVE_INTERVAL_SEC, Math.max(MIN_AUTOSAVE_INTERVAL_SEC, Math.round(value)));
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob);
+        return;
+      }
+      reject(new Error("Unable to create overlay PNG."));
+    }, "image/png");
+  });
+}
+
+function wrapCanvasLines(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  for (const paragraph of text.split(/\r?\n/)) {
+    const words = paragraph.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) {
+      lines.push("");
+      continue;
+    }
+
+    let current = "";
+    for (const word of words) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (ctx.measureText(candidate).width <= maxWidth || !current) {
+        if (ctx.measureText(candidate).width <= maxWidth) {
+          current = candidate;
+          continue;
+        }
+
+        let chunk = "";
+        for (const char of word) {
+          const nextChunk = `${chunk}${char}`;
+          if (ctx.measureText(nextChunk).width > maxWidth && chunk) {
+            lines.push(chunk);
+            chunk = char;
+          } else {
+            chunk = nextChunk;
+          }
+        }
+        current = chunk;
+        continue;
+      }
+
+      lines.push(current);
+      current = word;
+    }
+
+    if (current) lines.push(current);
+  }
+  return lines;
+}
+
+function drawWrappedCanvasText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  width: number,
+  lineHeight: number,
+  align: TextAlignment
+) {
+  ctx.textAlign = align;
+  ctx.textBaseline = "top";
+  const drawX = align === "center" ? x + width / 2 : align === "right" ? x + width : x;
+  const lines = wrapCanvasLines(ctx, text, width);
+  lines.forEach((line, index) => {
+    ctx.fillText(line, drawX, y + index * lineHeight);
+  });
+}
+
+async function renderOverlayBlob(
+  overlay: Overlay,
+  template: TemplateInfo | undefined,
+  loadImage: (url: string) => Promise<HTMLImageElement>,
+  arrowTemplate?: ArrowInfo | null
+): Promise<Blob> {
+  const width = Math.max(1, Math.floor(overlay.rect.w));
+  const height = Math.max(1, Math.floor(overlay.rect.h));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Unable to create overlay canvas.");
+  context.clearRect(0, 0, width, height);
+
+  if (isArrow(overlay)) {
+    if (arrowTemplate) {
+      const image = await loadImage(assetUrl(arrowTemplate.imagePath));
+      context.save();
+      context.translate(width / 2, height / 2);
+      context.rotate(((overlay.rotationDeg ?? 0) * Math.PI) / 180);
+      context.drawImage(image, -width / 2, -height / 2, width, height);
+      context.restore();
+    }
+    return canvasToBlob(canvas);
+  }
+
+  if (template) {
+    const image = await loadImage(assetUrl(template.imagePath));
+    context.drawImage(
+      image,
+      template.bounds.left,
+      template.bounds.top,
+      template.bounds.width,
+      template.bounds.height,
+      0,
+      0,
+      width,
+      height
+    );
+  } else {
+    context.fillStyle = "rgba(15, 19, 24, 0.65)";
+    context.fillRect(0, 0, width, height);
+  }
+
+  const templateAlign = resolveTemplateAlign(overlay.templateId, template);
+  const textAlign = resolveTextAlign(overlay.fields.textAlign, templateAlign);
+  const textScale = resolveTextScale(overlay.fields.textScale, DEFAULT_TEXT_SCALE);
+  const titleScale = resolveTextScale(overlay.fields.titleScale, DEFAULT_TITLE_SCALE);
+  const titleOffset = BASE_TITLE_OFFSET + resolveTextOffset(overlay.fields.titleOffsetY, 0);
+  const textOffset = BASE_TEXT_OFFSET + resolveTextOffset(overlay.fields.textOffsetY, 0);
+  const baseMargins = getDefaultTextMargins(templateAlign);
+  const marginLeft = resolveTextMargin(overlay.fields.textMarginLeft, baseMargins.left);
+  const marginRight = resolveTextMargin(overlay.fields.textMarginRight, baseMargins.right);
+  const textWidth = Math.max(40, width - marginLeft - marginRight);
+  const titleSize = Math.max(14, height * 0.3 * titleScale);
+  const subtitleSize = Math.max(12, height * 0.18 * textScale);
+
+  context.fillStyle = template?.title?.color ?? "#f5f2ea";
+  context.font = `${titleSize}px Arial`;
+  drawWrappedCanvasText(
+    context,
+    String(overlay.fields.title ?? ""),
+    marginLeft,
+    Math.max(8, height * 0.18) + titleOffset,
+    textWidth,
+    titleSize,
+    "center"
+  );
+
+  context.fillStyle = template?.subtitle?.color ?? "#d1c7b8";
+  context.font = `${subtitleSize}px Arial`;
+  drawWrappedCanvasText(
+    context,
+    String(overlay.fields.text ?? overlay.fields.subtitle ?? ""),
+    marginLeft,
+    Math.max(8, height * 0.55) + textOffset,
+    textWidth,
+    subtitleSize,
+    textAlign
+  );
+
+  return canvasToBlob(canvas);
+}
+
 type StageMetrics = {
   width: number;
   height: number;
@@ -328,12 +550,22 @@ export default function App() {
   const [editorCenterHeight, setEditorCenterHeight] = useState<number | null>(null);
   const [isDirty, setIsDirty] = useState(false);
   const [externalUpdateAvailable, setExternalUpdateAvailable] = useState(false);
+  const [autosaveEnabled, setAutosaveEnabled] = useState(() =>
+    readStoredBoolean(AUTOSAVE_ENABLED_KEY, true)
+  );
+  const [autosaveIntervalSec, setAutosaveIntervalSec] = useState(() =>
+    clampAutosaveInterval(readStoredNumber(AUTOSAVE_INTERVAL_KEY, DEFAULT_AUTOSAVE_INTERVAL_SEC))
+  );
+  const [autosavePausedProjectId, setAutosavePausedProjectId] = useState<string | null>(null);
+  const [lastAutosaveAt, setLastAutosaveAt] = useState<string | null>(null);
   const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
   const currentFrameRef = useRef(0);
   const totalFramesRef = useRef(0);
   const isDirtyRef = useRef(false);
   const projectRef = useRef<Project | null>(null);
+  const autosaveInFlightRef = useRef(false);
+  const renderAssetImageCacheRef = useRef<Map<string, Promise<HTMLImageElement>>>(new Map());
   const historyRef = useRef<{ past: HistoryEntry[]; future: HistoryEntry[] }>({
     past: [],
     future: [],
@@ -463,11 +695,41 @@ export default function App() {
     setToast(message);
   }, []);
 
+  function loadRenderImage(url: string): Promise<HTMLImageElement> {
+    const cached = renderAssetImageCacheRef.current.get(url);
+    if (cached) return cached;
+    const promise = new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new window.Image();
+      image.crossOrigin = "anonymous";
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error(`Unable to load render asset: ${url}`));
+      image.src = url;
+    });
+    renderAssetImageCacheRef.current.set(url, promise);
+    return promise;
+  }
+
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 4500);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(AUTOSAVE_ENABLED_KEY, String(autosaveEnabled));
+    } catch {
+      return;
+    }
+  }, [autosaveEnabled]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(AUTOSAVE_INTERVAL_KEY, String(autosaveIntervalSec));
+    } catch {
+      return;
+    }
+  }, [autosaveIntervalSec]);
 
   async function refreshProjects(nextSelectedId?: string) {
     const list = await listProjects();
@@ -506,6 +768,8 @@ export default function App() {
       setSelectedOverlayId(null);
       setIsDirty(false);
       setExternalUpdateAvailable(false);
+      setAutosavePausedProjectId(null);
+      setLastAutosaveAt(null);
       setSourceSegmentsOpen(false);
       historyRef.current = { past: [], future: [] };
       return;
@@ -520,6 +784,8 @@ export default function App() {
         setSelectedOverlayId(normalizedProject.overlays[0]?.id ?? null);
         setIsDirty(false);
         setExternalUpdateAvailable(false);
+        setAutosavePausedProjectId(null);
+        setLastAutosaveAt(null);
         setSourceSegmentsOpen(false);
         historyRef.current = { past: [], future: [] };
       })
@@ -630,10 +896,38 @@ export default function App() {
   }, [project]);
 
   useEffect(() => {
+    if (!autosaveEnabled) return;
+    if (!selectedId || !project || !isDirty) return;
+    if (externalUpdateAvailable || renderActive || autosavePausedProjectId === selectedId) return;
+
+    const timer = window.setTimeout(() => {
+      if (autosaveInFlightRef.current) return;
+      const currentProject = projectRef.current;
+      if (!currentProject || !isDirtyRef.current) return;
+      autosaveInFlightRef.current = true;
+      saveProjectDocument(selectedId, currentProject, "autosave").finally(() => {
+        autosaveInFlightRef.current = false;
+      });
+    }, autosaveIntervalSec * 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    autosaveEnabled,
+    autosaveIntervalSec,
+    selectedId,
+    project,
+    isDirty,
+    externalUpdateAvailable,
+    renderActive,
+    autosavePausedProjectId,
+  ]);
+
+  useEffect(() => {
     if (!templateLibrary.length) return;
     templateLibrary.forEach((template) => {
       if (templateImages[template.id]) return;
       const image = new window.Image();
+      image.crossOrigin = "anonymous";
       image.src = assetUrl(template.imagePath);
       image.onload = () => {
         setTemplateImages((prev) => {
@@ -649,6 +943,7 @@ export default function App() {
     const nextUrl = assetUrl(arrowTemplate.imagePath);
     if (arrowImage?.src === nextUrl) return;
     const image = new window.Image();
+    image.crossOrigin = "anonymous";
     image.src = nextUrl;
     image.onload = () => {
       setArrowImage(image);
@@ -1423,16 +1718,77 @@ export default function App() {
     createArrowOverlay();
   }
 
-  async function handleSaveProject() {
-    if (!project || !selectedId) return;
-    setStatus("Saving project...");
+  async function prepareRenderAssets(projectToRender: Project): Promise<Project> {
+    if (!projectToRender.overlays.length) {
+      const overlayAssetHash = projectToRender.renderCache?.overlayAssetHash ?? {};
+      if (!Object.keys(overlayAssetHash).length) return projectToRender;
+      return {
+        ...projectToRender,
+        renderCache: { ...(projectToRender.renderCache ?? {}), overlayAssetHash: {} },
+      };
+    }
+
+    const currentIds = new Set(projectToRender.overlays.map((overlay) => overlay.id));
+    const overlayAssetHash = { ...(projectToRender.renderCache?.overlayAssetHash ?? {}) };
+    let changed = false;
+    let uploaded = 0;
+
+    for (const key of Object.keys(overlayAssetHash)) {
+      if (!currentIds.has(key)) {
+        delete overlayAssetHash[key];
+        changed = true;
+      }
+    }
+
+    for (const [index, overlay] of projectToRender.overlays.entries()) {
+      const hash = getOverlayAssetHash(overlay);
+      if (overlayAssetHash[overlay.id] === hash) continue;
+      setStatus(`Preparing overlay asset ${index + 1}/${projectToRender.overlays.length}...`);
+      const template = templateMap[overlay.templateId];
+      const blob = await renderOverlayBlob(overlay, template, loadRenderImage, arrowTemplate);
+      await uploadAsset(
+        projectToRender.id,
+        isArrow(overlay) ? "arrows" : "overlays",
+        overlay.id,
+        blob
+      );
+      overlayAssetHash[overlay.id] = hash;
+      uploaded += 1;
+      changed = true;
+    }
+
+    if (uploaded > 0) {
+      setStatus(`Prepared ${uploaded} overlay asset${uploaded === 1 ? "" : "s"}.`);
+    }
+
+    return changed
+      ? {
+          ...projectToRender,
+          renderCache: { ...(projectToRender.renderCache ?? {}), overlayAssetHash },
+        }
+      : projectToRender;
+  }
+
+  async function saveProjectDocument(
+    projectId: string,
+    projectToSave: Project,
+    mode: "manual" | "autosave"
+  ): Promise<Project | null> {
     try {
-      const saved = await updateProject(selectedId, project);
+      const saved = await updateProject(projectId, projectToSave);
       updateProjectState(saved, undefined, { pushHistory: false, markDirty: false });
       setIsDirty(false);
       setExternalUpdateAvailable(false);
-      await refreshProjects(selectedId);
-      setStatus("Project saved.");
+      setAutosavePausedProjectId(null);
+      if (mode === "autosave") {
+        const at = new Date().toLocaleTimeString();
+        setLastAutosaveAt(at);
+        setStatus(`Autosaved at ${at}.`);
+      } else {
+        setStatus("Project saved.");
+      }
+      await refreshProjects(projectId);
+      return saved;
     } catch (error) {
       if (
         error instanceof ApiError &&
@@ -1442,16 +1798,32 @@ export default function App() {
         "project" in error.payload
       ) {
         const latest = (error.payload as { project: Project }).project;
+        if (mode === "autosave") {
+          setExternalUpdateAvailable(true);
+          setAutosavePausedProjectId(projectId);
+          setStatus("Autosave paused: external project update available.");
+          showToast("Autosave paused until you review the external update.");
+          return null;
+        }
         setProject(latest);
         setSelectedOverlayId(latest.overlays[0]?.id ?? null);
         setIsDirty(false);
         setExternalUpdateAvailable(false);
+        setAutosavePausedProjectId(null);
         historyRef.current = { past: [], future: [] };
         setStatus("Project changed externally. Reloaded the latest version.");
-        return;
+        return latest;
       }
-      setStatus((error as Error).message);
+      const message = (error as Error).message;
+      setStatus(mode === "autosave" ? `Autosave failed: ${message}` : message);
+      return null;
     }
+  }
+
+  async function handleSaveProject() {
+    if (!project || !selectedId) return;
+    setStatus("Saving project...");
+    await saveProjectDocument(selectedId, project, "manual");
   }
 
   async function handleRenderFinal() {
@@ -1463,7 +1835,11 @@ export default function App() {
     setRenderReady(false);
     setRenderFinalPath("");
     try {
-      await handleSaveProject();
+      const preparedProject = await prepareRenderAssets(project);
+      const saved = await saveProjectDocument(selectedId, preparedProject, "manual");
+      if (!saved) {
+        throw new Error("Project was not saved; render cancelled.");
+      }
       const es = new EventSource(renderStreamUrl(selectedId, renderOptions));
       const parsePayload = (event: Event) => {
         if ("data" in event) {
@@ -1986,24 +2362,39 @@ export default function App() {
               </div>
               {project && (
                 <ul className="overlay-list">
-                  {project.overlays.map((overlay: Overlay) => (
-                    <li
-                      key={overlay.id}
-                      className={overlay.id === selectedOverlayId ? "overlay-item active" : "overlay-item"}
-                    >
-                      <div className="overlay-item-row">
-                        <button className="secondary" onClick={() => selectOverlayById(overlay.id)}>
-                          {overlay.templateId}
-                        </button>
-                        <button className="danger" onClick={() => removeOverlay(overlay.id)}>
-                          Delete
-                        </button>
-                      </div>
-                      <div className="details">
-                        {overlay.startFrame} → {overlay.endFrame}
-                      </div>
-                    </li>
-                  ))}
+                  {project.overlays.map((overlay: Overlay) => {
+                    const mappedRange = hasSourceSegments
+                      ? getMappedOverlayRange(overlay, sourceSegments)
+                      : null;
+                    return (
+                      <li
+                        key={overlay.id}
+                        className={overlay.id === selectedOverlayId ? "overlay-item active" : "overlay-item"}
+                      >
+                        <div className="overlay-item-row">
+                          <button className="secondary" onClick={() => selectOverlayById(overlay.id)}>
+                            {overlay.templateId}
+                          </button>
+                          <button className="danger" onClick={() => removeOverlay(overlay.id)}>
+                            Delete
+                          </button>
+                        </div>
+                        <div className="details">
+                          {overlay.startFrame} → {overlay.endFrame}
+                        </div>
+                        {hasSourceSegments && (
+                          <div className="details">
+                            {mappedRange
+                              ? `Output ${formatTimecode(mappedRange.start, fps)} → ${formatTimecode(
+                                  mappedRange.end,
+                                  fps
+                                )}`
+                              : "Outside rendered source segments"}
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>
@@ -2690,6 +3081,39 @@ export default function App() {
                 {isRoughPreview ? "Copy preview path" : "Copy final path"}
               </button>
             )}
+          </div>
+          <div className="autosave-controls">
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={autosaveEnabled}
+                onChange={(event) => setAutosaveEnabled(event.target.checked)}
+              />
+              Autosave
+            </label>
+            <label className="autosave-interval">
+              <span>Every</span>
+              <input
+                type="number"
+                min={MIN_AUTOSAVE_INTERVAL_SEC}
+                max={MAX_AUTOSAVE_INTERVAL_SEC}
+                value={autosaveIntervalSec}
+                disabled={!autosaveEnabled}
+                onChange={(event) =>
+                  setAutosaveIntervalSec(clampAutosaveInterval(Number(event.target.value)))
+                }
+              />
+              <span>s</span>
+            </label>
+            <div className="details">
+              {autosavePausedProjectId === selectedId
+                ? "Paused for external update"
+                : autosaveEnabled
+                  ? lastAutosaveAt
+                    ? `Autosaved ${lastAutosaveAt}`
+                    : "Autosave ready"
+                  : "Autosave off"}
+            </div>
           </div>
           {renderProgress !== null && (
             <div className="progress slim">

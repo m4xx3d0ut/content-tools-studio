@@ -1,8 +1,8 @@
 import path from "node:path";
 import sharp from "sharp";
-import type { Overlay, Project } from "@content-tools/shared";
+import { getOverlayAssetHash, type Overlay, type Project } from "@content-tools/shared";
 import { REPO_ROOT, WORKSPACE_ROOT } from "../config.js";
-import { ensureDir } from "../utils/fs.js";
+import { ensureDir, fileExists } from "../utils/fs.js";
 import { DEFAULT_TEMPLATE_ID, getTemplateById } from "./templates.js";
 import { getTemplateCrop } from "./template-assets.js";
 
@@ -76,6 +76,45 @@ function escapeXml(text: string): string {
     .replace(/'/g, "&apos;");
 }
 
+function wrapTextLines(text: string, fontSize: number, maxWidth: number): string[] {
+  const maxChars = Math.max(1, Math.floor(maxWidth / Math.max(1, fontSize * 0.56)));
+  const lines: string[] = [];
+
+  for (const paragraph of text.split(/\r?\n/)) {
+    const words = paragraph.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) {
+      lines.push("");
+      continue;
+    }
+
+    let current = "";
+    for (const word of words) {
+      if (word.length > maxChars) {
+        if (current) {
+          lines.push(current);
+          current = "";
+        }
+        for (let index = 0; index < word.length; index += maxChars) {
+          lines.push(word.slice(index, index + maxChars));
+        }
+        continue;
+      }
+
+      const candidate = current ? `${current} ${word}` : word;
+      if (candidate.length > maxChars && current) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = candidate;
+      }
+    }
+
+    if (current) lines.push(current);
+  }
+
+  return lines;
+}
+
 function buildTextSvg(
   width: number,
   height: number,
@@ -118,8 +157,10 @@ function buildTextSvg(
   const subtitleTop = Math.max(8, height * SUBTITLE_Y_PCT) + (offsets?.subtitleY ?? 0);
   const subtitleY = subtitleTop + subtitleSize / 2;
 
-  const titleLines = escapeXml(title).split("\n");
-  const subtitleLines = subtitle ? escapeXml(subtitle).split("\n") : [];
+  const titleLines = wrapTextLines(title, titleSize, textAreaWidth).map(escapeXml);
+  const subtitleLines = subtitle
+    ? wrapTextLines(subtitle, subtitleSize, textAreaWidth).map(escapeXml)
+    : [];
 
   const titleTspans = titleLines
     .map(
@@ -167,6 +208,10 @@ export async function renderOverlayAsset(
   const targetPath = path.join(targetDir, `${overlay.id}.png`);
   const width = Math.max(1, Math.floor(overlay.rect.w));
   const height = Math.max(1, Math.floor(overlay.rect.h));
+  const cachedHash = project.renderCache?.overlayAssetHash?.[overlay.id];
+  if (cachedHash === getOverlayAssetHash(overlay) && await fileExists(targetPath)) {
+    return targetPath;
+  }
 
   if (isArrowOverlay(overlay)) {
     const rotation = overlay.rotationDeg ?? 0;

@@ -43,6 +43,34 @@ function isArrowOverlay(overlay: Pick<Overlay, "templateId">): boolean {
   return overlay.templateId.startsWith("arrow");
 }
 
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function getOverlayAssetHash(overlay: Overlay): string {
+  return stableStringify({
+    version: 1,
+    kind: isArrowOverlay(overlay) ? "arrow" : "card",
+    templateId: overlay.templateId,
+    templateVersion: overlay.templateVersion,
+    width: Math.max(1, Math.floor(overlay.rect.w)),
+    height: Math.max(1, Math.floor(overlay.rect.h)),
+    rotationDeg: isArrowOverlay(overlay) ? normalizeRotation(overlay.rotationDeg ?? 0) : 0,
+    fields: overlay.fields ?? {},
+  });
+}
+
 export function getVideoFps(video: VideoInfo): number {
   return video.fpsDen === 0 ? 30 : video.fpsNum / video.fpsDen;
 }
@@ -202,7 +230,16 @@ export function buildArrowOverlay(
   const arrow = context.arrows?.[0] ?? null;
   const size = getArrowSize(arrow);
   const start = formatFrame(input.startFrame ?? 0);
-  const duration = input.durationFrames ?? Math.floor(fps * 2);
+  const pairedCard = project.overlays.find(
+    (overlay) =>
+      !isArrowOverlay(overlay) &&
+      start >= overlay.startFrame &&
+      start < Math.max(overlay.startFrame + 1, overlay.endFrame)
+  );
+  const pairedDuration = pairedCard
+    ? Math.max(1, pairedCard.endFrame - pairedCard.startFrame)
+    : undefined;
+  const duration = input.durationFrames ?? pairedDuration ?? Math.floor(fps * 2);
   const fallbackX = project.video.width / 2 - size.w / 2;
   const fallbackY = project.video.height / 2 - size.h / 2;
 
