@@ -112,6 +112,63 @@ function parsePlaybackRate(directive: string, sourceSeconds: number): number {
   return 1;
 }
 
+function normalizeStillAssetPath(value: string): string | null {
+  const cleaned = value.trim().replace(/^["']|["']$/g, "").replace(/\\/g, "/");
+  if (!/\.png$/i.test(cleaned)) return null;
+  if (cleaned.startsWith("media/stills/")) return cleaned;
+  if (cleaned.startsWith("stills/")) return `media/${cleaned}`;
+  return `media/stills/${cleaned.split("/").at(-1)}`;
+}
+
+function basename(value: string): string {
+  return value.replace(/\\/g, "/").split("/").at(-1) ?? value;
+}
+
+function parseTimedRateDirectivePart(
+  part: string
+): { seconds: number; rate: number } | null {
+  const match = part.match(
+    new RegExp(String.raw`^\s*(${TIME_TOKEN_SOURCE})\s*(?:at\s*)?(\d+(?:\.\d+)?)\s*x\b`, "i")
+  );
+  if (!match) return null;
+  const seconds = parseFlexibleTimestamp(match[1]);
+  const rate = Number(match[2]);
+  if (!seconds || seconds <= 0 || !isFinitePositive(rate)) return null;
+  return { seconds, rate };
+}
+
+function parseThreePartDirective(
+  directive: string,
+  sourceSeconds: number
+): {
+  prefixSeconds: number;
+  prefixRate: number;
+  middleTargetSeconds: number;
+  suffixSeconds: number;
+  suffixRate: number;
+} | null {
+  const parts = directive.split(/\s+(?:-|\u2013|\u2014)\s+/).map((part) => part.trim());
+  if (parts.length !== 3) return null;
+
+  const prefix = parseTimedRateDirectivePart(parts[0]);
+  const suffix = parseTimedRateDirectivePart(parts[2]);
+  if (!prefix || !suffix) return null;
+
+  const fitIndex = parts[1].search(/\bfit\b/i);
+  if (fitIndex < 0) return null;
+  const middleTargetSeconds = parseTargetSeconds(parts[1].slice(fitIndex));
+  if (!middleTargetSeconds || middleTargetSeconds <= 0) return null;
+
+  if (prefix.seconds + suffix.seconds >= sourceSeconds) return null;
+  return {
+    prefixSeconds: prefix.seconds,
+    prefixRate: prefix.rate,
+    middleTargetSeconds,
+    suffixSeconds: suffix.seconds,
+    suffixRate: suffix.rate,
+  };
+}
+
 function parseCompoundRealtimePrefix(
   directive: string,
   sourceSeconds: number
@@ -173,6 +230,28 @@ function normalizeSegment(input: {
   });
 }
 
+function normalizeStillSegment(input: {
+  id: string;
+  label: string;
+  assetPath: string;
+  durationSeconds: number;
+  fps: number;
+}): SourceSegment | null {
+  const durationFrames = Math.max(1, secondsToFrame(input.durationSeconds, input.fps));
+  return SourceSegmentSchema.parse({
+    kind: "image",
+    id: input.id,
+    label: input.label,
+    startFrame: 0,
+    endFrameExclusive: 1,
+    playbackRate: 1,
+    assetPath: input.assetPath,
+    durationFrames,
+    audio: "mute",
+    transition: { type: "cut", durationFrames: 0 },
+  });
+}
+
 function parseTimelineLine(
   rawLine: string,
   lineNumber: number,
@@ -185,6 +264,22 @@ function parseTimelineLine(
   const label = labelParts.join("=").trim();
   const directive = leftRaw.match(/\(([^)]*)\)/)?.[1]?.trim() ?? "";
   const rangeText = leftRaw.replace(/\([^)]*\)/g, " ").trim();
+  const stillAssetPath = normalizeStillAssetPath(label);
+  if (stillAssetPath && !/\s*(?:-|\u2013|\u2014|\bto\b)\s*/i.test(rangeText)) {
+    const durationSeconds = parseFlexibleTimestamp(rangeText);
+    if (durationSeconds === null || durationSeconds <= 0) {
+      return { segments: [], warning: `Line ${lineNumber}: could not parse still duration.` };
+    }
+    const segment = normalizeStillSegment({
+      id: options.createId(),
+      label: basename(label),
+      assetPath: stillAssetPath,
+      durationSeconds,
+      fps: options.fps,
+    });
+    return { segments: segment ? [segment] : [] };
+  }
+
   const rangeParts = rangeText.split(/\s*(?:-|\u2013|\u2014|\bto\b)\s*/i).filter(Boolean);
   if (rangeParts.length < 2) return { segments: [] };
 
@@ -199,6 +294,51 @@ function parseTimelineLine(
 
   const sourceSeconds = endSeconds - startSeconds;
   const baseLabel = formatLineLabel(label, `Segment ${lineNumber}`);
+  const threePart = parseThreePartDirective(directive, sourceSeconds);
+  if (threePart) {
+    const prefixEnd = startSeconds + threePart.prefixSeconds;
+    const suffixStart = endSeconds - threePart.suffixSeconds;
+    const middleRate = (suffixStart - prefixEnd) / threePart.middleTargetSeconds;
+    const first = normalizeSegment({
+      id: options.createId(),
+      label: `${baseLabel} (first ${threePart.prefixSeconds}s)`,
+      startSeconds,
+      endSeconds: prefixEnd,
+      playbackRate: threePart.prefixRate,
+      directive,
+      fps: options.fps,
+      totalFrames: options.totalFrames,
+      options,
+    });
+    const middle = normalizeSegment({
+      id: options.createId(),
+      label: `${baseLabel} (compressed)`,
+      startSeconds: prefixEnd,
+      endSeconds: suffixStart,
+      playbackRate: middleRate,
+      directive,
+      fps: options.fps,
+      totalFrames: options.totalFrames,
+      options,
+    });
+    const last = normalizeSegment({
+      id: options.createId(),
+      label: `${baseLabel} (last ${threePart.suffixSeconds}s)`,
+      startSeconds: suffixStart,
+      endSeconds,
+      playbackRate: threePart.suffixRate,
+      directive,
+      fps: options.fps,
+      totalFrames: options.totalFrames,
+      options,
+    });
+    return {
+      segments: [first, middle, last].filter((segment): segment is SourceSegment =>
+        Boolean(segment)
+      ),
+    };
+  }
+
   const compound = parseCompoundRealtimePrefix(directive, sourceSeconds);
   if (compound) {
     const splitSeconds = startSeconds + compound.realtimeSeconds;
@@ -249,6 +389,9 @@ export function summarizeSourceSegments(
   fps: number
 ): Pick<SourceTimelineParseResponse, "outputDurationSeconds" | "outputFrames"> {
   const outputFrames = segments.reduce((sum, segment) => {
+    if (segment.kind === "image") {
+      return sum + Math.max(1, segment.durationFrames ?? 1);
+    }
     const sourceFrames = Math.max(1, segment.endFrameExclusive - segment.startFrame);
     return sum + Math.max(1, Math.round(sourceFrames / segment.playbackRate));
   }, 0);

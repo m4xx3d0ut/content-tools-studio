@@ -16,6 +16,8 @@ import path from "node:path";
 import { promises as fs, createWriteStream, createReadStream } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { Readable, Transform } from "node:stream";
+import type { TransformCallback } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 import {
@@ -26,9 +28,9 @@ import {
   readProject,
   writeProject,
 } from "../services/workspace.js";
-import { probeVideo } from "../services/ffprobe.js";
+import { probeAudio, probeVideo } from "../services/ffprobe.js";
 import { renderFinal, writeExportBundle, type RenderProgress } from "../services/exporter.js";
-import { FFMPEG_PATH, WORKSPACE_ROOT } from "../config.js";
+import { FFMPEG_PATH, UPLOAD_MAX_BYTES, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { ensureThumbnail } from "../services/thumbnails.js";
 import { getTemplateCrop } from "../services/template-assets.js";
@@ -59,6 +61,37 @@ const BUNDLE_MANIFEST_FILENAME = "manifest.json";
 const BUNDLE_PROJECT_FILENAME = "project.json";
 const BUNDLE_MODE_VALUES = ["project", "project-media", "full"] as const;
 type BundleMode = (typeof BUNDLE_MODE_VALUES)[number];
+const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus"]);
+const AUDIO_EXTENSION_RE = /\.(mp3|wav|m4a|aac|flac|ogg|oga|opus)(?:$|[?#])/i;
+const AUDIO_CONTENT_TYPE_EXTENSION: Record<string, string> = {
+  "audio/mpeg": ".mp3",
+  "audio/mp3": ".mp3",
+  "audio/wav": ".wav",
+  "audio/x-wav": ".wav",
+  "audio/mp4": ".m4a",
+  "audio/aac": ".aac",
+  "audio/flac": ".flac",
+  "audio/ogg": ".ogg",
+  "audio/opus": ".opus",
+  "application/ogg": ".ogg",
+};
+
+class SizeLimitTransform extends Transform {
+  private bytes = 0;
+
+  constructor(private readonly limitBytes: number) {
+    super();
+  }
+
+  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+    this.bytes += chunk.length;
+    if (this.bytes > this.limitBytes) {
+      callback(new Error(`audio download exceeds ${this.limitBytes} bytes`));
+      return;
+    }
+    callback(null, chunk);
+  }
+}
 
 async function runFfmpeg(args: string[]): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -162,6 +195,160 @@ function sanitizeArchiveName(value: string): string {
   return value.replace(/[^a-z0-9-_]+/gi, "_") || "project";
 }
 
+function sanitizeTimelineAssetFilename(value: string): string {
+  const parsed = path.parse(path.basename(value));
+  const name = parsed.name.replace(/[^a-z0-9._-]+/gi, "_") || "image";
+  return `${name}.png`;
+}
+
+function audioExtensionFromContentType(contentType?: string | null): string | null {
+  const normalized = contentType?.split(";")[0]?.trim().toLowerCase();
+  if (!normalized) return null;
+  return AUDIO_CONTENT_TYPE_EXTENSION[normalized] ?? null;
+}
+
+function sanitizeAudioAssetFilename(
+  value: string | undefined,
+  contentType?: string | null
+): string {
+  const parsed = path.parse(path.basename(value || "audio"));
+  const typeExtension = audioExtensionFromContentType(contentType);
+  const extension = AUDIO_EXTENSIONS.has(parsed.ext.toLowerCase())
+    ? parsed.ext.toLowerCase()
+    : typeExtension ?? ".audio";
+  const name = parsed.name.replace(/[^a-z0-9._-]+/gi, "_") || `audio-${randomUUID()}`;
+  return `${name}${extension}`;
+}
+
+function filenameFromContentDisposition(value?: string | null): string | null {
+  if (!value) return null;
+  const encoded = value.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded.replace(/^"|"$/g, ""));
+    } catch {
+      return encoded.replace(/^"|"$/g, "");
+    }
+  }
+  return value.match(/filename="?([^";]+)"?/i)?.[1] ?? null;
+}
+
+function isAudioResponse(response: Response, requestUrl: string): boolean {
+  const contentType = response.headers.get("content-type");
+  if (audioExtensionFromContentType(contentType)) return true;
+  if (contentType?.toLowerCase().includes("text/html")) return false;
+  return AUDIO_EXTENSION_RE.test(new URL(response.url || requestUrl).pathname);
+}
+
+function decodeHtmlAttribute(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&#x2F;/gi, "/")
+    .replace(/&#47;/g, "/")
+    .replace(/&quot;/g, "\"");
+}
+
+function extractAudioUrlsFromHtml(html: string, pageUrl: string): string[] {
+  const base = new URL(pageUrl);
+  const candidates = new Set<string>();
+  const attrPattern = /(?:href|src|content)=["']([^"']+)["']/gi;
+  for (const match of html.matchAll(attrPattern)) {
+    const raw = decodeHtmlAttribute(match[1] ?? "");
+    if (!AUDIO_EXTENSION_RE.test(raw)) continue;
+    try {
+      const resolved = raw.startsWith("//")
+        ? `${base.protocol}${raw}`
+        : new URL(raw, base).toString();
+      candidates.add(resolved);
+    } catch {
+      // Ignore malformed URLs discovered in arbitrary HTML.
+    }
+  }
+  return [...candidates].sort((a, b) => {
+    const aUpload = a.includes("upload.wikimedia.org") ? 0 : 1;
+    const bUpload = b.includes("upload.wikimedia.org") ? 0 : 1;
+    return aUpload - bUpload;
+  });
+}
+
+async function fetchAudioResponse(inputUrl: string): Promise<Response> {
+  let initialUrl: URL;
+  try {
+    initialUrl = new URL(inputUrl);
+  } catch {
+    throw new Error("audio URL is invalid");
+  }
+  if (initialUrl.protocol !== "http:" && initialUrl.protocol !== "https:") {
+    throw new Error("audio URL must use http or https");
+  }
+
+  const response = await fetch(initialUrl, {
+    redirect: "follow",
+    headers: { "User-Agent": "content-tools-studio/1.0" },
+  });
+  if (!response.ok) {
+    throw new Error(`audio URL returned ${response.status}`);
+  }
+  if (isAudioResponse(response, initialUrl.toString())) {
+    return response;
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("text/html")) {
+    throw new Error("URL did not return an audio file");
+  }
+
+  const html = await response.text();
+  const candidates = extractAudioUrlsFromHtml(html, response.url || initialUrl.toString());
+  for (const candidate of candidates) {
+    const candidateResponse = await fetch(candidate, {
+      redirect: "follow",
+      headers: { "User-Agent": "content-tools-studio/1.0" },
+    });
+    if (candidateResponse.ok && isAudioResponse(candidateResponse, candidate)) {
+      return candidateResponse;
+    }
+  }
+
+  throw new Error("Could not find an audio file link on the URL page");
+}
+
+async function persistAudioAsset(
+  projectId: string,
+  input: {
+    stream: NodeJS.ReadableStream;
+    filename?: string;
+    contentType?: string | null;
+    source: "upload" | "url";
+    originalUrl?: string;
+  }
+) {
+  const filename = sanitizeAudioAssetFilename(input.filename, input.contentType);
+  const projectRoot = path.join(WORKSPACE_ROOT, projectId);
+  const targetDir = path.join(projectRoot, "media", "audio");
+  await ensureDir(targetDir);
+  const targetPath = path.join(targetDir, filename);
+  await pipeline(input.stream, new SizeLimitTransform(UPLOAD_MAX_BYTES), createWriteStream(targetPath));
+
+  try {
+    const audio = await probeAudio(targetPath);
+    const stat = await fs.stat(targetPath);
+    return {
+      ok: true,
+      path: toPosix(path.join("media", "audio", filename)),
+      filename,
+      sizeBytes: stat.size,
+      sha256: await hashFile(targetPath),
+      audio,
+      source: input.source,
+      originalUrl: input.originalUrl,
+    };
+  } catch (error) {
+    await fs.unlink(targetPath).catch(() => undefined);
+    throw error;
+  }
+}
+
 function toPosix(inputPath: string): string {
   return inputPath.replace(/\\/g, "/");
 }
@@ -196,6 +383,28 @@ function isAllowedBundleEntry(entryPath: string): boolean {
     entryPath.startsWith("exports/") ||
     entryPath.startsWith("slugs/media/")
   );
+}
+
+function getProjectTimelineAssetPaths(project: Project): string[] {
+  const seen = new Set<string>();
+  const paths: string[] = [];
+  for (const segment of project.edits?.sourceSegments ?? []) {
+    if (segment.kind !== "image" || !segment.assetPath) continue;
+    const normalized = normalizeBundleEntryPath(segment.assetPath);
+    if (!normalized || !normalized.startsWith("media/")) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    paths.push(normalized);
+  }
+  return paths;
+}
+
+function getProjectAudioAssetPaths(project: Project): string[] {
+  const normalized = project.audioTrack?.assetPath
+    ? normalizeBundleEntryPath(project.audioTrack.assetPath)
+    : null;
+  if (!normalized || !normalized.startsWith("media/audio/")) return [];
+  return [normalized];
 }
 
 async function addBundleFile(
@@ -263,6 +472,12 @@ async function buildProjectBundle(project: Project, mode: BundleMode): Promise<B
 
   if (mode === "project-media") {
     await addBundleFile(entries, rootDir, path.join("media", project.source.filename));
+    for (const assetPath of getProjectTimelineAssetPaths(project)) {
+      await addBundleFile(entries, rootDir, assetPath);
+    }
+    for (const assetPath of getProjectAudioAssetPaths(project)) {
+      await addBundleFile(entries, rootDir, assetPath);
+    }
   }
 
   if (mode === "full") {
@@ -850,6 +1065,151 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(500).send({ error: (error as Error).message });
     }
   });
+
+  app.post(
+    "/:id/timeline-assets",
+    routeDoc(["Projects"], "Upload a PNG still for source timeline recipes", {
+      params: projectIdParamsSchema,
+      consumes: ["multipart/form-data"],
+      response: {
+        200: {
+          type: "object",
+          required: ["ok", "path", "filename", "sizeBytes", "sha256"],
+          properties: {
+            ok: { type: "boolean" },
+            path: { type: "string" },
+            filename: { type: "string" },
+            sizeBytes: { type: "number" },
+            sha256: { type: "string" },
+          },
+        },
+        ...errorResponses,
+      },
+    }),
+    async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const project = await readProject(id);
+    if (!project) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+
+    const data = await request.file();
+    if (!data) {
+      return reply.code(400).send({ error: "file is required" });
+    }
+
+    const originalName = path.basename(data.filename);
+    if (path.extname(originalName).toLowerCase() !== ".png") {
+      data.file.resume();
+      return reply.code(400).send({ error: "timeline asset must be a png file" });
+    }
+
+    const filename = sanitizeTimelineAssetFilename(originalName);
+    const projectRoot = path.join(WORKSPACE_ROOT, id);
+    const targetDir = path.join(projectRoot, "media", "stills");
+    await ensureDir(targetDir);
+    const targetPath = path.join(targetDir, filename);
+    await pipeline(data.file, createWriteStream(targetPath));
+
+    const stat = await fs.stat(targetPath);
+    const sha256 = await hashFile(targetPath);
+    return {
+      ok: true,
+      path: toPosix(path.join("media", "stills", filename)),
+      filename,
+      sizeBytes: stat.size,
+      sha256,
+    };
+  });
+
+  app.post(
+    "/:id/audio-assets",
+    routeDoc(["Projects"], "Upload an external audio asset", {
+      params: projectIdParamsSchema,
+      consumes: ["multipart/form-data"],
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const project = await readProject(id);
+      if (!project) {
+        return reply.code(404).send({ error: "project not found" });
+      }
+
+      const data = await request.file();
+      if (!data) {
+        return reply.code(400).send({ error: "file is required" });
+      }
+
+      try {
+        return await persistAudioAsset(id, {
+          stream: data.file,
+          filename: data.filename,
+          contentType: data.mimetype,
+          source: "upload",
+        });
+      } catch (error) {
+        return reply.code(400).send({
+          error: "audio import failed",
+          message: (error as Error).message,
+        });
+      }
+    }
+  );
+
+  app.post(
+    "/:id/audio-assets/from-url",
+    routeDoc(["Projects"], "Import an external audio asset from a URL", {
+      params: projectIdParamsSchema,
+      body: {
+        type: "object",
+        required: ["url"],
+        properties: { url: { type: "string" } },
+      },
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const project = await readProject(id);
+      if (!project) {
+        return reply.code(404).send({ error: "project not found" });
+      }
+
+      const inputUrl = (request.body as { url?: string } | undefined)?.url?.trim();
+      if (!inputUrl) {
+        return reply.code(400).send({ error: "url is required" });
+      }
+
+      try {
+        const response = await fetchAudioResponse(inputUrl);
+        const contentLength = Number(response.headers.get("content-length") ?? 0);
+        if (Number.isFinite(contentLength) && contentLength > UPLOAD_MAX_BYTES) {
+          return reply.code(400).send({ error: "audio file is too large" });
+        }
+        if (!response.body) {
+          return reply.code(400).send({ error: "audio URL returned an empty body" });
+        }
+        const responseUrl = response.url || inputUrl;
+        const fallbackName = path.basename(new URL(responseUrl).pathname) || "audio";
+        const filename =
+          filenameFromContentDisposition(response.headers.get("content-disposition")) ??
+          fallbackName;
+        const stream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
+        return await persistAudioAsset(id, {
+          stream,
+          filename,
+          contentType: response.headers.get("content-type"),
+          source: "url",
+          originalUrl: inputUrl,
+        });
+      } catch (error) {
+        return reply.code(400).send({
+          error: "audio import failed",
+          message: (error as Error).message,
+        });
+      }
+    }
+  );
 
   app.post(
     "/:id/assets/:kind/:overlayId",

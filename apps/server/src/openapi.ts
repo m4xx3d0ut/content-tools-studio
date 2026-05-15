@@ -77,6 +77,49 @@ export const openApiSchemas = {
       file: { type: "string", format: "binary" },
     },
   },
+  AudioAssetImport: {
+    type: "object",
+    required: ["file"],
+    properties: {
+      file: { type: "string", format: "binary" },
+    },
+  },
+  AudioAssetFromUrl: {
+    type: "object",
+    required: ["url"],
+    properties: {
+      url: { type: "string", format: "uri" },
+    },
+  },
+  AudioAssetResponse: {
+    type: "object",
+    required: ["ok", "path", "filename", "sizeBytes", "sha256", "audio", "source"],
+    properties: {
+      ok: { type: "boolean" },
+      path: { type: "string" },
+      filename: { type: "string" },
+      sizeBytes: { type: "number" },
+      sha256: { type: "string" },
+      source: { type: "string", enum: ["upload", "url"] },
+      originalUrl: { type: "string" },
+      audio: {
+        type: "object",
+        properties: {
+          durationMs: { type: "number" },
+          sampleRate: { type: "number" },
+          channels: { type: "number" },
+          codecName: { type: "string" },
+        },
+      },
+    },
+  },
+  TimelineAssetImport: {
+    type: "object",
+    required: ["file"],
+    properties: {
+      file: { type: "string", format: "binary" },
+    },
+  },
   TemplateInfo: {
     type: "object",
     required: ["id", "label", "imagePath", "bounds", "sourceWidth", "sourceHeight", "align"],
@@ -234,6 +277,32 @@ export function openApiDocument(app: FastifyInstance): Record<string, unknown> {
   patchJsonRequestBody(document, "/projects/{id}", "put", ref("Project"));
   patchJsonResponse(document, "/projects/{id}", "put", "200", ref("Project"));
   patchJsonResponse(document, "/projects/{id}/import", "post", "200", ref("Project"));
+  patchMultipartRequestBody(
+    document,
+    "/projects/{id}/timeline-assets",
+    "post",
+    ref("TimelineAssetImport")
+  );
+  patchMultipartRequestBody(
+    document,
+    "/projects/{id}/audio-assets",
+    "post",
+    ref("AudioAssetImport")
+  );
+  patchJsonResponse(document, "/projects/{id}/audio-assets", "post", "200", ref("AudioAssetResponse"));
+  patchJsonRequestBody(
+    document,
+    "/projects/{id}/audio-assets/from-url",
+    "post",
+    ref("AudioAssetFromUrl")
+  );
+  patchJsonResponse(
+    document,
+    "/projects/{id}/audio-assets/from-url",
+    "post",
+    "200",
+    ref("AudioAssetResponse")
+  );
   patchJsonRequestBody(document, "/projects/{id}/commands", "post", ref("CommandBatchRequest"));
   patchJsonResponse(document, "/projects/{id}/commands", "post", "200", ref("CommandBatchResponse"));
   patchJsonRequestBody(

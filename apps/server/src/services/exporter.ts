@@ -37,6 +37,9 @@ type ExportManifest = {
   includeSlugStart: boolean;
   includeSlugEnd: boolean;
   source: string;
+  timelineSource?: string;
+  timelineAssetInputs?: string[];
+  timelineInputs: string[];
   overlayInputs: string[];
   arrowInputs: string[];
   filterCards: string;
@@ -51,6 +54,12 @@ type ExportManifest = {
   outputHeight?: number;
   sourceSegmentOutputFrames?: number;
   sourceSegmentOutputDurationSec?: number;
+  tailSlugStartSec?: number;
+  assembledDurationSec?: number;
+  externalAudioInput?: string;
+  externalAudioFadeOutStartSec?: number;
+  externalAudioFadeOutEndSec?: number;
+  audioTrack?: Project["audioTrack"];
 };
 
 type FilterResult = {
@@ -62,6 +71,22 @@ type FilterResult = {
 type AudioPlan = {
   label: string;
   lines: string[];
+};
+
+type ExternalAudioContext = {
+  tailSlugStartSec?: number;
+};
+
+type ExternalAudioFadePlan = {
+  target: "tailSlug" | "end";
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+};
+
+type ExternalAudioApplyResult = {
+  durationSec: number;
+  fadeOut?: ExternalAudioFadePlan;
 };
 
 type OverlayTiming = {
@@ -88,12 +113,15 @@ type TimelineTransition = {
 };
 
 type TimelineSegment = {
+  kind: "source" | "image";
   startFrame: number;
   endFrame: number;
   durationFrames: number;
   outputStartFrame: number;
   playbackRate: number;
   audio: "preserve" | "mute";
+  assetPath?: string;
+  imageInputIndex?: number;
 };
 
 const DEFAULT_VIDEO_WIDTH = 1920;
@@ -450,6 +478,7 @@ function buildFilterScript(
   speed: 1 | 2,
   baseLabel: string,
   preLines: string[],
+  timelineInputCount: number,
   renderTuning?: {
     outputFps?: number;
     outputWidth?: number;
@@ -489,7 +518,7 @@ function buildFilterScript(
   let prevLabel = "[v0]";
 
   overlays.forEach((overlay, index) => {
-    const inputIndex = index + 1;
+    const inputIndex = timelineInputCount + index + 1;
     const ovLabel = `[ov${inputIndex}]`;
     const timing = computeOverlayTiming(overlay, fps, speed);
     lines.push(buildOverlayInputLine(overlay, inputIndex, timing));
@@ -539,7 +568,12 @@ function normalizeTransition(input?: {
   return { type: "cut", durationFrames: 0 };
 }
 
-function outputFramesForSegment(segment: Pick<TimelineSegment, "durationFrames" | "playbackRate">): number {
+function outputFramesForSegment(
+  segment: Pick<TimelineSegment, "kind" | "durationFrames" | "playbackRate">
+): number {
+  if ("kind" in segment && segment.kind === "image") {
+    return Math.max(1, Math.round(segment.durationFrames));
+  }
   return Math.max(1, Math.round(segment.durationFrames / Math.max(0.01, segment.playbackRate)));
 }
 
@@ -569,6 +603,7 @@ function buildAtempoFilters(playbackRate: number): string {
 function adjustOverlaysForSegments(project: Project, segments: TimelineSegment[]): Overlay[] {
   const mapFrame = (frame: number) => {
     for (const segment of segments) {
+      if (segment.kind !== "source") continue;
       if (frame >= segment.startFrame && frame < segment.endFrame) {
         return {
           outputFrame:
@@ -654,10 +689,24 @@ function normalizeSourceSegmentsForRender(project: Project): SourceSegment[] {
   );
   return (project.edits?.sourceSegments ?? [])
     .map((segment) => {
+      if (segment.kind === "image") {
+        return {
+          ...segment,
+          kind: "image" as const,
+          startFrame: 0,
+          endFrameExclusive: 1,
+          playbackRate: 1,
+          audio: "mute" as const,
+          durationFrames: Math.max(1, Math.floor(segment.durationFrames ?? 1)),
+          assetPath: segment.assetPath?.trim(),
+          transition: normalizeTransition(segment.transition),
+        };
+      }
       const startFrame = clampNumber(segment.startFrame, 0, totalFrames - 1);
       const endFrameExclusive = clampNumber(segment.endFrameExclusive, startFrame + 1, totalFrames);
       return {
         ...segment,
+        kind: "source" as const,
         startFrame,
         endFrameExclusive,
         playbackRate: Math.max(0.01, segment.playbackRate),
@@ -665,7 +714,11 @@ function normalizeSourceSegmentsForRender(project: Project): SourceSegment[] {
         transition: normalizeTransition(segment.transition),
       };
     })
-    .filter((segment) => segment.endFrameExclusive > segment.startFrame);
+    .filter((segment) =>
+      segment.kind === "image"
+        ? Boolean(segment.assetPath && segment.durationFrames && segment.durationFrames > 0)
+        : segment.endFrameExclusive > segment.startFrame
+    );
 }
 
 function combineVideoSegments(
@@ -749,6 +802,7 @@ function buildSourceSegmentTimelinePlan(project: Project): {
   outputFrames: number;
   audioLabel?: string;
   audioLines?: string[];
+  timelineInputs: string[];
   usesSourceSegments: boolean;
 } {
   const fps = project.video.fpsNum / project.video.fpsDen;
@@ -759,12 +813,17 @@ function buildSourceSegmentTimelinePlan(project: Project): {
   }
 
   const timelineSegments: TimelineSegment[] = [];
+  const timelineInputs: string[] = [];
   const transitions = sourceSegments.slice(0, -1).map((segment, index) => {
     const transition = normalizeTransition(segment.transition);
     const maxDuration = Math.min(
       transition.durationFrames,
-      Math.max(1, Math.round((sourceSegments[index].endFrameExclusive - sourceSegments[index].startFrame) / sourceSegments[index].playbackRate)),
-      Math.max(1, Math.round((sourceSegments[index + 1].endFrameExclusive - sourceSegments[index + 1].startFrame) / sourceSegments[index + 1].playbackRate))
+      sourceSegments[index].kind === "image"
+        ? Math.max(1, sourceSegments[index].durationFrames ?? 1)
+        : Math.max(1, Math.round((sourceSegments[index].endFrameExclusive - sourceSegments[index].startFrame) / sourceSegments[index].playbackRate)),
+      sourceSegments[index + 1].kind === "image"
+        ? Math.max(1, sourceSegments[index + 1].durationFrames ?? 1)
+        : Math.max(1, Math.round((sourceSegments[index + 1].endFrameExclusive - sourceSegments[index + 1].startFrame) / sourceSegments[index + 1].playbackRate))
     );
     return transition.type === "crossfade" && maxDuration > 0
       ? { type: "crossfade" as const, durationFrames: maxDuration }
@@ -773,7 +832,31 @@ function buildSourceSegmentTimelinePlan(project: Project): {
 
   let outputCursor = 0;
   sourceSegments.forEach((segment, index) => {
+    if (segment.kind === "image") {
+      const imageInputIndex = timelineInputs.length;
+      timelineInputs.push(segment.assetPath ?? "");
+      const timelineSegment: TimelineSegment = {
+        kind: "image",
+        startFrame: 0,
+        endFrame: Math.max(1, segment.durationFrames ?? 1),
+        durationFrames: Math.max(1, segment.durationFrames ?? 1),
+        outputStartFrame: outputCursor,
+        playbackRate: 1,
+        audio: "mute",
+        assetPath: segment.assetPath,
+        imageInputIndex,
+      };
+      timelineSegments.push(timelineSegment);
+      outputCursor += outputFramesForSegment(timelineSegment);
+      const transition = transitions[index];
+      if (transition?.type === "crossfade") {
+        outputCursor -= transition.durationFrames;
+      }
+      return;
+    }
+
     const timelineSegment: TimelineSegment = {
+      kind: "source",
       startFrame: segment.startFrame,
       endFrame: segment.endFrameExclusive,
       durationFrames: segment.endFrameExclusive - segment.startFrame,
@@ -791,6 +874,19 @@ function buildSourceSegmentTimelinePlan(project: Project): {
 
   const baseLines: string[] = [];
   timelineSegments.forEach((segment, index) => {
+    if (segment.kind === "image") {
+      const inputIndex = 1 + (segment.imageInputIndex ?? 0);
+      const durationSec = outputFramesForSegment(segment) / fps;
+      baseLines.push(
+        `[${inputIndex}:v]scale=${project.video.width || DEFAULT_VIDEO_WIDTH}:${project.video.height || DEFAULT_VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,pad=${project.video.width || DEFAULT_VIDEO_WIDTH}:${project.video.height || DEFAULT_VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,tpad=stop_mode=clone:stop_duration=${formatNumber(
+          durationSec
+        )},trim=duration=${formatNumber(durationSec)},fps=${formatNumber(
+          fps
+        )},setpts=PTS-STARTPTS[ss${index}]`
+      );
+      return;
+    }
+
     const setpts =
       Math.abs(segment.playbackRate - 1) < 0.0001
         ? "PTS-STARTPTS"
@@ -844,6 +940,7 @@ function buildSourceSegmentTimelinePlan(project: Project): {
     outputFrames: combined.outputFrames,
     audioLabel,
     audioLines: audioLines.length ? audioLines : undefined,
+    timelineInputs,
     usesSourceSegments: true,
   };
 }
@@ -855,6 +952,7 @@ function buildTimelinePlan(project: Project): {
   outputFrames: number;
   audioLabel?: string;
   audioLines?: string[];
+  timelineInputs?: string[];
   usesSourceSegments?: boolean;
 } {
   if (project.edits?.sourceSegments?.length) {
@@ -884,6 +982,7 @@ function buildTimelinePlan(project: Project): {
       outputFrames: totalFrames,
       audioLabel: hasAudio ? "[0:a]" : undefined,
       audioLines: hasAudio ? [] : undefined,
+      timelineInputs: [],
     };
   }
 
@@ -918,6 +1017,7 @@ function buildTimelinePlan(project: Project): {
     const cutEnd = Math.min(cut.endFrame, keepEnd);
     if (cutStart > cursor) {
       segments.push({
+        kind: "source",
         startFrame: cursor,
         endFrame: cutStart,
         durationFrames: cutStart - cursor,
@@ -938,6 +1038,7 @@ function buildTimelinePlan(project: Project): {
 
   if (cursor < keepEnd) {
     segments.push({
+      kind: "source",
       startFrame: cursor,
       endFrame: keepEnd,
       durationFrames: keepEnd - cursor,
@@ -1120,6 +1221,7 @@ function buildTimelinePlan(project: Project): {
     outputFrames: Math.max(1, currentDurationFrames),
     audioLabel,
     audioLines: audioLines.length ? audioLines : undefined,
+    timelineInputs: [],
   };
 }
 
@@ -1131,6 +1233,166 @@ function relPath(from: string, to: string): string {
   return toPosix(path.relative(from, to));
 }
 
+function resolveProjectAssetPath(projectRoot: string, inputPath: string): string {
+  if (path.isAbsolute(inputPath)) return inputPath;
+  return path.join(projectRoot, inputPath);
+}
+
+function concatListPath(inputPath: string): string {
+  return `'${inputPath.replace(/'/g, "'\\''")}'`;
+}
+
+async function renderFlattenedSourceTimeline(
+  project: Project,
+  exportDir: string,
+  outputPath: string,
+  includeAudio: boolean,
+  onProgress?: (update: RenderProgress) => void
+): Promise<void> {
+  const segments = normalizeSourceSegmentsForRender(project);
+  if (!segments.length) {
+    throw new Error("No source segments remain after normalization");
+  }
+
+  const projectRoot = path.join(WORKSPACE_ROOT, project.id);
+  const sourcePath = path.join(projectRoot, "media", project.source.filename);
+  const segmentDir = path.join(exportDir, "timeline_segments");
+  await ensureDir(segmentDir);
+
+  const fps = project.video.fpsNum / project.video.fpsDen;
+  const width = project.video.width || DEFAULT_VIDEO_WIDTH;
+  const height = project.video.height || DEFAULT_VIDEO_HEIGHT;
+  const sampleRate = project.video.audio?.sampleRate ?? 48000;
+  const hasAudio = includeAudio && Boolean(project.video.audio?.hasAudio);
+  const segmentFiles: string[] = [];
+
+  for (const [index, segment] of segments.entries()) {
+    const segmentPath = path.join(segmentDir, `${String(index).padStart(3, "0")}.mp4`);
+    const outputDurationSec = outputFramesForSegment({
+      kind: segment.kind,
+      durationFrames:
+        segment.kind === "image"
+          ? Math.max(1, segment.durationFrames ?? 1)
+          : segment.endFrameExclusive - segment.startFrame,
+      playbackRate: segment.playbackRate,
+    }) / fps;
+
+    const videoFilter =
+      segment.kind === "image"
+        ? `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${formatNumber(
+            fps
+          )},format=yuv420p,trim=duration=${formatNumber(
+            outputDurationSec
+          )},setpts=PTS-STARTPTS[v]`
+        : `[0:v]setpts=(PTS-STARTPTS)/${formatNumber(
+            segment.playbackRate
+          )},fps=${formatNumber(
+            fps
+          )},scale=${width}:${height},setsar=1,format=yuv420p,trim=duration=${formatNumber(
+            outputDurationSec
+          )},setpts=PTS-STARTPTS[v]`;
+
+    const audioFilter = hasAudio
+      ? segment.kind === "image" || segment.audio === "mute"
+        ? `anullsrc=channel_layout=stereo:sample_rate=${sampleRate},atrim=duration=${formatNumber(
+            outputDurationSec
+          )},asetpts=PTS-STARTPTS[a]`
+        : `[0:a]asetpts=PTS-STARTPTS${buildAtempoFilters(
+            segment.playbackRate
+          )},atrim=duration=${formatNumber(outputDurationSec)},asetpts=PTS-STARTPTS[a]`
+      : null;
+
+    const inputArgs =
+      segment.kind === "image"
+        ? [
+            "-loop",
+            "1",
+            "-t",
+            formatNumber(outputDurationSec),
+            "-i",
+            resolveProjectAssetPath(projectRoot, segment.assetPath ?? ""),
+          ]
+        : [
+            "-ss",
+            formatNumber(segment.startFrame / fps),
+            "-t",
+            formatNumber((segment.endFrameExclusive - segment.startFrame) / fps),
+            "-i",
+            sourcePath,
+          ];
+
+    const args = [
+      "-y",
+      ...inputArgs,
+      "-filter_complex",
+      [videoFilter, audioFilter].filter(Boolean).join(";"),
+      "-map",
+      "[v]",
+      ...(hasAudio ? ["-map", "[a]"] : []),
+      "-c:v",
+      "libx264",
+      "-crf",
+      "18",
+      "-preset",
+      "veryfast",
+      ...(hasAudio ? ["-c:a", "aac", "-b:a", "192k"] : []),
+      "-pix_fmt",
+      "yuv420p",
+      "-movflags",
+      "+faststart",
+      segmentPath,
+    ];
+
+    onProgress?.({
+      stage: "timeline",
+      message: `Rendering timeline segment ${index + 1}/${segments.length}`,
+      percent: index / segments.length,
+    });
+    await runFfmpeg(args, exportDir, onProgress, outputDurationSec, "timeline-segment");
+    segmentFiles.push(segmentPath);
+  }
+
+  const concatPath = path.join(segmentDir, "concat.txt");
+  await fs.writeFile(
+    concatPath,
+    `${segmentFiles.map((filePath) => `file ${concatListPath(filePath)}`).join("\n")}\n`,
+    "utf-8"
+  );
+
+  onProgress?.({
+    stage: "timeline",
+    message: "Concatenating flattened timeline",
+    percent: 0.95,
+  });
+  await runFfmpeg(
+    [
+      "-y",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      concatPath,
+      "-c:v",
+      "libx264",
+      "-crf",
+      "18",
+      "-preset",
+      "veryfast",
+      ...(hasAudio ? ["-c:a", "aac", "-b:a", "192k"] : []),
+      "-pix_fmt",
+      "yuv420p",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ],
+    exportDir,
+    onProgress,
+    undefined,
+    "timeline-concat"
+  );
+}
+
 function buildReadme(
   exportDir: string,
   manifest: ExportManifest,
@@ -1139,6 +1401,9 @@ function buildReadme(
 ): string {
   const preset = EXPORT_PRESETS[manifest.presetId] ??
     EXPORT_PRESETS[DEFAULT_PRESET_ID];
+  const timelineLines = manifest.timelineInputs.map(
+    (input) => `  -i ${relPath(exportDir, input)} \\\\`
+  );
   const overlayLines = cardInputs.map(
     (input) => `  -loop 1 -i ${relPath(exportDir, input.filePath)} \\\\`
   );
@@ -1152,6 +1417,7 @@ function buildReadme(
 
   const cardsCommand = [
     `ffmpeg -y -i ${inputVideo} \\\\`,
+    ...timelineLines,
     ...overlayLines,
     `  -filter_complex_script ${cardsScript} \\\\`,
     `  -map "${manifest.outputLabelCards}" \\\\`,
@@ -1169,6 +1435,7 @@ function buildReadme(
   if (arrowInputs.length) {
     arrowsCommand = [
       `ffmpeg -y -i ${inputVideo} \\\\`,
+      ...timelineLines,
       ...overlayLines,
       ...arrowLines,
       `  -filter_complex_script ${cardsArrowsScript} \\\\`,
@@ -1280,6 +1547,164 @@ async function resolveSlugPath(projectRoot: string, inputPath?: string): Promise
   return null;
 }
 
+function resolveProjectAudioPath(projectRoot: string, inputPath: string): string {
+  if (path.isAbsolute(inputPath)) return inputPath;
+  return path.join(projectRoot, inputPath);
+}
+
+function planExternalAudioFade(
+  audioTrack: NonNullable<Project["audioTrack"]>,
+  startSec: number,
+  durationSec: number,
+  context: ExternalAudioContext
+): ExternalAudioFadePlan | undefined {
+  const fadeOut = audioTrack.fadeOut;
+  if (!fadeOut?.enabled) return undefined;
+
+  const target = fadeOut.target ?? "tailSlug";
+  const requestedEndSec = target === "tailSlug" ? context.tailSlugStartSec : durationSec;
+  if (typeof requestedEndSec !== "number" || !Number.isFinite(requestedEndSec)) {
+    return undefined;
+  }
+
+  const endSec = clampNumber(requestedEndSec, startSec, durationSec);
+  if (endSec <= startSec) return undefined;
+
+  const requestedDurationSec = Math.max(0, fadeOut.durationSec ?? 2);
+  const fadeStartSec = Math.max(startSec, endSec - requestedDurationSec);
+  const fadeDurationSec = endSec - fadeStartSec;
+  if (fadeDurationSec <= 0) return undefined;
+
+  return {
+    target,
+    startSec: fadeStartSec,
+    endSec,
+    durationSec: fadeDurationSec,
+  };
+}
+
+async function applyExternalAudioTrack(
+  project: Project,
+  exportDir: string,
+  inputPath: string,
+  outputPath: string,
+  onProgress?: (update: RenderProgress) => void,
+  context: ExternalAudioContext = {}
+): Promise<ExternalAudioApplyResult> {
+  const audioTrack = project.audioTrack;
+  if (!audioTrack) {
+    await fs.copyFile(inputPath, outputPath);
+    const outputInfo = await probeVideo(inputPath);
+    return { durationSec: outputInfo.durationMs / 1000 };
+  }
+
+  const projectRoot = path.join(WORKSPACE_ROOT, project.id);
+  const audioPath = resolveProjectAudioPath(projectRoot, audioTrack.assetPath);
+  if (!(await fileExists(audioPath))) {
+    throw new Error(`External audio asset is missing: ${audioTrack.assetPath}`);
+  }
+
+  const outputInfo = await probeVideo(inputPath);
+  const durationSec = outputInfo.durationMs > 0
+    ? outputInfo.durationMs / 1000
+    : project.video.durationMs / 1000;
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new Error("Cannot apply external audio because output duration is unknown");
+  }
+
+  const startSec = clampNumber(audioTrack.startSec ?? 0, 0, durationSec);
+  const remainingSec = Math.max(0, durationSec - startSec);
+  const startMs = Math.round(startSec * 1000);
+  const fadePlan = planExternalAudioFade(audioTrack, startSec, durationSec, context);
+  const audioFormat = "aformat=sample_rates=48000:channel_layouts=stereo";
+  const lines: string[] = [];
+  let externalLabel: string | null = null;
+
+  if (remainingSec > 0) {
+    const externalDurationSec = fadePlan
+      ? Math.max(0, fadePlan.endSec - startSec)
+      : remainingSec;
+    const externalFilters = [
+      `[1:a]${audioFormat}`,
+      `atrim=duration=${formatNumber(externalDurationSec)}`,
+      "asetpts=PTS-STARTPTS",
+    ];
+    if (fadePlan) {
+      externalFilters.push(
+        `afade=t=out:st=${formatNumber(fadePlan.startSec - startSec)}:d=${formatNumber(
+          fadePlan.durationSec
+        )}`
+      );
+    }
+    externalFilters.push(
+      `adelay=${startMs}:all=1`,
+      "apad",
+      `atrim=duration=${formatNumber(durationSec)}`,
+      "asetpts=PTS-STARTPTS[exta]"
+    );
+    lines.push(externalFilters.join(","));
+    externalLabel = "[exta]";
+  }
+
+  const silenceLine = `anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration=${formatNumber(
+    durationSec
+  )},asetpts=PTS-STARTPTS[basea]`;
+  const mode = audioTrack.mode ?? "overlay";
+  let audioOutputLabel = "[basea]";
+
+  if (mode === "overlay" && outputInfo.audio?.hasAudio) {
+    lines.push(
+      `[0:a]${audioFormat},atrim=duration=${formatNumber(
+        durationSec
+      )},asetpts=PTS-STARTPTS[basea]`
+    );
+  } else {
+    lines.push(silenceLine);
+  }
+
+  if (externalLabel) {
+    lines.push(
+      `[basea]${externalLabel}amix=inputs=2:duration=first:dropout_transition=0[aout]`
+    );
+    audioOutputLabel = "[aout]";
+  }
+
+  onProgress?.({
+    stage: "audio",
+    message: `Applying external audio (${mode})`,
+    percent: 0,
+  });
+  await runFfmpeg(
+    [
+      "-y",
+      "-i",
+      inputPath,
+      "-i",
+      audioPath,
+      "-filter_complex",
+      lines.join(";"),
+      "-map",
+      "0:v:0",
+      "-map",
+      audioOutputLabel,
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ],
+    exportDir,
+    onProgress,
+    durationSec,
+    "ffmpeg-audio"
+  );
+  return { durationSec, fadeOut: fadePlan };
+}
+
 export async function writeExportBundle(
   project: Project,
   options: ExportRequest = {}
@@ -1300,6 +1725,11 @@ export async function writeExportBundle(
   const exportId = new Date().toISOString().replace(/[:.]/g, "-");
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const exportDir = path.join(projectRoot, "exports", exportId);
+  const sourcePath = path.join(projectRoot, "media", project.source.filename);
+  const usesFlattenedTimeline = Boolean(timelinePlan.usesSourceSegments);
+  const renderSourcePath = usesFlattenedTimeline
+    ? path.join(exportDir, "timeline_source.mp4")
+    : sourcePath;
   const requestedSpeed = options.speed ?? project.exportOptions?.speed ?? 1;
   const speed = timelinePlan.usesSourceSegments ? 1 : requestedSpeed;
   const hasAudio = Boolean(project.video.audio?.hasAudio);
@@ -1325,6 +1755,9 @@ export async function writeExportBundle(
   const sourceSegmentOutputDurationSec = timelinePlan.usesSourceSegments
     ? timelinePlan.outputFrames / sourceFps
     : undefined;
+  const timelineInputs = (timelinePlan.timelineInputs ?? []).map((inputPath) =>
+    resolveProjectAssetPath(projectRoot, inputPath)
+  );
   const filterTuning =
     renderTuning.mode === "rough" || sourceSegmentOutputDurationSec
       ? {
@@ -1350,17 +1783,23 @@ export async function writeExportBundle(
     filePath: path.join(projectRoot, "render", "arrows", `${overlay.id}.png`),
   }));
 
+  const filterTimelineInputs = usesFlattenedTimeline ? [] : timelineInputs;
+  const filterBaseLabel = usesFlattenedTimeline ? "[0:v]" : timelinePlan.baseLabel;
+  const filterBaseLines = usesFlattenedTimeline ? [] : timelinePlan.baseLines;
   const audioPlan =
-    includeAudio && timelinePlan.audioLabel
-      ? { label: timelinePlan.audioLabel, lines: timelinePlan.audioLines ?? [] }
+    includeAudio && usesFlattenedTimeline
+      ? { label: "[0:a]", lines: [] }
+      : includeAudio && timelinePlan.audioLabel
+        ? { label: timelinePlan.audioLabel, lines: timelinePlan.audioLines ?? [] }
       : undefined;
 
   const cardsScript = buildFilterScript(
     projectForRender,
     cards,
     speed,
-    timelinePlan.baseLabel,
-    timelinePlan.baseLines,
+    filterBaseLabel,
+    filterBaseLines,
+    filterTimelineInputs.length,
     filterTuning,
     audioPlan
   );
@@ -1368,8 +1807,9 @@ export async function writeExportBundle(
     projectForRender,
     [...cards, ...arrows],
     speed,
-    timelinePlan.baseLabel,
-    timelinePlan.baseLines,
+    filterBaseLabel,
+    filterBaseLines,
+    filterTimelineInputs.length,
     filterTuning,
     audioPlan
   );
@@ -1382,8 +1822,6 @@ export async function writeExportBundle(
   await fs.writeFile(filterCardsPath, cardsScript.script, "utf-8");
   await fs.writeFile(filterCardsArrowsPath, cardsArrowsScript.script, "utf-8");
 
-  const sourcePath = path.join(projectRoot, "media", project.source.filename);
-
   const manifest: ExportManifest = {
     projectId: project.id,
     createdAt: new Date().toISOString(),
@@ -1393,7 +1831,10 @@ export async function writeExportBundle(
     includeAudio,
     includeSlugStart,
     includeSlugEnd,
-    source: sourcePath,
+    source: renderSourcePath,
+    timelineSource: usesFlattenedTimeline ? sourcePath : undefined,
+    timelineAssetInputs: usesFlattenedTimeline ? timelineInputs : undefined,
+    timelineInputs: filterTimelineInputs,
     overlayInputs: cardInputs.map((input) => input.filePath),
     arrowInputs: arrowInputs.map((input) => input.filePath),
     filterCards: path.basename(filterCardsPath),
@@ -1408,6 +1849,10 @@ export async function writeExportBundle(
     outputHeight: renderTuning.outputHeight,
     sourceSegmentOutputFrames: timelinePlan.usesSourceSegments ? timelinePlan.outputFrames : undefined,
     sourceSegmentOutputDurationSec,
+    externalAudioInput: project.audioTrack
+      ? resolveProjectAudioPath(projectRoot, project.audioTrack.assetPath)
+      : undefined,
+    audioTrack: project.audioTrack,
   };
 
   const readme = buildReadme(exportDir, manifest, cardInputs, arrowInputs);
@@ -1442,12 +1887,23 @@ export async function renderFinal(
   const { exportDir, exportId, manifest, outputFrames, projectForRender, renderTuning } =
     await writeExportBundle(project, options);
 
+  if (manifest.timelineSource) {
+    onProgress?.({ stage: "timeline", message: "Rendering flattened source timeline" });
+    await renderFlattenedSourceTimeline(
+      project,
+      exportDir,
+      manifest.source,
+      manifest.includeAudio,
+      onProgress
+    );
+  }
+
   onProgress?.({ stage: "assets", message: "Rendering overlay assets" });
   await renderProjectAssets(projectForRender);
   const preset = EXPORT_PRESETS[manifest.presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
 
   const missingInputs = [];
-  for (const input of [...manifest.overlayInputs, ...manifest.arrowInputs]) {
+  for (const input of [...manifest.timelineInputs, ...manifest.overlayInputs, ...manifest.arrowInputs]) {
     if (!(await fileExists(input))) {
       missingInputs.push(input);
     }
@@ -1466,6 +1922,9 @@ export async function renderFinal(
   const mainOutputPath = path.join(exportDir, mainOutputName);
 
   const args = ["-y", "-i", manifest.source];
+  for (const input of manifest.timelineInputs) {
+    args.push("-i", input);
+  }
   for (const input of manifest.overlayInputs) {
     args.push("-loop", "1", "-i", input);
   }
@@ -1494,6 +1953,9 @@ export async function renderFinal(
 
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
   const finalPath = path.join(exportDir, "final.mp4");
+  let assembledFinalPath = mainOutputPath;
+  let tailSlugStartSec: number | undefined;
+  let assembledDurationSec = durationSec;
 
   if (manifest.includeSlugStart || manifest.includeSlugEnd) {
     const introPath = manifest.includeSlugStart
@@ -1530,7 +1992,12 @@ export async function renderFinal(
       slugTransition.durationFrames > 0 &&
       inputs.length > 1;
     const includeAudio = manifest.includeAudio;
-    const needsInputInfo = includeAudio || useCrossfade;
+    const needsTailSlugStart = Boolean(
+      outroPath &&
+        project.audioTrack?.fadeOut?.enabled &&
+        (project.audioTrack.fadeOut.target ?? "tailSlug") === "tailSlug"
+    );
+    const needsInputInfo = includeAudio || useCrossfade || needsTailSlugStart;
     const inputInfos: Array<{ durationSec: number; hasAudio: boolean }> = [];
     if (needsInputInfo) {
       if (introPath) {
@@ -1592,11 +2059,15 @@ export async function renderFinal(
       let currentAudioDuration = durationsSec[0] ?? 0;
 
       inputs.slice(1).forEach((_, index) => {
+        const nextInputIndex = index + 1;
         const nextLabel = `[v${index + 1}]`;
-        const nextDuration = durationsSec[index + 1] ?? 0;
+        const nextDuration = durationsSec[nextInputIndex] ?? 0;
         const safeDuration = Math.min(transitionSec, currentDuration, nextDuration);
         if (safeDuration > 0) {
           const offset = Math.max(0, currentDuration - safeDuration);
+          if (outroPath && nextInputIndex === inputs.length - 1) {
+            tailSlugStartSec = offset;
+          }
           const outLabel = `[x${index + 1}]`;
           chain.push(
             `${currentLabel}${nextLabel}xfade=transition=fade:duration=${formatNumber(
@@ -1606,6 +2077,9 @@ export async function renderFinal(
           currentDuration = currentDuration + nextDuration - safeDuration;
           currentLabel = outLabel;
         } else {
+          if (outroPath && nextInputIndex === inputs.length - 1) {
+            tailSlugStartSec = currentDuration;
+          }
           const outLabel = `[c${index + 1}]`;
           chain.push(`${currentLabel}${nextLabel}concat=n=2:v=1:a=0${outLabel}`);
           currentDuration += nextDuration;
@@ -1613,11 +2087,11 @@ export async function renderFinal(
         }
 
         if (!includeAudio) return;
-        const nextAudioLabel = `[a${index + 1}]`;
+        const nextAudioLabel = `[a${nextInputIndex}]`;
         const safeAudioDuration = Math.min(
           transitionSec,
           currentAudioDuration,
-          durationsSec[index + 1] ?? 0
+          durationsSec[nextInputIndex] ?? 0
         );
         if (safeAudioDuration > 0) {
           const outAudioLabel = `[ax${index + 1}]`;
@@ -1627,7 +2101,7 @@ export async function renderFinal(
             )}:c1=tri:c2=tri${outAudioLabel}`
           );
           currentAudioDuration =
-            currentAudioDuration + (durationsSec[index + 1] ?? 0) - safeAudioDuration;
+            currentAudioDuration + (durationsSec[nextInputIndex] ?? 0) - safeAudioDuration;
           currentAudioLabel = outAudioLabel;
           return;
         }
@@ -1649,7 +2123,14 @@ export async function renderFinal(
       }
       concatFilter = filterParts.filter((part) => part.trim().length > 0).join(";");
       outputLabel = currentLabel;
+      assembledDurationSec = currentDuration;
     } else {
+      if (durationsSec.length === inputs.length) {
+        assembledDurationSec = durationsSec.reduce((sum, value) => sum + value, 0);
+        if (outroPath) {
+          tailSlugStartSec = durationsSec.slice(0, -1).reduce((sum, value) => sum + value, 0);
+        }
+      }
       const filterParts = [baseFilter, ...audioLines];
       filterParts.push(
         `${inputs.map((_, index) => `[v${index}]`).join("")}concat=n=${inputs.length}:v=1:a=0[v]`
@@ -1682,10 +2163,32 @@ export async function renderFinal(
       finalWithSlug,
     ];
     await runFfmpeg(concatArgs, exportDir, onProgress, undefined, "ffmpeg-concat");
-    await fs.copyFile(finalWithSlug, finalPath);
-  } else {
-    await fs.copyFile(mainOutputPath, finalPath);
+    assembledFinalPath = finalWithSlug;
+    manifest.tailSlugStartSec = tailSlugStartSec;
+    manifest.assembledDurationSec = assembledDurationSec;
   }
+
+  if (project.audioTrack) {
+    const audioResult = await applyExternalAudioTrack(
+      project,
+      exportDir,
+      assembledFinalPath,
+      finalPath,
+      onProgress,
+      { tailSlugStartSec }
+    );
+    manifest.assembledDurationSec = audioResult.durationSec;
+    manifest.externalAudioFadeOutStartSec = audioResult.fadeOut?.startSec;
+    manifest.externalAudioFadeOutEndSec = audioResult.fadeOut?.endSec;
+  } else {
+    await fs.copyFile(assembledFinalPath, finalPath);
+  }
+
+  await fs.writeFile(
+    path.join(exportDir, "manifest.json"),
+    JSON.stringify(manifest, null, 2),
+    "utf-8"
+  );
 
   onProgress?.({ stage: "done", message: "Render complete", percent: 1 });
   return { exportDir, exportId, finalPath, manifest };

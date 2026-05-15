@@ -4,6 +4,7 @@ import { FFPROBE_PATH } from "../config.js";
 
 type FfprobeStream = {
   codec_type?: string;
+  codec_name?: string;
   width?: number;
   height?: number;
   avg_frame_rate?: string;
@@ -107,5 +108,59 @@ export async function probeVideo(filePath: string): Promise<VideoInfo> {
         : undefined,
       channels: audioStream?.channels,
     },
+  };
+}
+
+export type AudioInfo = {
+  durationMs: number;
+  sampleRate?: number;
+  channels?: number;
+  codecName?: string;
+};
+
+export async function probeAudio(filePath: string): Promise<AudioInfo> {
+  const args = [
+    "-v",
+    "error",
+    "-print_format",
+    "json",
+    "-show_streams",
+    "-show_format",
+    filePath,
+  ];
+
+  const stdout = await new Promise<string>((resolve, reject) => {
+    const child = spawn(FFPROBE_PATH, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    let error = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      error += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(error || `ffprobe exited with code ${code}`));
+        return;
+      }
+      resolve(output);
+    });
+  });
+
+  const parsed = JSON.parse(stdout) as FfprobeResult;
+  const audioStream = parsed.streams?.find((stream) => stream.codec_type === "audio");
+  if (!audioStream) {
+    throw new Error("ffprobe did not return an audio stream");
+  }
+
+  return {
+    durationMs:
+      parseDurationMs(parsed.format?.duration) ||
+      parseDurationMs(audioStream.duration),
+    sampleRate: audioStream.sample_rate ? Number(audioStream.sample_rate) : undefined,
+    channels: audioStream.channels,
+    codecName: audioStream.codec_name,
   };
 }

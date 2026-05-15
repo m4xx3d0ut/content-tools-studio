@@ -109,6 +109,24 @@ export const ExportOptionsSchema = z
   })
   .optional();
 
+export const AudioFadeOutSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    target: z.enum(["tailSlug", "end"]).default("tailSlug"),
+    durationSec: z.number().finite().positive().default(2),
+  })
+  .optional();
+
+export const AudioTrackSchema = z.object({
+  assetPath: z.string().min(1),
+  mode: z.enum(["overlay", "replace"]).default("overlay"),
+  startSec: z.number().finite().nonnegative().default(0),
+  source: z.enum(["upload", "url"]).default("upload"),
+  filename: z.string().min(1).optional(),
+  originalUrl: z.string().url().optional(),
+  fadeOut: AudioFadeOutSchema,
+});
+
 const CutSchema = z.object({
   id: z.string().min(1),
   startFrame: z.number().int().nonnegative(),
@@ -117,12 +135,15 @@ const CutSchema = z.object({
 });
 
 export const SourceSegmentSchema = z.object({
+  kind: z.enum(["source", "image"]).default("source"),
   id: z.string().min(1),
   label: z.string().optional(),
   startFrame: z.number().int().nonnegative(),
   endFrameExclusive: z.number().int().positive(),
   playbackRate: z.number().finite().positive(),
   audio: z.enum(["preserve", "mute"]).default("preserve"),
+  assetPath: z.string().min(1).optional(),
+  durationFrames: z.number().int().positive().optional(),
   transition: TransitionSchema,
 });
 
@@ -151,6 +172,7 @@ export const ProjectSchema = z.object({
 
   slug: SlugSchema,
   exportOptions: ExportOptionsSchema,
+  audioTrack: AudioTrackSchema.optional(),
   edits: TimelineEditsSchema,
 
   lastExportPresetId: z.string().optional(),
@@ -160,6 +182,7 @@ export const ProjectSchema = z.object({
 export type Project = z.infer<typeof ProjectSchema>;
 export type Overlay = z.infer<typeof OverlaySchema>;
 export type SourceSegment = z.infer<typeof SourceSegmentSchema>;
+export type AudioTrack = z.infer<typeof AudioTrackSchema>;
 export type VideoInfo = z.infer<typeof VideoSchema>;
 
 export function validateProject(json: unknown): Project {

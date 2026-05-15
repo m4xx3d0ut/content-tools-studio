@@ -279,16 +279,33 @@ function getCompleteExportOptions(project: Project): NonNullable<Project["export
 function normalizeSourceSegment(
   input: {
     id?: string;
+    kind?: SourceSegment["kind"];
     label?: string;
     startFrame: number;
     endFrameExclusive: number;
     playbackRate: number;
     audio?: SourceSegment["audio"];
+    assetPath?: string;
+    durationFrames?: number;
     transition?: { type?: "cut" | "crossfade"; durationFrames?: number };
   },
   totalFrames: number,
   createId: () => string
 ): SourceSegment {
+  if (input.kind === "image") {
+    return SourceSegmentSchema.parse({
+      ...input,
+      id: input.id ?? createId(),
+      kind: "image",
+      startFrame: 0,
+      endFrameExclusive: 1,
+      playbackRate: 1,
+      durationFrames: Math.max(1, Math.floor(input.durationFrames ?? 1)),
+      audio: "mute",
+      transition: normalizeTransition(input.transition),
+    });
+  }
+
   const startFrame = clampNumber(input.startFrame, 0, totalFrames - 1);
   const endFrameExclusive = clampNumber(
     input.endFrameExclusive,
@@ -298,6 +315,7 @@ function normalizeSourceSegment(
   return SourceSegmentSchema.parse({
     ...input,
     id: input.id ?? createId(),
+    kind: "source",
     startFrame,
     endFrameExclusive,
     playbackRate: Math.max(0.01, input.playbackRate),
@@ -571,6 +589,12 @@ export function applyEditorCommands(
         ...next,
         exportOptions: { ...getCompleteExportOptions(next), ...command.options },
       };
+      results.push({ index, type: command.type });
+      return;
+    }
+
+    if (command.type === "setAudioTrack") {
+      next = { ...next, audioTrack: command.audioTrack ?? undefined };
       results.push({ index, type: command.type });
       return;
     }

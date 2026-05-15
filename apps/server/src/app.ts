@@ -99,6 +99,7 @@ export async function buildApp() {
         "setSourceSegmentsFromText",
         "setSlug",
         "setExportOptions",
+        "setAudioTrack",
       ],
       slugLibrary: {
         list: "GET /slugs",

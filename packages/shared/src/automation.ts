@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   ExportOptionsSchema,
+  AudioTrackSchema,
   MotionSchema,
   ProjectSchema,
   RectSchema,
@@ -105,20 +106,26 @@ const RemoveCutCommandSchema = z.object({
 
 const SourceSegmentInputSchema = z.object({
   id: z.string().min(1).optional(),
+  kind: z.enum(["source", "image"]).optional(),
   label: z.string().optional(),
   startFrame: z.number().int().nonnegative(),
   endFrameExclusive: z.number().int().positive(),
   playbackRate: z.number().finite().positive(),
   audio: SourceSegmentAudioSchema.optional(),
+  assetPath: z.string().min(1).optional(),
+  durationFrames: z.number().int().positive().optional(),
   transition: TransitionInputSchema,
 });
 
 const SourceSegmentPatchSchema = z.object({
+  kind: z.enum(["source", "image"]).optional(),
   label: z.string().optional(),
   startFrame: z.number().int().nonnegative().optional(),
   endFrameExclusive: z.number().int().positive().optional(),
   playbackRate: z.number().finite().positive().optional(),
   audio: SourceSegmentAudioSchema.optional(),
+  assetPath: z.string().min(1).optional(),
+  durationFrames: z.number().int().positive().optional(),
   transition: TransitionInputSchema,
 });
 
@@ -165,6 +172,11 @@ const SetExportOptionsCommandSchema = z.object({
   options: ExportOptionsSchema.unwrap().partial(),
 });
 
+const SetAudioTrackCommandSchema = z.object({
+  type: z.literal("setAudioTrack"),
+  audioTrack: AudioTrackSchema.nullable(),
+});
+
 export const EditorCommandSchema = z.discriminatedUnion("type", [
   AddCardCommandSchema,
   AddArrowCommandSchema,
@@ -183,6 +195,7 @@ export const EditorCommandSchema = z.discriminatedUnion("type", [
   SetSourceSegmentsFromTextCommandSchema,
   SetSlugCommandSchema,
   SetExportOptionsCommandSchema,
+  SetAudioTrackCommandSchema,
 ]);
 
 export const CommandBatchRequestSchema = z.object({

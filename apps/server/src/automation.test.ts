@@ -1,7 +1,9 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -37,6 +39,20 @@ const TIMESTAMP_RECIPE = `# timestamps
 6m45s-7m26s (speed up to fit in 10s) = watch replicas come up
 8m25s-10m54s (speed up to fit in 10s) = WorkerBee troubleshoots, rebuilds, redeploys \`frontend\` after scaling \`backend\` up
 11m10s-12m01s (2x speed)= Response for full scale prompt with \`backend\` and \`frontend\` fix, immediately followed by a WorkerBee security check and report output finishing off the video`;
+
+const MIXED_TIMELINE_RECIPE = `# timestamps
+3s = 1-connect.png
+54s-1m0s = codex session /mcp connect
+3s = 2-launch.png
+1m3s-7m54s (10s 2x speed - speed up to fit into 5s - 5s 1x speed) = workerbee up
+3s = 3-observe.png
+7m57s-8m18s (speed up to fit in 5s) = k1s dashboard for project
+8m48s-9m24s (speed up to fit in 5s) = Demo app running in stack
+10m12s-16m45s (5s 1x speed - speed up to fit into 5s - 5s 1x speed) = BE scale, FE fix
+3s = 4-secure-and-deliver.png
+16m48s-17m57s (5s 1x speed - speed up to fit into 5s - 5s 1x speed) = sec test
+18m45s-21m0s (5s 1x speed - speed up to fit into 5s - 5s 1x speed) = write k1s manifests to repo
+3s = 5-fin.png`;
 
 function multipartPayload(
   name: string,
@@ -124,11 +140,17 @@ test("OpenAPI document exposes automation and streaming contracts", async (t) =>
   assert.ok(document.components.schemas.EditorCommand);
   assert.ok(document.components.schemas.SourceSegment);
   assert.ok(document.components.schemas.ProjectBundleImport);
+  assert.ok(document.components.schemas.AudioAssetImport);
+  assert.ok(document.components.schemas.AudioAssetFromUrl);
+  assert.ok(document.components.schemas.AudioAssetResponse);
   assert.ok(document.components.schemas.SlugAsset);
   assert.ok(document.components.schemas.SlugListResponse);
   assert.ok(document.paths["/projects/{id}/commands"]);
   assert.ok(document.paths["/projects/import-bundle"]);
   assert.ok(document.paths["/projects/{id}/bundle"]);
+  assert.ok(document.paths["/projects/{id}/timeline-assets"]);
+  assert.ok(document.paths["/projects/{id}/audio-assets"]);
+  assert.ok(document.paths["/projects/{id}/audio-assets/from-url"]);
   assert.ok(document.paths["/slugs"]);
   assert.ok(document.paths["/slugs/{id}/media"]);
   assert.equal(
@@ -147,6 +169,16 @@ test("OpenAPI document exposes automation and streaming contracts", async (t) =>
   assert.ok(
     document.paths["/projects/{id}/bundle"].get.responses["200"].content["application/zip"]
   );
+  assert.ok(
+    document.paths["/projects/{id}/audio-assets"].post.responses["200"].content[
+      "application/json"
+    ]
+  );
+  assert.ok(
+    document.paths["/projects/{id}/audio-assets/from-url"].post.responses["200"].content[
+      "application/json"
+    ]
+  );
   assert.ok(document.paths["/slugs"].get.responses["200"].content["application/json"]);
   assert.ok(document.paths["/slugs"].post.responses["201"].content["application/json"]);
   assert.ok(document.paths["/slugs/{id}/media"].get.responses["200"].content["video/mp4"]);
@@ -154,6 +186,126 @@ test("OpenAPI document exposes automation and streaming contracts", async (t) =>
   const templatesResponse = await app.inject({ method: "GET", url: "/templates" });
   assert.equal(templatesResponse.statusCode, 200);
   assert.equal(templatesResponse.json().templates[0].id, "card-lower-third-left");
+});
+
+test("command endpoint sets and clears external audio tracks", async (t) => {
+  const app = await createTestApp();
+  t.after(async () => app.close());
+
+  const createdResponse = await app.inject({
+    method: "POST",
+    url: "/projects",
+    payload: {
+      name: "Audio Command Test",
+      video: { durationMs: 60000, audio: { hasAudio: false } },
+    },
+  });
+  assert.equal(createdResponse.statusCode, 201);
+  const created = createdResponse.json();
+
+  const setResponse = await app.inject({
+    method: "POST",
+    url: `/projects/${created.id}/commands`,
+    payload: {
+      baseRevision: created.revision,
+      commands: [
+        {
+          type: "setAudioTrack",
+          audioTrack: {
+            assetPath: "media/audio/bumblebee.oga",
+            mode: "replace",
+            startSec: 3,
+            source: "url",
+            filename: "bumblebee.oga",
+            originalUrl:
+              "https://commons.wikimedia.org/wiki/File:Rimsky-Korsakov_-_flight_of_the_bumblebee.oga",
+            fadeOut: {
+              enabled: true,
+              target: "tailSlug",
+              durationSec: 2,
+            },
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(setResponse.statusCode, 200);
+  const setResult = setResponse.json();
+  assert.equal(setResult.project.audioTrack.mode, "replace");
+  assert.equal(setResult.project.audioTrack.startSec, 3);
+  assert.equal(setResult.project.audioTrack.assetPath, "media/audio/bumblebee.oga");
+  assert.equal(setResult.project.audioTrack.fadeOut.enabled, true);
+  assert.equal(setResult.project.audioTrack.fadeOut.target, "tailSlug");
+
+  const clearResponse = await app.inject({
+    method: "POST",
+    url: `/projects/${created.id}/commands`,
+    payload: {
+      baseRevision: setResult.project.revision,
+      commands: [{ type: "setAudioTrack", audioTrack: null }],
+    },
+  });
+  assert.equal(clearResponse.statusCode, 200);
+  assert.equal(clearResponse.json().project.audioTrack, undefined);
+});
+
+test("timestamp shorthand supports PNG stills and three-part speed directives", async (t) => {
+  const app = await createTestApp();
+  t.after(async () => app.close());
+
+  const createdResponse = await app.inject({
+    method: "POST",
+    url: "/projects",
+    payload: {
+      name: "Mixed Timeline Test",
+      video: {
+        width: 1920,
+        height: 1080,
+        fpsNum: 60,
+        fpsDen: 1,
+        durationMs: 1330067,
+        audio: { hasAudio: true, sampleRate: 48000, channels: 2 },
+      },
+    },
+  });
+  assert.equal(createdResponse.statusCode, 201);
+  const created = createdResponse.json();
+
+  const previewResponse = await app.inject({
+    method: "POST",
+    url: `/projects/${created.id}/timeline/parse`,
+    payload: {
+      text: MIXED_TIMELINE_RECIPE,
+      defaultAudio: "preserve",
+      fastAudio: "mute",
+    },
+  });
+  assert.equal(previewResponse.statusCode, 200);
+  const preview = previewResponse.json();
+  assert.deepEqual(preview.warnings, []);
+  assert.equal(preview.segments.length, 20);
+  assert.equal(preview.outputFrames, 5460);
+  assert.equal(preview.outputDurationSeconds, 91);
+
+  assert.equal(preview.segments[0].kind, "image");
+  assert.equal(preview.segments[0].assetPath, "media/stills/1-connect.png");
+  assert.equal(preview.segments[0].durationFrames, 180);
+  assert.equal(preview.segments[0].audio, "mute");
+  assert.equal(preview.segments[1].audio, "preserve");
+  assert.equal(preview.segments[3].playbackRate, 2);
+  assert.equal(preview.segments[3].audio, "mute");
+  assert.equal(preview.segments[4].playbackRate, 79.2);
+  assert.equal(preview.segments[4].audio, "mute");
+  assert.equal(preview.segments[5].playbackRate, 1);
+  assert.equal(preview.segments[5].audio, "preserve");
+  assert.equal(preview.segments[7].playbackRate, 4.2);
+  assert.equal(preview.segments[8].playbackRate, 7.2);
+  assert.equal(preview.segments[9].playbackRate, 1);
+  assert.equal(preview.segments[10].playbackRate, 76.6);
+  assert.equal(preview.segments[11].playbackRate, 1);
+  assert.equal(preview.segments[13].playbackRate, 1);
+  assert.equal(preview.segments[14].playbackRate, 11.8);
+  assert.equal(preview.segments[17].playbackRate, 25);
 });
 
 test("timestamp shorthand creates variable-speed source segments", async (t) => {
@@ -253,9 +405,10 @@ test("timestamp shorthand creates variable-speed source segments", async (t) => 
     path.join(exportResult.exportDir, exportResult.manifest.filterCards),
     "utf-8"
   );
-  assert.match(filter, /trim=start_frame=1050:end_frame=9000,setpts=\(PTS-STARTPTS\)\/53/);
-  assert.match(filter, /atempo=2/);
-  assert.match(filter, /concat=n=2:v=1:a=0,setpts=PTS-STARTPTS/);
+  assert.equal(exportResult.manifest.timelineInputs.length, 0);
+  assert.match(exportResult.manifest.source, /timeline_source\.mp4$/);
+  assert.match(exportResult.manifest.timelineSource, /media\/source\.mp4$/);
+  assert.match(filter, /\[0:v\]setpts=PTS-STARTPTS,trim=duration=93/);
   assert.equal(exportResult.manifest.sourceSegmentOutputFrames, 2790);
   assert.equal(exportResult.manifest.sourceSegmentOutputDurationSec, 93);
 });
@@ -404,6 +557,218 @@ test("slug library upload, delete conflicts, and bundle restore", async (t) => {
   assert.equal(restoredSlug.usageCount, 1);
 });
 
+test("external audio URL import can replace final render audio", async (t) => {
+  const { FFMPEG_PATH, FFPROBE_PATH } = await import("./config.js");
+  try {
+    await execFile(FFMPEG_PATH, ["-version"]);
+    await execFile(FFPROBE_PATH, ["-version"]);
+  } catch {
+    t.skip("ffmpeg/ffprobe unavailable");
+    return;
+  }
+
+  const app = await createTestApp();
+  t.after(async () => app.close());
+
+  const createdResponse = await app.inject({
+    method: "POST",
+    url: "/projects",
+    payload: {
+      name: "External Audio Render Test",
+      video: {
+        width: 160,
+        height: 90,
+        fpsNum: 30,
+        fpsDen: 1,
+        durationMs: 2000,
+        audio: { hasAudio: false },
+      },
+    },
+  });
+  assert.equal(createdResponse.statusCode, 201);
+  const created = createdResponse.json();
+
+  const mediaDir = path.join(workspaceRoot, created.id, "media");
+  await mkdir(mediaDir, { recursive: true });
+  const sourcePath = path.join(mediaDir, "source.mp4");
+  await execFile(FFMPEG_PATH, [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "testsrc2=size=160x90:rate=30:duration=2",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "28",
+    "-pix_fmt",
+    "yuv420p",
+    sourcePath,
+  ]);
+  const slugPath = path.join(mediaDir, "slug.mp4");
+  await execFile(FFMPEG_PATH, [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "color=c=0x111111:size=160x90:rate=30:duration=1",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "28",
+    "-pix_fmt",
+    "yuv420p",
+    slugPath,
+  ]);
+
+  const tonePath = path.join(workspaceRoot, "tone.wav");
+  await execFile(FFMPEG_PATH, [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "sine=frequency=660:sample_rate=48000:duration=5",
+    "-c:a",
+    "pcm_s16le",
+    tonePath,
+  ]);
+  const toneBuffer = await readFile(tonePath);
+  const server = createServer((_request, response) => {
+    response.writeHead(200, {
+      "content-type": "audio/wav",
+      "content-disposition": "attachment; filename=\"tone.wav\"",
+      "content-length": toneBuffer.length,
+    });
+    response.end(toneBuffer);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.close();
+  });
+  const address = server.address() as AddressInfo;
+
+  const audioImportResponse = await app.inject({
+    method: "POST",
+    url: `/projects/${created.id}/audio-assets/from-url`,
+    payload: { url: `http://127.0.0.1:${address.port}/tone.wav` },
+  });
+  assert.equal(audioImportResponse.statusCode, 200);
+  const audioAsset = audioImportResponse.json();
+  assert.equal(audioAsset.source, "url");
+  assert.equal(audioAsset.filename, "tone.wav");
+  assert.equal(audioAsset.audio.sampleRate, 48000);
+
+  const commandResponse = await app.inject({
+    method: "POST",
+    url: `/projects/${created.id}/commands`,
+    payload: {
+      baseRevision: created.revision,
+      commands: [
+        {
+          type: "setSlug",
+          slug: {
+            introPath: "media/slug.mp4",
+            outroPath: "media/slug.mp4",
+            fps: 30,
+            transition: { type: "cut", durationFrames: 0 },
+          },
+        },
+        {
+          type: "setAudioTrack",
+          audioTrack: {
+            assetPath: audioAsset.path,
+            mode: "replace",
+            startSec: 0.25,
+            source: "url",
+            filename: audioAsset.filename,
+            originalUrl: audioAsset.originalUrl,
+            fadeOut: {
+              enabled: true,
+              target: "tailSlug",
+              durationSec: 0.5,
+            },
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(commandResponse.statusCode, 200);
+  const projectWithAudio = commandResponse.json().project;
+  assert.equal(projectWithAudio.audioTrack.mode, "replace");
+  assert.equal(projectWithAudio.audioTrack.fadeOut.durationSec, 0.5);
+
+  const bundleResponse = await app.inject({
+    method: "GET",
+    url: `/projects/${created.id}/bundle?mode=project-media`,
+  });
+  assert.equal(bundleResponse.statusCode, 200);
+  const { unzipSync } = await import("fflate");
+  const projectMediaBundle = unzipSync(new Uint8Array(bundleResponse.rawPayload));
+  assert.ok(projectMediaBundle["media/audio/tone.wav"]);
+
+  const { renderFinal } = await import("./services/exporter.js");
+  const renderResult = await renderFinal(projectWithAudio, {
+    includeAudio: false,
+    includeSlugStart: true,
+    includeSlugEnd: true,
+    presetId: "roughPreview",
+  });
+  assert.equal(renderResult.manifest.audioTrack?.mode, "replace");
+  assert.equal(renderResult.manifest.tailSlugStartSec, 3);
+  assert.equal(renderResult.manifest.externalAudioFadeOutStartSec, 2.5);
+  assert.equal(renderResult.manifest.externalAudioFadeOutEndSec, 3);
+
+  const { stdout } = await execFile(FFPROBE_PATH, [
+    "-v",
+    "error",
+    "-select_streams",
+    "a:0",
+    "-show_entries",
+    "stream=sample_rate,channels,duration",
+    "-of",
+    "json",
+    renderResult.finalPath,
+  ]);
+  const stream = JSON.parse(stdout).streams[0] as {
+    sample_rate?: string;
+    channels?: number;
+    duration?: string;
+  };
+  assert.equal(stream.sample_rate, "48000");
+  assert.equal(stream.channels, 2);
+  const duration = Number(stream.duration);
+  assert.ok(duration >= 3.9 && duration <= 4.1, `audio duration was ${duration}`);
+
+  const volumeProbe = await execFile(FFMPEG_PATH, [
+    "-hide_banner",
+    "-nostats",
+    "-i",
+    renderResult.finalPath,
+    "-vn",
+    "-af",
+    "atrim=start=3.1:end=3.8,volumedetect",
+    "-f",
+    "null",
+    "-",
+  ]);
+  const meanVolume = volumeProbe.stderr.match(/mean_volume:\s*(-?\d+(?:\.\d+)?) dB/);
+  assert.ok(meanVolume, volumeProbe.stderr);
+  assert.ok(Number(meanVolume[1]) < -50, `tail mean volume was ${meanVolume[1]} dB`);
+});
+
 test("source segment render duration matches computed output frames", async (t) => {
   const { FFMPEG_PATH, FFPROBE_PATH } = await import("./config.js");
   try {
@@ -467,6 +832,22 @@ test("source segment render duration matches computed output frames", async (t) 
     "aac",
     sourcePath,
   ]);
+  const stillDir = path.join(mediaDir, "stills");
+  await mkdir(stillDir, { recursive: true });
+  const stillPath = path.join(stillDir, "still.png");
+  await execFile(FFMPEG_PATH, [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "color=c=0x224466:size=160x90:rate=30",
+    "-frames:v",
+    "1",
+    stillPath,
+  ]);
 
   const commandResponse = await app.inject({
     method: "POST",
@@ -479,13 +860,26 @@ test("source segment render duration matches computed output frames", async (t) 
           segments: [
             {
               id: "seg-1",
+              kind: "source",
               startFrame: 0,
               endFrameExclusive: 60,
               playbackRate: 2,
               audio: "preserve",
             },
             {
+              id: "still-1",
+              kind: "image",
+              label: "Still",
+              startFrame: 0,
+              endFrameExclusive: 1,
+              playbackRate: 1,
+              assetPath: "media/stills/still.png",
+              durationFrames: 30,
+              audio: "mute",
+            },
+            {
               id: "seg-2",
+              kind: "source",
               startFrame: 60,
               endFrameExclusive: 90,
               playbackRate: 1,
@@ -493,6 +887,7 @@ test("source segment render duration matches computed output frames", async (t) 
             },
             {
               id: "seg-3",
+              kind: "source",
               startFrame: 90,
               endFrameExclusive: 150,
               playbackRate: 4,
@@ -506,13 +901,24 @@ test("source segment render duration matches computed output frames", async (t) 
   assert.equal(commandResponse.statusCode, 200);
   const updatedProject = commandResponse.json().project;
 
+  const projectMediaBundleResponse = await app.inject({
+    method: "GET",
+    url: `/projects/${created.id}/bundle?mode=project-media`,
+  });
+  assert.equal(projectMediaBundleResponse.statusCode, 200);
+  const { unzipSync } = await import("fflate");
+  const projectMediaBundle = unzipSync(new Uint8Array(projectMediaBundleResponse.rawPayload));
+  assert.ok(projectMediaBundle["media/stills/still.png"]);
+
   const { renderFinal } = await import("./services/exporter.js");
   const renderResult = await renderFinal(updatedProject, {
     includeAudio: true,
     presetId: "roughPreview",
   });
-  assert.equal(renderResult.manifest.sourceSegmentOutputFrames, 75);
-  assert.equal(renderResult.manifest.sourceSegmentOutputDurationSec, 2.5);
+  assert.equal(renderResult.manifest.timelineInputs.length, 0);
+  assert.equal(renderResult.manifest.timelineAssetInputs?.length, 1);
+  assert.equal(renderResult.manifest.sourceSegmentOutputFrames, 105);
+  assert.equal(renderResult.manifest.sourceSegmentOutputDurationSec, 3.5);
 
   const { stdout } = await execFile(FFPROBE_PATH, [
     "-v",
@@ -529,8 +935,8 @@ test("source segment render duration matches computed output frames", async (t) 
   const stream = JSON.parse(stdout).streams[0] as { nb_read_frames?: string; duration?: string };
   const duration = Number(stream.duration);
   const frames = Number(stream.nb_read_frames);
-  assert.ok(duration >= 2.4 && duration <= 2.65, `duration was ${duration}`);
-  assert.ok(frames >= 72 && frames <= 78, `frame count was ${frames}`);
+  assert.ok(duration >= 3.4 && duration <= 3.65, `duration was ${duration}`);
+  assert.ok(frames >= 102 && frames <= 108, `frame count was ${frames}`);
 
   const slugSource = path.join(workspaceRoot, "duration-slug.mp4");
   await execFile(FFMPEG_PATH, [
@@ -605,6 +1011,6 @@ test("source segment render duration matches computed output frames", async (t) 
   };
   const slugDuration = Number(slugStream.duration);
   const slugFrames = Number(slugStream.nb_read_frames);
-  assert.ok(slugDuration >= 3.4 && slugDuration <= 3.65, `slug duration was ${slugDuration}`);
-  assert.ok(slugFrames >= 102 && slugFrames <= 108, `slug frame count was ${slugFrames}`);
+  assert.ok(slugDuration >= 4.4 && slugDuration <= 4.65, `slug duration was ${slugDuration}`);
+  assert.ok(slugFrames >= 132 && slugFrames <= 138, `slug frame count was ${slugFrames}`);
 });
