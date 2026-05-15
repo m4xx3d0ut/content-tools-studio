@@ -11,6 +11,8 @@ import { getTemplateById } from "./templates.js";
 
 type RenderMode = "final" | "rough";
 
+const STATIC_OVERLAY_INPUT_FPS = "1";
+
 type ExportRequest = {
   presetId?: string;
   includeAudio?: boolean;
@@ -1405,10 +1407,10 @@ function buildReadme(
     (input) => `  -i ${relPath(exportDir, input)} \\\\`
   );
   const overlayLines = cardInputs.map(
-    (input) => `  -loop 1 -i ${relPath(exportDir, input.filePath)} \\\\`
+    (input) => `  -loop 1 -framerate ${STATIC_OVERLAY_INPUT_FPS} -i ${relPath(exportDir, input.filePath)} \\\\`
   );
   const arrowLines = arrowInputs.map(
-    (input) => `  -loop 1 -i ${relPath(exportDir, input.filePath)} \\\\`
+    (input) => `  -loop 1 -framerate ${STATIC_OVERLAY_INPUT_FPS} -i ${relPath(exportDir, input.filePath)} \\\\`
   );
 
   const inputVideo = relPath(exportDir, manifest.source);
@@ -1926,10 +1928,10 @@ export async function renderFinal(
     args.push("-i", input);
   }
   for (const input of manifest.overlayInputs) {
-    args.push("-loop", "1", "-i", input);
+    args.push("-loop", "1", "-framerate", STATIC_OVERLAY_INPUT_FPS, "-i", input);
   }
   for (const input of manifest.arrowInputs) {
-    args.push("-loop", "1", "-i", input);
+    args.push("-loop", "1", "-framerate", STATIC_OVERLAY_INPUT_FPS, "-i", input);
   }
   args.push(
     "-filter_complex_script",
@@ -1971,10 +1973,7 @@ export async function renderFinal(
       throw new Error("Slug outro path is required for includeSlugEnd");
     }
 
-    const slugFps =
-      renderTuning.outputFps ??
-      project.slug?.fps ??
-      project.video.fpsNum / project.video.fpsDen;
+    const slugFps = renderTuning.outputFps ?? fps;
     const targetWidth = projectForRender.video.width;
     const targetHeight = projectForRender.video.height;
     const inputs: string[] = [];
