@@ -11,4 +11,6 @@ export const SERVER_PORT = Number(process.env.PORT || 3033);
 
 export const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 5 * 1024 * 1024 * 1024);
 
-export const REPO_ROOT = path.resolve(process.cwd(), "../..");
+export const REPO_ROOT = process.env.REPO_ROOT
+  ? path.resolve(process.env.REPO_ROOT)
+  : path.resolve(process.cwd(), "../..");

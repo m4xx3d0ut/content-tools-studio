@@ -23,6 +23,7 @@ ENV NODE_ENV=production \
   HOST=127.0.0.1 \
   PORT=3033 \
   WORKSPACE_ROOT=/data/workspace \
+  REPO_ROOT=/app \
   FFMPEG_PATH=/usr/bin/ffmpeg \
   FFPROBE_PATH=/usr/bin/ffprobe
 
