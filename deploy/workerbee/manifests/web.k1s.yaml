@@ -13,7 +13,7 @@ spec:
   replicas: 1
   env:
     - name: WORKERBEE_DEPLOY_REV
-      value: source-segments-collapsed-v1
+      value: external-audio-fade-v1
   ports:
     - name: http
       containerPort: 8080
