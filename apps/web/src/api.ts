@@ -90,12 +90,15 @@ export type Overlay = {
 };
 
 export type SourceSegment = {
+  kind: "source" | "image";
   id: string;
   label?: string;
   startFrame: number;
   endFrameExclusive: number;
   playbackRate: number;
   audio: "preserve" | "mute";
+  assetPath?: string;
+  durationFrames?: number;
   transition?: { type: "cut" | "crossfade"; durationFrames: number };
 };
 
@@ -147,6 +150,36 @@ export type SlugAsset = {
   usageCount?: number;
 };
 
+export type AudioTrack = {
+  assetPath: string;
+  mode: "overlay" | "replace";
+  startSec: number;
+  source: "upload" | "url";
+  filename?: string;
+  originalUrl?: string;
+  fadeOut?: {
+    enabled: boolean;
+    target: "tailSlug" | "end";
+    durationSec: number;
+  };
+};
+
+export type AudioAsset = {
+  ok: boolean;
+  path: string;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+  source: "upload" | "url";
+  originalUrl?: string;
+  audio: {
+    durationMs: number;
+    sampleRate?: number;
+    channels?: number;
+    codecName?: string;
+  };
+};
+
 export type Project = ProjectSummary & {
   schemaVersion: 1;
   revision: number;
@@ -192,6 +225,7 @@ export type Project = ProjectSummary & {
     fps?: number;
     transition?: { type: "cut" | "crossfade"; durationFrames: number };
   };
+  audioTrack?: AudioTrack;
   renderCache: {
     overlayAssetHash: Record<string, string>;
     templatesVersion?: string;
@@ -246,6 +280,38 @@ export async function importVideo(projectId: string, file: File): Promise<Projec
   return request<ProjectSummary>(`/projects/${projectId}/import`, {
     method: "POST",
     body: form,
+  });
+}
+
+export async function uploadTimelineAsset(projectId: string, file: File): Promise<{
+  ok: boolean;
+  path: string;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+}> {
+  const form = new FormData();
+  form.append("file", file);
+  return request(`/projects/${projectId}/timeline-assets`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+export async function uploadAudioAsset(projectId: string, file: File): Promise<AudioAsset> {
+  const form = new FormData();
+  form.append("file", file);
+  return request<AudioAsset>(`/projects/${projectId}/audio-assets`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+export async function importAudioAssetFromUrl(projectId: string, url: string): Promise<AudioAsset> {
+  return request<AudioAsset>(`/projects/${projectId}/audio-assets/from-url`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
   });
 }
 

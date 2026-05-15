@@ -18,6 +18,7 @@ import {
   deleteSlug,
   exportLatestUrl,
   getProject,
+  importAudioAssetFromUrl,
   importProjectBundle,
   importSlugVideo,
   importVideo,
@@ -32,7 +33,10 @@ import {
   slugMediaUrl,
   thumbnailUrl,
   updateProject,
+  uploadAudioAsset,
   type ArrowInfo,
+  type AudioAsset,
+  type AudioTrack,
   type Overlay,
   type Project,
   type ProjectBundleMode,
@@ -122,6 +126,10 @@ function formatTimecode(frames: number, fps: number) {
 function formatSeconds(seconds: number) {
   if (!Number.isFinite(seconds)) return "0.000s";
   return `${Math.max(0, seconds).toFixed(3)}s`;
+}
+
+function pathBasename(inputPath: string) {
+  return inputPath.split("/").filter(Boolean).at(-1) ?? inputPath;
 }
 
 function parseTimecode(value: string): number | null {
@@ -304,6 +312,7 @@ export default function App() {
   const [templateLibrary, setTemplateLibrary] = useState<TemplateInfo[]>([]);
   const [arrowLibrary, setArrowLibrary] = useState<ArrowInfo[]>([]);
   const [slugLibrary, setSlugLibrary] = useState<SlugAsset[]>([]);
+  const [audioUrlInput, setAudioUrlInput] = useState("");
   const [templateImages, setTemplateImages] = useState<Record<string, HTMLImageElement>>({});
   const [arrowImage, setArrowImage] = useState<HTMLImageElement | null>(null);
   const [showHotkeys, setShowHotkeys] = useState(false);
@@ -379,6 +388,9 @@ export default function App() {
   const hasSourceSegments = sourceSegments.length > 0;
   const sourceSegmentsOutput = useMemo(() => {
     const outputFrames = sourceSegments.reduce((sum, segment) => {
+      if (segment.kind === "image") {
+        return sum + Math.max(1, segment.durationFrames ?? 1);
+      }
       const sourceFrames = Math.max(1, segment.endFrameExclusive - segment.startFrame);
       return sum + Math.max(1, Math.round(sourceFrames / Math.max(0.01, segment.playbackRate)));
     }, 0);
@@ -847,6 +859,89 @@ export default function App() {
     });
   }
 
+  function updateExternalAudioTrack(patch: Partial<AudioTrack> | null) {
+    if (!project) return;
+    if (!patch) {
+      updateProjectState({ ...project, audioTrack: undefined }, undefined, {
+        pushHistory: false,
+      });
+      return;
+    }
+    const current = project.audioTrack;
+    if (!current?.assetPath && !patch.assetPath) return;
+    const hasFadeOutPatch = Object.prototype.hasOwnProperty.call(patch, "fadeOut");
+    const rawFadeOut = hasFadeOutPatch ? patch.fadeOut : current?.fadeOut;
+    const fadeOut = rawFadeOut?.enabled
+      ? {
+          enabled: true,
+          target: rawFadeOut.target ?? "tailSlug",
+          durationSec: Math.max(0.1, Number(rawFadeOut.durationSec) || 2),
+        }
+      : undefined;
+    const nextTrack: AudioTrack = {
+      assetPath: patch.assetPath ?? current?.assetPath ?? "",
+      mode: patch.mode ?? current?.mode ?? "overlay",
+      startSec: Math.max(0, Number(patch.startSec ?? current?.startSec ?? 0) || 0),
+      source: patch.source ?? current?.source ?? "upload",
+      filename: patch.filename ?? current?.filename,
+      originalUrl: patch.originalUrl ?? current?.originalUrl,
+      fadeOut,
+    };
+    updateProjectState({ ...project, audioTrack: nextTrack }, undefined, {
+      pushHistory: false,
+    });
+  }
+
+  function audioTrackFromAsset(asset: AudioAsset, mode: AudioTrack["mode"]): AudioTrack {
+    return {
+      assetPath: asset.path,
+      mode,
+      startSec: project?.audioTrack?.startSec ?? 0,
+      source: asset.source,
+      filename: asset.filename,
+      originalUrl: asset.originalUrl,
+      fadeOut: project?.audioTrack?.fadeOut,
+    };
+  }
+
+  async function handleImportAudioFile(file: File) {
+    if (!selectedId) {
+      setStatus("Select a project first.");
+      return;
+    }
+    setStatus("Importing audio...");
+    try {
+      const asset = await uploadAudioAsset(selectedId, file);
+      updateExternalAudioTrack(audioTrackFromAsset(asset, project?.audioTrack?.mode ?? "overlay"));
+      setStatus(`Imported audio ${asset.filename}.`);
+      showToast(`Imported audio ${asset.filename}.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    }
+  }
+
+  async function handleImportAudioUrl() {
+    if (!selectedId) {
+      setStatus("Select a project first.");
+      return;
+    }
+    const url = audioUrlInput.trim();
+    if (!url) {
+      setStatus("Enter an audio URL.");
+      return;
+    }
+    setStatus("Importing audio URL...");
+    try {
+      const asset = await importAudioAssetFromUrl(selectedId, url);
+      updateExternalAudioTrack(audioTrackFromAsset(asset, project?.audioTrack?.mode ?? "overlay"));
+      setAudioUrlInput("");
+      setStatus(`Imported audio ${asset.filename}.`);
+      showToast(`Imported audio ${asset.filename}.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    }
+  }
+
   function updateEdits(patch: Partial<NonNullable<Project["edits"]>>) {
     if (!project) return;
     const nextEdits = {
@@ -940,6 +1035,17 @@ export default function App() {
     const nextSegments = sourceSegments.map((segment) => {
       if (segment.id !== id) return segment;
       const next = { ...segment, ...patch };
+      if (next.kind === "image") {
+        return {
+          ...next,
+          kind: "image" as const,
+          startFrame: 0,
+          endFrameExclusive: 1,
+          playbackRate: 1,
+          durationFrames: Math.max(1, Number(next.durationFrames) || 1),
+          audio: "mute" as const,
+        };
+      }
       const startFrame = Math.max(0, Math.min(formatFrame(next.startFrame), totalFrames - 1));
       const endFrameExclusive = Math.max(
         startFrame + 1,
@@ -947,6 +1053,7 @@ export default function App() {
       );
       return {
         ...next,
+        kind: "source" as const,
         startFrame,
         endFrameExclusive,
         playbackRate: Math.max(0.01, Number(next.playbackRate) || 1),
@@ -979,6 +1086,7 @@ export default function App() {
       ...sourceSegments,
       {
         id: crypto.randomUUID(),
+        kind: "source",
         label: "Manual segment",
         startFrame,
         endFrameExclusive,
@@ -2671,6 +2779,114 @@ export default function App() {
               <div className="details">No audio track detected in source.</div>
             )}
           </div>
+          <div className="render-setting audio-track-setting">
+            <label>External audio</label>
+            <input
+              type="file"
+              accept=".mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,audio/*"
+              disabled={!project}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (file) void handleImportAudioFile(file);
+              }}
+            />
+            <div className="audio-url-row">
+              <input
+                type="url"
+                value={audioUrlInput}
+                placeholder="https://..."
+                disabled={!project}
+                onChange={(event) => setAudioUrlInput(event.target.value)}
+              />
+              <button
+                className="secondary"
+                type="button"
+                disabled={!project || !audioUrlInput.trim()}
+                onClick={() => void handleImportAudioUrl()}
+              >
+                Import
+              </button>
+            </div>
+            <div className="audio-track-controls">
+              <select
+                value={project?.audioTrack?.mode ?? "overlay"}
+                disabled={!project?.audioTrack}
+                onChange={(event) =>
+                  updateExternalAudioTrack({ mode: event.target.value as AudioTrack["mode"] })
+                }
+              >
+                <option value="overlay">Overlay</option>
+                <option value="replace">Replace</option>
+              </select>
+              <input
+                type="number"
+                min={0}
+                step={0.1}
+                value={project?.audioTrack?.startSec ?? 0}
+                disabled={!project?.audioTrack}
+                onChange={(event) =>
+                  updateExternalAudioTrack({ startSec: Number(event.target.value) })
+                }
+              />
+              <button
+                className="secondary"
+                type="button"
+                disabled={!project?.audioTrack}
+                onClick={() => updateExternalAudioTrack(null)}
+              >
+                Clear
+              </button>
+            </div>
+            <div className="audio-fade-controls">
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={Boolean(project?.audioTrack?.fadeOut?.enabled)}
+                  disabled={!project?.audioTrack}
+                  onChange={(event) =>
+                    updateExternalAudioTrack({
+                      fadeOut: event.target.checked
+                        ? {
+                            enabled: true,
+                            target: "tailSlug",
+                            durationSec: project?.audioTrack?.fadeOut?.durationSec ?? 2,
+                          }
+                        : undefined,
+                    })
+                  }
+                />
+                Fade at outro
+              </label>
+              <input
+                type="number"
+                min={0.1}
+                step={0.1}
+                value={project?.audioTrack?.fadeOut?.durationSec ?? 2}
+                disabled={!project?.audioTrack?.fadeOut?.enabled}
+                onChange={(event) =>
+                  updateExternalAudioTrack({
+                    fadeOut: {
+                      enabled: true,
+                      target: project?.audioTrack?.fadeOut?.target ?? "tailSlug",
+                      durationSec: Number(event.target.value),
+                    },
+                  })
+                }
+              />
+            </div>
+            {project?.audioTrack && (
+              <div className="details">
+                {project.audioTrack.filename ?? pathBasename(project.audioTrack.assetPath)} ·{" "}
+                starts at {formatSeconds(project.audioTrack.startSec)}
+                {project.audioTrack.fadeOut?.enabled
+                  ? ` · fades at outro over ${formatSeconds(
+                      project.audioTrack.fadeOut.durationSec
+                    )}`
+                  : ""}
+              </div>
+            )}
+          </div>
           <div className="render-setting">
             <label htmlFor="slug-select">Slug video</label>
             <select
@@ -2814,8 +3030,12 @@ export default function App() {
               ))}
               <div className="segment-list">
             {sourceSegments.map((segment, index) => {
+              const isImageSegment = segment.kind === "image";
               const sourceFrames = Math.max(1, segment.endFrameExclusive - segment.startFrame);
-              const outputSeconds = sourceFrames / Math.max(0.01, segment.playbackRate) / fps;
+              const outputFrames = isImageSegment
+                ? Math.max(1, segment.durationFrames ?? 1)
+                : Math.max(1, Math.round(sourceFrames / Math.max(0.01, segment.playbackRate)));
+              const outputSeconds = outputFrames / fps;
               return (
                 <div key={segment.id} className="segment-card">
                   <div className="segment-card-header">
@@ -2852,7 +3072,7 @@ export default function App() {
                         min={0}
                         max={Math.max(0, totalFrames - 1)}
                         value={segment.startFrame}
-                        disabled={!hasMedia}
+                        disabled={!hasMedia || isImageSegment}
                         onChange={(event) =>
                           updateSourceSegment(segment.id, {
                             startFrame: Number(event.target.value),
@@ -2867,7 +3087,7 @@ export default function App() {
                         min={1}
                         max={totalFrames}
                         value={segment.endFrameExclusive}
-                        disabled={!hasMedia}
+                        disabled={!hasMedia || isImageSegment}
                         onChange={(event) =>
                           updateSourceSegment(segment.id, {
                             endFrameExclusive: Number(event.target.value),
@@ -2882,7 +3102,7 @@ export default function App() {
                         min={0.01}
                         step={0.01}
                         value={Number(segment.playbackRate.toFixed(3))}
-                        disabled={!hasMedia}
+                        disabled={!hasMedia || isImageSegment}
                         onChange={(event) =>
                           updateSourceSegment(segment.id, {
                             playbackRate: Number(event.target.value),
@@ -2894,7 +3114,7 @@ export default function App() {
                       Audio
                       <select
                         value={segment.audio ?? "preserve"}
-                        disabled={!hasMedia || !hasAudio}
+                        disabled={!hasMedia || !hasAudio || isImageSegment}
                         onChange={(event) =>
                           updateSourceSegment(segment.id, {
                             audio: event.target.value as "preserve" | "mute",
@@ -2907,8 +3127,12 @@ export default function App() {
                     </label>
                   </div>
                   <div className="segment-meta">
-                    {formatTimecode(segment.startFrame, fps)} →{" "}
-                    {formatTimecode(segment.endFrameExclusive, fps)} ·{" "}
+                    {isImageSegment
+                      ? `${segment.assetPath ?? "PNG still"} · Still frame`
+                      : `${formatTimecode(segment.startFrame, fps)} → ${formatTimecode(
+                          segment.endFrameExclusive,
+                          fps
+                        )}`} ·{" "}
                     {formatSeconds(outputSeconds)}
                   </div>
                   <button className="danger" onClick={() => removeSourceSegment(segment.id)}>

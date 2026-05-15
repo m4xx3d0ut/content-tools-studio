@@ -732,6 +732,35 @@ button.danger:hover {
   margin-top: 6px;
 }
 
+.audio-track-setting {
+  display: grid;
+  gap: 8px;
+}
+
+.audio-url-row,
+.audio-track-controls,
+.audio-fade-controls {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.audio-track-controls {
+  grid-template-columns: minmax(0, 1fr) 96px auto;
+}
+
+.audio-track-controls input,
+.audio-track-controls select,
+.audio-fade-controls input[type="number"],
+.audio-url-row input {
+  width: 100%;
+}
+
+.audio-fade-controls {
+  grid-template-columns: minmax(0, 1fr) 96px;
+  align-items: center;
+}
+
 .slug-flags {
   display: flex;
   gap: 12px;
