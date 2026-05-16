@@ -25,6 +25,7 @@ const TITLE_COLOR = "#f5f2ea";
 const SUBTITLE_COLOR = "#d1c7b8";
 const OFFSET_MODE_KEY = "offsetMode";
 const OFFSET_MODE_DELTA = "delta-v1";
+const SVG_TEXT_TOP_TO_BASELINE = 0.8;
 
 function resolveTextAlign(value: unknown, fallback: "left" | "center" | "right") {
   if (typeof value === "string" && TEXT_ALIGNMENTS.has(value)) {
@@ -76,8 +77,27 @@ function escapeXml(text: string): string {
     .replace(/'/g, "&apos;");
 }
 
+function estimateTextWidth(text: string, fontSize: number): number {
+  let emWidth = 0;
+
+  for (const char of text) {
+    if (char === " ") {
+      emWidth += 0.25;
+    } else if (/[ilI1|.,:;!'`]/.test(char)) {
+      emWidth += 0.25;
+    } else if (/[mwMW@#%&]/.test(char)) {
+      emWidth += 0.78;
+    } else if (/[A-Z0-9]/.test(char)) {
+      emWidth += 0.56;
+    } else {
+      emWidth += 0.5;
+    }
+  }
+
+  return emWidth * fontSize;
+}
+
 function wrapTextLines(text: string, fontSize: number, maxWidth: number): string[] {
-  const maxChars = Math.max(1, Math.floor(maxWidth / Math.max(1, fontSize * 0.56)));
   const lines: string[] = [];
 
   for (const paragraph of text.split(/\r?\n/)) {
@@ -89,19 +109,28 @@ function wrapTextLines(text: string, fontSize: number, maxWidth: number): string
 
     let current = "";
     for (const word of words) {
-      if (word.length > maxChars) {
+      if (estimateTextWidth(word, fontSize) > maxWidth) {
         if (current) {
           lines.push(current);
           current = "";
         }
-        for (let index = 0; index < word.length; index += maxChars) {
-          lines.push(word.slice(index, index + maxChars));
+
+        let chunk = "";
+        for (const char of word) {
+          const candidateChunk = `${chunk}${char}`;
+          if (chunk && estimateTextWidth(candidateChunk, fontSize) > maxWidth) {
+            lines.push(chunk);
+            chunk = char;
+          } else {
+            chunk = candidateChunk;
+          }
         }
+        if (chunk) lines.push(chunk);
         continue;
       }
 
       const candidate = current ? `${current} ${word}` : word;
-      if (candidate.length > maxChars && current) {
+      if (estimateTextWidth(candidate, fontSize) > maxWidth && current) {
         lines.push(current);
         current = word;
       } else {
@@ -145,7 +174,7 @@ function buildTextSvg(
   const titleX = marginLeft + textAreaWidth / 2;
   const titleSize = Math.max(14, height * TITLE_SIZE_PCT * scales.title);
   const titleTop = Math.max(8, height * TITLE_Y_PCT) + (offsets?.titleY ?? 0);
-  const titleY = titleTop + titleSize / 2;
+  const titleY = titleTop + titleSize * SVG_TEXT_TOP_TO_BASELINE;
 
   const subtitleX =
     subtitleAlign === "left"
@@ -155,7 +184,7 @@ function buildTextSvg(
         : marginLeft + textAreaWidth / 2;
   const subtitleSize = Math.max(12, height * SUBTITLE_SIZE_PCT * scales.subtitle);
   const subtitleTop = Math.max(8, height * SUBTITLE_Y_PCT) + (offsets?.subtitleY ?? 0);
-  const subtitleY = subtitleTop + subtitleSize / 2;
+  const subtitleY = subtitleTop + subtitleSize * SVG_TEXT_TOP_TO_BASELINE;
 
   const titleLines = wrapTextLines(title, titleSize, textAreaWidth).map(escapeXml);
   const subtitleLines = subtitle

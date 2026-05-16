@@ -60,7 +60,7 @@ function stableStringify(value: unknown): string {
 
 export function getOverlayAssetHash(overlay: Overlay): string {
   return stableStringify({
-    version: 1,
+    version: 2,
     kind: isArrowOverlay(overlay) ? "arrow" : "card",
     templateId: overlay.templateId,
     templateVersion: overlay.templateVersion,
