@@ -346,6 +346,10 @@ export function openApiDocument(app: FastifyInstance): Record<string, unknown> {
     type: "string",
     format: "binary",
   });
+  patchJsonResponse(document, "/projects/{id}/patch/status", "get", "200", {
+    type: "object",
+    additionalProperties: true,
+  });
   patchPathContent(document, "/projects/{id}/thumbnail", "get", "200", "image/jpeg", {
     type: "string",
     format: "binary",
@@ -359,6 +363,9 @@ export function openApiDocument(app: FastifyInstance): Record<string, unknown> {
     format: "binary",
   });
   patchPathContent(document, "/projects/{id}/render/stream", "get", "200", "text/event-stream", {
+    type: "string",
+  });
+  patchPathContent(document, "/projects/{id}/patch/stream", "get", "200", "text/event-stream", {
     type: "string",
   });
   patchPathContent(document, "/projects/{id}/events", "get", "200", "text/event-stream", {

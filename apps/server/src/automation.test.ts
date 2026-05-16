@@ -2,11 +2,12 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import type { Project } from "@content-tools/shared";
 
 const execFile = promisify(execFileCallback);
 
@@ -151,6 +152,8 @@ test("OpenAPI document exposes automation and streaming contracts", async (t) =>
   assert.ok(document.paths["/projects/{id}/timeline-assets"]);
   assert.ok(document.paths["/projects/{id}/audio-assets"]);
   assert.ok(document.paths["/projects/{id}/audio-assets/from-url"]);
+  assert.ok(document.paths["/projects/{id}/patch/status"]);
+  assert.ok(document.paths["/projects/{id}/patch/stream"]);
   assert.ok(document.paths["/slugs"]);
   assert.ok(document.paths["/slugs/{id}/media"]);
   assert.equal(
@@ -162,6 +165,16 @@ test("OpenAPI document exposes automation and streaming contracts", async (t) =>
   assert.ok(document.paths["/projects/{id}/timeline/parse"]);
   assert.ok(
     document.paths["/projects/{id}/events"].get.responses["200"].content["text/event-stream"]
+  );
+  assert.ok(
+    document.paths["/projects/{id}/patch/status"].get.responses["200"].content[
+      "application/json"
+    ]
+  );
+  assert.ok(
+    document.paths["/projects/{id}/patch/stream"].get.responses["200"].content[
+      "text/event-stream"
+    ]
   );
   assert.ok(
     document.paths["/projects/{id}/exports/latest"].get.responses["200"].content["video/mp4"]
@@ -186,6 +199,91 @@ test("OpenAPI document exposes automation and streaming contracts", async (t) =>
   const templatesResponse = await app.inject({ method: "GET", url: "/templates" });
   assert.equal(templatesResponse.statusCode, 200);
   assert.equal(templatesResponse.json().templates[0].id, "card-lower-third-left");
+});
+
+test("surgical patch status allows only existing overlay visual changes", async () => {
+  const { getSurgicalPatchStatus, writeExportBundle } = await import("./services/exporter.js");
+  const projectId = "patch-status-test";
+  const projectRoot = path.join(workspaceRoot, projectId);
+  await mkdir(path.join(projectRoot, "media"), { recursive: true });
+  await writeFile(path.join(projectRoot, "media", "source.mp4"), "placeholder");
+
+  const overlay = {
+    id: "card-1",
+    templateId: "card-lower-third-left",
+    templateVersion: "1",
+    startFrame: 30,
+    endFrame: 90,
+    rect: { x: 80, y: 80, w: 640, h: 160 },
+    zIndex: 0,
+    fields: { title: "Original", text: "Body" },
+  };
+  const project: Project = {
+    schemaVersion: 1,
+    revision: 1,
+    id: projectId,
+    name: "Patch Status Test",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    source: { filename: "source.mp4" },
+    video: {
+      width: 1280,
+      height: 720,
+      fpsNum: 30,
+      fpsDen: 1,
+      durationMs: 5000,
+      audio: { hasAudio: false },
+    },
+    proxy: { enabled: false },
+    overlays: [overlay],
+    exportOptions: {
+      speed: 1,
+      includeAudio: false,
+      includeSlug: false,
+      includeSlugStart: false,
+      includeSlugEnd: false,
+    },
+    renderCache: { overlayAssetHash: {} },
+  };
+
+  const exportResult = await writeExportBundle(project, {
+    includeAudio: false,
+    presetId: "balanced",
+  });
+  assert.ok(exportResult.manifest.mainOutput);
+  await writeFile(exportResult.manifest.mainOutput, "main");
+  await writeFile(path.join(exportResult.exportDir, "final.mp4"), "final");
+
+  const visualEditStatus = await getSurgicalPatchStatus(
+    {
+      ...project,
+      overlays: [
+        {
+          ...overlay,
+          fields: { title: "Updated", text: "Body" },
+        },
+      ],
+    },
+    { includeAudio: false, presetId: "balanced" }
+  );
+  assert.equal(visualEditStatus.patchable, true);
+  assert.deepEqual(visualEditStatus.changedOverlayIds, ["card-1"]);
+  assert.equal(visualEditStatus.affectedWindows.length, 1);
+
+  const movedStatus = await getSurgicalPatchStatus(
+    {
+      ...project,
+      overlays: [
+        {
+          ...overlay,
+          rect: { ...overlay.rect, x: 120 },
+        },
+      ],
+    },
+    { includeAudio: false, presetId: "balanced" }
+  );
+  assert.equal(movedStatus.patchable, false);
+  assert.match(movedStatus.reason ?? "", /placement|motion|layer/);
 });
 
 test("command endpoint sets and clears external audio tracks", async (t) => {

@@ -348,6 +348,15 @@ export type ExportOptions = {
   renderMode?: "final" | "rough";
 };
 
+export type SurgicalPatchStatus = {
+  patchable: boolean;
+  reason?: string;
+  latestExportId?: string;
+  changedOverlayIds: string[];
+  affectedWindows: Array<{ startSec: number; endSec: number }>;
+  estimatedPatchSec?: number;
+};
+
 export async function exportProject(projectId: string, options: ExportOptions) {
   return request(`/projects/${projectId}/export`, {
     method: "POST",
@@ -362,6 +371,17 @@ export async function renderProject(projectId: string, options: ExportOptions) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
   });
+}
+
+export async function getPatchStatus(
+  projectId: string,
+  options: ExportOptions
+): Promise<SurgicalPatchStatus> {
+  const params = renderOptionsParams(options);
+  const query = params.toString();
+  return request<SurgicalPatchStatus>(
+    `/projects/${projectId}/patch/status${query ? `?${query}` : ""}`
+  );
 }
 
 export async function parseSourceTimeline(
@@ -381,7 +401,7 @@ export async function parseSourceTimeline(
   });
 }
 
-export function renderStreamUrl(projectId: string, options: ExportOptions): string {
+function renderOptionsParams(options: ExportOptions): URLSearchParams {
   const params = new URLSearchParams();
   if (options.presetId) params.set("presetId", options.presetId);
   if (typeof options.includeAudio === "boolean") {
@@ -398,8 +418,20 @@ export function renderStreamUrl(projectId: string, options: ExportOptions): stri
   }
   if (options.speed) params.set("speed", String(options.speed));
   if (options.renderMode === "rough") params.set("renderMode", options.renderMode);
+  if (options.renderMode === "final") params.set("renderMode", options.renderMode);
+  return params;
+}
+
+export function renderStreamUrl(projectId: string, options: ExportOptions): string {
+  const params = renderOptionsParams(options);
   const query = params.toString();
   return `${API_BASE}/projects/${projectId}/render/stream${query ? `?${query}` : ""}`;
+}
+
+export function patchStreamUrl(projectId: string, options: ExportOptions): string {
+  const params = renderOptionsParams(options);
+  const query = params.toString();
+  return `${API_BASE}/projects/${projectId}/patch/stream${query ? `?${query}` : ""}`;
 }
 
 export async function uploadAsset(

@@ -29,7 +29,13 @@ import {
   writeProject,
 } from "../services/workspace.js";
 import { probeAudio, probeVideo } from "../services/ffprobe.js";
-import { renderFinal, writeExportBundle, type RenderProgress } from "../services/exporter.js";
+import {
+  getSurgicalPatchStatus,
+  renderFinal,
+  renderSurgicalPatch,
+  writeExportBundle,
+  type RenderProgress,
+} from "../services/exporter.js";
 import { FFMPEG_PATH, UPLOAD_MAX_BYTES, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { ensureThumbnail } from "../services/thumbnails.js";
@@ -120,6 +126,48 @@ async function hashFile(filePath: string): Promise<string> {
     stream.on("end", resolve);
   });
   return hash.digest("hex");
+}
+
+type RenderOptionsQuery = {
+  presetId?: string;
+  includeAudio?: string;
+  includeSlug?: string;
+  includeSlugStart?: string;
+  includeSlugEnd?: string;
+  speed?: string;
+  renderMode?: string;
+};
+
+function parseRenderOptionsQuery(query: RenderOptionsQuery): {
+  presetId?: string;
+  includeAudio?: boolean;
+  includeSlug?: boolean;
+  includeSlugStart?: boolean;
+  includeSlugEnd?: boolean;
+  speed?: 1 | 2;
+  renderMode?: "final" | "rough";
+} {
+  const includeAudio =
+    typeof query.includeAudio === "string" ? query.includeAudio === "true" : undefined;
+  const includeSlug = query.includeSlug === "true";
+  const includeSlugStart =
+    query.includeSlugStart === "true" || (includeSlug && query.includeSlugStart == null);
+  const includeSlugEnd =
+    query.includeSlugEnd === "true" || (includeSlug && query.includeSlugEnd == null);
+  return {
+    presetId: query.presetId,
+    includeAudio,
+    includeSlug,
+    includeSlugStart,
+    includeSlugEnd,
+    speed: query.speed ? (Number(query.speed) as 1 | 2) : undefined,
+    renderMode:
+      query.renderMode === "rough"
+        ? "rough"
+        : query.renderMode === "final"
+          ? "final"
+          : undefined,
+  };
 }
 
 async function normalizeVideoIfNeeded(
@@ -1518,6 +1566,90 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       };
     } catch (error) {
       return reply.code(500).send({ error: (error as Error).message });
+    }
+  });
+
+  app.get(
+    "/:id/patch/status",
+    routeDoc(["Rendering"], "Report whether latest final export can be surgically patched", {
+      params: projectIdParamsSchema,
+      querystring: {
+        type: "object",
+        properties: {
+          presetId: { type: "string" },
+          includeAudio: { type: "string" },
+          includeSlug: { type: "string" },
+          includeSlugStart: { type: "string" },
+          includeSlugEnd: { type: "string" },
+          speed: { type: "string" },
+          renderMode: { type: "string", enum: ["final", "rough"] },
+        },
+      },
+      response: { 200: { type: "object", additionalProperties: true }, ...errorResponses },
+    }),
+    async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const query = request.query as RenderOptionsQuery;
+    const project = await readProject(id);
+    if (!project) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+
+    return getSurgicalPatchStatus(project, parseRenderOptionsQuery(query));
+  });
+
+  app.get(
+    "/:id/patch/stream",
+    routeDoc(["Rendering"], "Stream surgical patch render progress with SSE", {
+      params: projectIdParamsSchema,
+      querystring: {
+        type: "object",
+        properties: {
+          presetId: { type: "string" },
+          includeAudio: { type: "string" },
+          includeSlug: { type: "string" },
+          includeSlugStart: { type: "string" },
+          includeSlugEnd: { type: "string" },
+          speed: { type: "string" },
+          renderMode: { type: "string", enum: ["final", "rough"] },
+        },
+      },
+      response: { 200: { type: "string" }, ...errorResponses },
+      produces: ["text/event-stream"],
+    }),
+    async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const query = request.query as RenderOptionsQuery;
+    const project = await readProject(id);
+    if (!project) {
+      return reply.code(404).send({ error: "project not found" });
+    }
+
+    const options = parseRenderOptionsQuery(query);
+    const origin = request.headers.origin ?? "*";
+    reply.raw.setHeader("Access-Control-Allow-Origin", origin);
+    reply.raw.setHeader("Content-Type", "text/event-stream");
+    reply.raw.setHeader("Cache-Control", "no-cache");
+    reply.raw.setHeader("Connection", "keep-alive");
+    reply.raw.flushHeaders();
+    reply.hijack();
+
+    const send = (event: string, data: RenderProgress | { message: string }) => {
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    send("status", { message: "Patch render started" });
+
+    try {
+      const result = await renderSurgicalPatch(project, options, (update) => {
+        send("progress", update);
+      });
+      send("done", { message: result.finalPath });
+    } catch (error) {
+      send("error", { message: (error as Error).message });
+    } finally {
+      reply.raw.end();
     }
   });
 

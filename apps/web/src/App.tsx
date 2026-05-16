@@ -18,6 +18,7 @@ import {
   deleteProject,
   deleteSlug,
   exportLatestUrl,
+  getPatchStatus,
   getProject,
   importAudioAssetFromUrl,
   importProjectBundle,
@@ -30,6 +31,7 @@ import {
   parseSourceTimeline,
   projectBundleUrl,
   projectEventsUrl,
+  patchStreamUrl,
   renderStreamUrl,
   slugMediaUrl,
   thumbnailUrl,
@@ -45,6 +47,7 @@ import {
   type ProjectSummary,
   type SlugAsset,
   type SourceSegment,
+  type SurgicalPatchStatus,
   type TemplateInfo,
 } from "./api";
 
@@ -528,6 +531,8 @@ export default function App() {
   const [renderActive, setRenderActive] = useState(false);
   const [renderReady, setRenderReady] = useState(false);
   const [renderFinalPath, setRenderFinalPath] = useState("");
+  const [patchStatus, setPatchStatus] = useState<SurgicalPatchStatus | null>(null);
+  const [patchStatusLoading, setPatchStatusLoading] = useState(false);
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
   const [bundleMode, setBundleMode] = useState<ProjectBundleMode>("project-media");
   const [thumbnailError, setThumbnailError] = useState<string | null>(null);
@@ -690,6 +695,47 @@ export default function App() {
   }, [totalFrames]);
 
   const downloadUrl = selectedId ? exportLatestUrl(selectedId) : "";
+  const canPatchLatestFinal =
+    Boolean(project) && !renderActive && !isRoughPreview && (isDirty || Boolean(patchStatus?.patchable));
+  const patchStatusMessage = isRoughPreview
+    ? "Patch latest final is unavailable in rough preview mode."
+    : isDirty
+      ? "Save changes to check whether latest final can be patched."
+      : patchStatusLoading
+        ? "Checking latest final patch status..."
+        : patchStatus?.patchable
+          ? `Patch ${patchStatus.changedOverlayIds.length} overlay${patchStatus.changedOverlayIds.length === 1 ? "" : "s"} across ${patchStatus.affectedWindows.length} window${patchStatus.affectedWindows.length === 1 ? "" : "s"}.`
+          : patchStatus?.reason ?? "Run a final render before patching.";
+
+  useEffect(() => {
+    if (!selectedId || !project || isDirty || isRoughPreview) {
+      setPatchStatus(null);
+      setPatchStatusLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPatchStatusLoading(true);
+    getPatchStatus(selectedId, renderOptions)
+      .then((nextStatus) => {
+        if (!cancelled) setPatchStatus(nextStatus);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setPatchStatus({
+            patchable: false,
+            reason: (error as Error).message,
+            changedOverlayIds: [],
+            affectedWindows: [],
+          });
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setPatchStatusLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, project?.revision, renderOptions, isDirty, isRoughPreview]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -1826,6 +1872,75 @@ export default function App() {
     await saveProjectDocument(selectedId, project, "manual");
   }
 
+  function openRenderEventSource(url: string, label: "Render" | "Patch") {
+    const es = new EventSource(url);
+    const parsePayload = (event: Event) => {
+      if ("data" in event) {
+        const raw = (event as MessageEvent).data;
+        if (typeof raw === "string" && raw.length) {
+          try {
+            return JSON.parse(raw) as { stage?: string; message?: string; percent?: number };
+          } catch {
+            return { message: raw };
+          }
+        }
+      }
+      return {};
+    };
+
+    const pushRenderLog = (line: string) => {
+      if (!line) return;
+      setRenderLogs((prev) => {
+        const next = [...prev, line];
+        return next.length > 200 ? next.slice(next.length - 200) : next;
+      });
+    };
+
+    const applyUpdate = (data: { stage?: string; message?: string; percent?: number }) => {
+      if (typeof data.percent === "number") {
+        setRenderProgress(data.percent);
+      }
+      if (data.message) {
+        const stageLabel = data.stage ? `[${data.stage}] ` : "";
+        const line = `${stageLabel}${data.message}`;
+        setStatus(line);
+        pushRenderLog(line);
+      }
+    };
+
+    es.addEventListener("status", (event) => {
+      applyUpdate(parsePayload(event));
+    });
+    es.addEventListener("progress", (event) => {
+      applyUpdate(parsePayload(event));
+    });
+    es.addEventListener("done", (event) => {
+      const data = parsePayload(event);
+      setStatus(`${label} complete: ${data.message ?? "Done"}`);
+      setRenderProgress(1);
+      pushRenderLog(`${label} complete: ${data.message ?? "Done"}`);
+      setRenderActive(false);
+      setRenderReady(true);
+      if (data.message) {
+        setRenderFinalPath(data.message);
+      }
+      if (selectedId && !isRoughPreview) {
+        getPatchStatus(selectedId, renderOptions)
+          .then(setPatchStatus)
+          .catch(() => setPatchStatus(null));
+      }
+      es.close();
+    });
+    es.addEventListener("error", (event) => {
+      const data = parsePayload(event);
+      const message = `${label} error: ${data.message ?? "unknown"}`;
+      setStatus(message);
+      pushRenderLog(message);
+      setRenderActive(false);
+      es.close();
+    });
+  }
+
   async function handleRenderFinal() {
     if (!project || !selectedId) return;
     setStatus("Starting render...");
@@ -1840,67 +1955,33 @@ export default function App() {
       if (!saved) {
         throw new Error("Project was not saved; render cancelled.");
       }
-      const es = new EventSource(renderStreamUrl(selectedId, renderOptions));
-      const parsePayload = (event: Event) => {
-        if ("data" in event) {
-          const raw = (event as MessageEvent).data;
-          if (typeof raw === "string" && raw.length) {
-            try {
-              return JSON.parse(raw) as { stage?: string; message?: string; percent?: number };
-            } catch {
-              return { message: raw };
-            }
-          }
-        }
-        return {};
-      };
+      openRenderEventSource(renderStreamUrl(selectedId, renderOptions), "Render");
+    } catch (error) {
+      setStatus((error as Error).message);
+      setRenderActive(false);
+    }
+  }
 
-      const pushRenderLog = (line: string) => {
-        if (!line) return;
-        setRenderLogs((prev) => {
-          const next = [...prev, line];
-          return next.length > 200 ? next.slice(next.length - 200) : next;
-        });
-      };
-
-      const applyUpdate = (data: { stage?: string; message?: string; percent?: number }) => {
-        if (typeof data.percent === "number") {
-          setRenderProgress(data.percent);
-        }
-        if (data.message) {
-          const stageLabel = data.stage ? `[${data.stage}] ` : "";
-          const line = `${stageLabel}${data.message}`;
-          setStatus(line);
-          pushRenderLog(line);
-        }
-      };
-
-      es.addEventListener("status", (event) => {
-        applyUpdate(parsePayload(event));
-      });
-      es.addEventListener("progress", (event) => {
-        applyUpdate(parsePayload(event));
-      });
-      es.addEventListener("done", (event) => {
-        const data = parsePayload(event);
-        setStatus(`Render complete: ${data.message ?? "Done"}`);
-        setRenderProgress(1);
-        pushRenderLog(`Render complete: ${data.message ?? "Done"}`);
-        setRenderActive(false);
-        setRenderReady(true);
-        if (data.message) {
-          setRenderFinalPath(data.message);
-        }
-        es.close();
-      });
-      es.addEventListener("error", (event) => {
-        const data = parsePayload(event);
-        const message = `Render error: ${data.message ?? "unknown"}`;
-        setStatus(message);
-        pushRenderLog(message);
-        setRenderActive(false);
-        es.close();
-      });
+  async function handlePatchLatestFinal() {
+    if (!project || !selectedId) return;
+    setStatus("Preparing patch...");
+    setRenderProgress(0);
+    setRenderLogs([]);
+    setRenderActive(true);
+    setRenderReady(false);
+    setRenderFinalPath("");
+    try {
+      const preparedProject = await prepareRenderAssets(project);
+      const saved = await saveProjectDocument(selectedId, preparedProject, "manual");
+      if (!saved) {
+        throw new Error("Project was not saved; patch cancelled.");
+      }
+      const nextStatus = await getPatchStatus(selectedId, renderOptions);
+      setPatchStatus(nextStatus);
+      if (!nextStatus.patchable) {
+        throw new Error(nextStatus.reason ?? "Latest final export is not patchable.");
+      }
+      openRenderEventSource(patchStreamUrl(selectedId, renderOptions), "Patch");
     } catch (error) {
       setStatus((error as Error).message);
       setRenderActive(false);
@@ -2411,7 +2492,17 @@ export default function App() {
                 <button onClick={handleRenderFinal} disabled={!project}>
                   {isRoughPreview ? "Render preview" : "Render final"}
                 </button>
+                {!isRoughPreview && (
+                  <button
+                    className="secondary"
+                    onClick={handlePatchLatestFinal}
+                    disabled={!canPatchLatestFinal}
+                  >
+                    Patch latest final
+                  </button>
+                )}
               </div>
+              {!isRoughPreview && <div className="details">{patchStatusMessage}</div>}
             </div>
           )}
         </aside>
@@ -3066,6 +3157,15 @@ export default function App() {
             <button onClick={handleRenderFinal} disabled={!project}>
               {isRoughPreview ? "Render preview" : "Render final"}
             </button>
+            {!isRoughPreview && (
+              <button
+                className="secondary"
+                onClick={handlePatchLatestFinal}
+                disabled={!canPatchLatestFinal}
+              >
+                Patch latest final
+              </button>
+            )}
             {renderReady && downloadUrl && (
               <a
                 className="button-link"
@@ -3082,6 +3182,7 @@ export default function App() {
               </button>
             )}
           </div>
+          {!isRoughPreview && <div className="details">{patchStatusMessage}</div>}
           <div className="autosave-controls">
             <label className="checkbox">
               <input

@@ -1,8 +1,9 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { Overlay, Project, SourceSegment } from "@content-tools/shared";
-import { DEFAULT_PRESET_ID, EXPORT_PRESETS } from "@content-tools/shared";
+import { DEFAULT_PRESET_ID, EXPORT_PRESETS, getOverlayAssetHash } from "@content-tools/shared";
 import { FFMPEG_PATH, REPO_ROOT, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { renderProjectAssets } from "./renderer.js";
@@ -62,6 +63,62 @@ type ExportManifest = {
   externalAudioFadeOutStartSec?: number;
   externalAudioFadeOutEndSec?: number;
   audioTrack?: Project["audioTrack"];
+  mainOutput?: string;
+  fingerprints?: ExportFingerprints;
+  overlaySnapshots?: OverlayRenderSnapshot[];
+  patch?: {
+    baseExportId: string;
+    changedOverlayIds: string[];
+    affectedWindows: PatchWindow[];
+  };
+};
+
+type ExportFingerprints = {
+  source: string;
+  timeline: string;
+  render: string;
+  slug: string;
+  audio: string;
+};
+
+type OverlayRenderSnapshot = {
+  id: string;
+  kind: OverlayKind;
+  visualHash: string;
+  structuralHash: string;
+  startSec: number;
+  endSec: number;
+};
+
+export type PatchWindow = {
+  startSec: number;
+  endSec: number;
+};
+
+export type SurgicalPatchStatus = {
+  patchable: boolean;
+  reason?: string;
+  latestExportId?: string;
+  changedOverlayIds: string[];
+  affectedWindows: PatchWindow[];
+  estimatedPatchSec?: number;
+};
+
+type LatestExport = {
+  exportId: string;
+  exportDir: string;
+  finalPath: string;
+  manifest: ExportManifest;
+};
+
+type PatchAnalysis = SurgicalPatchStatus & {
+  latest?: LatestExport;
+  projectForRender?: Project;
+  renderTuning?: RenderTuning;
+  outputFrames?: number;
+  speed?: 1 | 2;
+  fingerprints?: ExportFingerprints;
+  overlaySnapshots?: OverlayRenderSnapshot[];
 };
 
 type FilterResult = {
@@ -1235,6 +1292,25 @@ function relPath(from: string, to: string): string {
   return toPosix(path.relative(from, to));
 }
 
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hashStable(value: unknown): string {
+  return createHash("sha256").update(stableStringify(value)).digest("hex");
+}
+
 function resolveProjectAssetPath(projectRoot: string, inputPath: string): string {
   if (path.isAbsolute(inputPath)) return inputPath;
   return path.join(projectRoot, inputPath);
@@ -1707,6 +1783,393 @@ async function applyExternalAudioTrack(
   return { durationSec, fadeOut: fadePlan };
 }
 
+function buildOverlayStructuralHash(overlay: Overlay): string {
+  return hashStable({
+    version: 1,
+    kind: isArrowOverlay(overlay) ? "arrow" : "card",
+    startFrame: overlay.startFrame,
+    endFrame: overlay.endFrame,
+    rect: overlay.rect,
+    opacity: overlay.opacity,
+    zIndex: overlay.zIndex,
+    motion: overlay.motion,
+  });
+}
+
+function buildOverlaySnapshots(projectForRender: Project, speed: 1 | 2): OverlayRenderSnapshot[] {
+  const fps = projectForRender.video.fpsNum / projectForRender.video.fpsDen;
+  return sortOverlays(projectForRender.overlays).map((overlay) => {
+    const timing = computeOverlayTiming(overlay, fps, speed);
+    return {
+      id: overlay.id,
+      kind: isArrowOverlay(overlay) ? "arrow" : "card",
+      visualHash: getOverlayAssetHash(overlay),
+      structuralHash: buildOverlayStructuralHash(overlay),
+      startSec: timing.visStartSec,
+      endSec: timing.visEndSec,
+    };
+  });
+}
+
+function buildExportFingerprints(input: {
+  project: Project;
+  renderTuning: RenderTuning;
+  presetId: string;
+  speed: 1 | 2;
+  includeAudio: boolean;
+  includeSlugStart: boolean;
+  includeSlugEnd: boolean;
+}): ExportFingerprints {
+  const { project, renderTuning, presetId, speed, includeAudio, includeSlugStart, includeSlugEnd } =
+    input;
+  return {
+    source: hashStable({
+      version: 1,
+      source: project.source,
+      video: project.video,
+    }),
+    timeline: hashStable({
+      version: 1,
+      edits: project.edits ?? null,
+    }),
+    render: hashStable({
+      version: 1,
+      presetId,
+      speed,
+      includeAudio,
+      includeSlugStart,
+      includeSlugEnd,
+      renderMode: renderTuning.mode,
+      outputFps: renderTuning.outputFps,
+      outputWidth: renderTuning.outputWidth,
+      outputHeight: renderTuning.outputHeight,
+    }),
+    slug: hashStable({
+      version: 1,
+      includeSlugStart,
+      includeSlugEnd,
+      slug: project.slug ?? null,
+    }),
+    audio: hashStable({
+      version: 1,
+      includeAudio,
+      audioTrack: project.audioTrack ?? null,
+    }),
+  };
+}
+
+function hasUnsupportedNonFlattenedTimeline(project: Project): boolean {
+  if (project.edits?.sourceSegments?.length) return false;
+  const trimStartFrames = project.edits?.trimStartFrames ?? 0;
+  const trimEndFrames = project.edits?.trimEndFrames ?? 0;
+  const cuts = project.edits?.cuts ?? [];
+  return trimStartFrames > 0 || trimEndFrames > 0 || cuts.length > 0;
+}
+
+function mergePatchWindows(windows: PatchWindow[]): PatchWindow[] {
+  const sorted = windows
+    .filter((window) => window.endSec > window.startSec)
+    .sort((a, b) => a.startSec - b.startSec);
+  const merged: PatchWindow[] = [];
+  for (const window of sorted) {
+    const previous = merged.at(-1);
+    if (!previous || window.startSec > previous.endSec) {
+      merged.push({ ...window });
+      continue;
+    }
+    previous.endSec = Math.max(previous.endSec, window.endSec);
+  }
+  return merged;
+}
+
+function buildAffectedWindows(
+  snapshots: OverlayRenderSnapshot[],
+  changedOverlayIds: string[],
+  mainDurationSec: number,
+  fps: number
+): PatchWindow[] {
+  const changedIds = new Set(changedOverlayIds);
+  const padSec = Math.max(0.2, 2 / Math.max(1, fps));
+  const windows = snapshots
+    .filter((snapshot) => changedIds.has(snapshot.id))
+    .map((snapshot) => ({
+      startSec: Math.max(0, snapshot.startSec - padSec),
+      endSec: Math.min(mainDurationSec, snapshot.endSec + padSec),
+    }));
+  return mergePatchWindows(windows);
+}
+
+async function readExportManifest(exportDir: string): Promise<ExportManifest | null> {
+  const manifestPath = path.join(exportDir, "manifest.json");
+  if (!(await fileExists(manifestPath))) return null;
+  try {
+    return JSON.parse(await fs.readFile(manifestPath, "utf-8")) as ExportManifest;
+  } catch {
+    return null;
+  }
+}
+
+async function findLatestFinalExport(projectId: string): Promise<LatestExport | null> {
+  const exportsRoot = path.join(WORKSPACE_ROOT, projectId, "exports");
+  if (!(await fileExists(exportsRoot))) return null;
+  const entries = await fs.readdir(exportsRoot, { withFileTypes: true });
+  const dirs = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort()
+    .reverse();
+  for (const exportId of dirs) {
+    const exportDir = path.join(exportsRoot, exportId);
+    const finalPath = path.join(exportDir, "final.mp4");
+    if (!(await fileExists(finalPath))) continue;
+    const manifest = await readExportManifest(exportDir);
+    if (!manifest || manifest.renderMode === "rough") continue;
+    return { exportId, exportDir, finalPath, manifest };
+  }
+  return null;
+}
+
+function analyzePatchCompatibility(
+  project: Project,
+  options: ExportRequest,
+  latest: LatestExport,
+  timelinePlan: ReturnType<typeof buildTimelinePlan>,
+  renderTuning: RenderTuning,
+  speed: 1 | 2,
+  includeAudio: boolean,
+  includeSlugStart: boolean,
+  includeSlugEnd: boolean,
+  presetId: string
+): PatchAnalysis {
+  const projectForRender =
+    renderTuning.mode === "rough"
+      ? scaleProjectForRender(timelinePlan.project, renderTuning)
+      : timelinePlan.project;
+  const fingerprints = buildExportFingerprints({
+    project,
+    renderTuning,
+    presetId,
+    speed,
+    includeAudio,
+    includeSlugStart,
+    includeSlugEnd,
+  });
+  const overlaySnapshots = buildOverlaySnapshots(projectForRender, speed);
+  const base = latest.manifest;
+  const baseMainOutput = base.mainOutput
+    ? path.isAbsolute(base.mainOutput)
+      ? base.mainOutput
+      : path.join(latest.exportDir, base.mainOutput)
+    : base.arrowInputs?.length
+      ? path.join(latest.exportDir, "main_noslug_arrows.mp4")
+      : path.join(latest.exportDir, "main_noslug.mp4");
+
+  const reject = (reason: string): PatchAnalysis => ({
+    patchable: false,
+    reason,
+    latestExportId: latest.exportId,
+    changedOverlayIds: [],
+    affectedWindows: [],
+    latest,
+    projectForRender,
+    renderTuning,
+    outputFrames: timelinePlan.outputFrames,
+    speed,
+    fingerprints,
+    overlaySnapshots,
+  });
+
+  if (options.renderMode === "rough" || renderTuning.mode === "rough") {
+    return reject("Surgical patching is only available for final renders.");
+  }
+  if (hasUnsupportedNonFlattenedTimeline(project)) {
+    return reject("Projects with trim/cut edits need one full render before patching.");
+  }
+  if (project.edits?.sourceSegments?.length && !base.timelineSource) {
+    return reject("Latest final export is missing the flattened source timeline needed for patching.");
+  }
+  if (!base.fingerprints || !base.overlaySnapshots) {
+    return reject("Latest final export was created before surgical patch metadata existed.");
+  }
+  if (!base.mainOutput && !base.overlayInputs && !base.arrowInputs) {
+    return reject("Latest final export does not include a patchable main render.");
+  }
+  if (!base.source || !baseMainOutput) {
+    return reject("Latest final export is missing its patch source.");
+  }
+  if (
+    base.fingerprints.source !== fingerprints.source ||
+    base.fingerprints.timeline !== fingerprints.timeline ||
+    base.fingerprints.render !== fingerprints.render ||
+    base.fingerprints.slug !== fingerprints.slug ||
+    base.fingerprints.audio !== fingerprints.audio
+  ) {
+    return reject("Source, timeline, render, slug, or audio settings changed; run a full render.");
+  }
+
+  const oldSnapshots = new Map(base.overlaySnapshots.map((snapshot) => [snapshot.id, snapshot]));
+  const currentSnapshots = new Map(overlaySnapshots.map((snapshot) => [snapshot.id, snapshot]));
+  if (oldSnapshots.size !== currentSnapshots.size) {
+    return reject("Overlay additions or deletions require a full render.");
+  }
+
+  const changedOverlayIds: string[] = [];
+  for (const snapshot of overlaySnapshots) {
+    const previous = oldSnapshots.get(snapshot.id);
+    if (!previous) {
+      return reject("Overlay additions require a full render.");
+    }
+    if (
+      previous.kind !== snapshot.kind ||
+      previous.structuralHash !== snapshot.structuralHash
+    ) {
+      return reject("Overlay timing, placement, motion, or layer changes require a full render.");
+    }
+    if (previous.visualHash !== snapshot.visualHash) {
+      changedOverlayIds.push(snapshot.id);
+    }
+  }
+
+  for (const snapshot of oldSnapshots.values()) {
+    if (!currentSnapshots.has(snapshot.id)) {
+      return reject("Overlay deletions require a full render.");
+    }
+  }
+
+  if (!changedOverlayIds.length) {
+    return reject("No patchable overlay visual changes detected.");
+  }
+
+  const fps = projectForRender.video.fpsNum / projectForRender.video.fpsDen;
+  const mainDurationSec = timelinePlan.outputFrames / fps / speed;
+  const affectedWindows = buildAffectedWindows(
+    overlaySnapshots,
+    changedOverlayIds,
+    mainDurationSec,
+    fps
+  );
+  const estimatedPatchSec = affectedWindows.reduce(
+    (sum, window) => sum + window.endSec - window.startSec,
+    0
+  );
+
+  return {
+    patchable: true,
+    latestExportId: latest.exportId,
+    changedOverlayIds,
+    affectedWindows,
+    estimatedPatchSec,
+    latest,
+    projectForRender,
+    renderTuning,
+    outputFrames: timelinePlan.outputFrames,
+    speed,
+    fingerprints,
+    overlaySnapshots,
+  };
+}
+
+function resolveLatestMainOutput(latest: LatestExport): string {
+  if (latest.manifest.mainOutput) {
+    return path.isAbsolute(latest.manifest.mainOutput)
+      ? latest.manifest.mainOutput
+      : path.join(latest.exportDir, latest.manifest.mainOutput);
+  }
+  return latest.manifest.arrowInputs?.length
+    ? path.join(latest.exportDir, "main_noslug_arrows.mp4")
+    : path.join(latest.exportDir, "main_noslug.mp4");
+}
+
+async function buildSurgicalPatchAnalysis(
+  project: Project,
+  options: ExportRequest = {}
+): Promise<PatchAnalysis> {
+  const latest = await findLatestFinalExport(project.id);
+  if (!latest) {
+    return {
+      patchable: false,
+      reason: "No final export is available to patch.",
+      changedOverlayIds: [],
+      affectedWindows: [],
+    };
+  }
+
+  const timelinePlan = buildTimelinePlan(project);
+  const renderTuning = resolveRenderTuning(project, options);
+  const requestedSpeed = options.speed ?? project.exportOptions?.speed ?? 1;
+  const speed = timelinePlan.usesSourceSegments ? 1 : requestedSpeed;
+  const hasAudio = Boolean(project.video.audio?.hasAudio);
+  const includeAudio =
+    (typeof options.includeAudio === "boolean"
+      ? options.includeAudio
+      : project.exportOptions?.includeAudio ?? true) && hasAudio;
+  const includeSlug =
+    typeof options.includeSlug === "boolean"
+      ? options.includeSlug
+      : project.exportOptions?.includeSlug ?? false;
+  const includeSlugStart =
+    typeof options.includeSlugStart === "boolean"
+      ? options.includeSlugStart
+      : includeSlug || project.exportOptions?.includeSlugStart || false;
+  const includeSlugEnd =
+    typeof options.includeSlugEnd === "boolean"
+      ? options.includeSlugEnd
+      : includeSlug || project.exportOptions?.includeSlugEnd || false;
+  const presetId = renderTuning.presetId;
+
+  const analysis = analyzePatchCompatibility(
+    project,
+    options,
+    latest,
+    timelinePlan,
+    renderTuning,
+    speed,
+    includeAudio,
+    includeSlugStart,
+    includeSlugEnd,
+    presetId
+  );
+  if (!analysis.patchable) return analysis;
+
+  const baseMainOutput = resolveLatestMainOutput(latest);
+  if (!(await fileExists(baseMainOutput))) {
+    return {
+      ...analysis,
+      patchable: false,
+      reason: "Latest final export is missing its patchable main render.",
+      changedOverlayIds: [],
+      affectedWindows: [],
+      estimatedPatchSec: undefined,
+    };
+  }
+  if (!(await fileExists(latest.manifest.source))) {
+    return {
+      ...analysis,
+      patchable: false,
+      reason: "Latest final export is missing its patch source.",
+      changedOverlayIds: [],
+      affectedWindows: [],
+      estimatedPatchSec: undefined,
+    };
+  }
+  return analysis;
+}
+
+export async function getSurgicalPatchStatus(
+  project: Project,
+  options: ExportRequest = {}
+): Promise<SurgicalPatchStatus> {
+  const analysis = await buildSurgicalPatchAnalysis(project, options);
+  return {
+    patchable: analysis.patchable,
+    reason: analysis.reason,
+    latestExportId: analysis.latestExportId,
+    changedOverlayIds: analysis.changedOverlayIds,
+    affectedWindows: analysis.affectedWindows,
+    estimatedPatchSec: analysis.estimatedPatchSec,
+  };
+}
+
 export async function writeExportBundle(
   project: Project,
   options: ExportRequest = {}
@@ -1772,6 +2235,19 @@ export async function writeExportBundle(
 
   const cards = sortOverlays(projectForRender.overlays.filter((overlay) => !isArrowOverlay(overlay)));
   const arrows = sortOverlays(projectForRender.overlays.filter(isArrowOverlay));
+  const hasArrows = arrows.length > 0;
+  const mainOutputName = hasArrows ? "main_noslug_arrows.mp4" : "main_noslug.mp4";
+  const mainOutputPath = path.join(exportDir, mainOutputName);
+  const fingerprints = buildExportFingerprints({
+    project,
+    renderTuning,
+    presetId,
+    speed,
+    includeAudio,
+    includeSlugStart,
+    includeSlugEnd,
+  });
+  const overlaySnapshots = buildOverlaySnapshots(projectForRender, speed);
 
   const cardInputs: OverlayInput[] = cards.map((overlay) => ({
     overlay,
@@ -1855,6 +2331,9 @@ export async function writeExportBundle(
       ? resolveProjectAudioPath(projectRoot, project.audioTrack.assetPath)
       : undefined,
     audioTrack: project.audioTrack,
+    mainOutput: mainOutputPath,
+    fingerprints,
+    overlaySnapshots,
   };
 
   const readme = buildReadme(exportDir, manifest, cardInputs, arrowInputs);
@@ -1876,85 +2355,20 @@ export async function writeExportBundle(
   };
 }
 
-export async function renderFinal(
+async function assembleFinalOutput(
   project: Project,
-  options: ExportRequest = {},
+  projectForRender: Project,
+  renderTuning: RenderTuning,
+  exportDir: string,
+  mainOutputPath: string,
+  finalPath: string,
+  manifest: ExportManifest,
+  durationSec: number,
   onProgress?: (update: RenderProgress) => void
-): Promise<{
-  exportDir: string;
-  exportId: string;
-  finalPath: string;
-  manifest: ExportManifest;
-}> {
-  const { exportDir, exportId, manifest, outputFrames, projectForRender, renderTuning } =
-    await writeExportBundle(project, options);
-
-  if (manifest.timelineSource) {
-    onProgress?.({ stage: "timeline", message: "Rendering flattened source timeline" });
-    await renderFlattenedSourceTimeline(
-      project,
-      exportDir,
-      manifest.source,
-      manifest.includeAudio,
-      onProgress
-    );
-  }
-
-  onProgress?.({ stage: "assets", message: "Rendering overlay assets" });
-  await renderProjectAssets(projectForRender);
+): Promise<void> {
   const preset = EXPORT_PRESETS[manifest.presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
-
-  const missingInputs = [];
-  for (const input of [...manifest.timelineInputs, ...manifest.overlayInputs, ...manifest.arrowInputs]) {
-    if (!(await fileExists(input))) {
-      missingInputs.push(input);
-    }
-  }
-  if (missingInputs.length) {
-    throw new Error(`Missing overlay assets: ${missingInputs.join(", ")}`);
-  }
-
-  const hasArrows = manifest.arrowInputs.length > 0;
-  const filterScript = hasArrows ? manifest.filterCardsArrows : manifest.filterCards;
-  const outputLabel = hasArrows ? manifest.outputLabelCardsArrows : manifest.outputLabelCards;
-  const audioLabel = hasArrows
-    ? manifest.outputLabelCardsArrowsAudio
-    : manifest.outputLabelCardsAudio;
-  const mainOutputName = hasArrows ? "main_noslug_arrows.mp4" : "main_noslug.mp4";
-  const mainOutputPath = path.join(exportDir, mainOutputName);
-
-  const args = ["-y", "-i", manifest.source];
-  for (const input of manifest.timelineInputs) {
-    args.push("-i", input);
-  }
-  for (const input of manifest.overlayInputs) {
-    args.push("-loop", "1", "-framerate", STATIC_OVERLAY_INPUT_FPS, "-i", input);
-  }
-  for (const input of manifest.arrowInputs) {
-    args.push("-loop", "1", "-framerate", STATIC_OVERLAY_INPUT_FPS, "-i", input);
-  }
-  args.push(
-    "-filter_complex_script",
-    filterScript,
-    "-map",
-    outputLabel,
-    ...(manifest.includeAudio && audioLabel ? ["-map", audioLabel] : []),
-    "-c:v",
-    preset.codec,
-    ...(manifest.includeAudio && audioLabel ? ["-c:a", "aac", "-b:a", "192k"] : []),
-    ...preset.args,
-    "-shortest",
-    "-pix_fmt",
-    "yuv420p",
-    mainOutputPath
-  );
-
-  const fps = project.video.fpsNum / project.video.fpsDen;
-  const durationSec = outputFrames / fps / manifest.speed;
-  await runFfmpeg(args, exportDir, onProgress, durationSec, "ffmpeg-main");
-
   const projectRoot = path.join(WORKSPACE_ROOT, project.id);
-  const finalPath = path.join(exportDir, "final.mp4");
+  const fps = project.video.fpsNum / project.video.fpsDen;
   let assembledFinalPath = mainOutputPath;
   let tailSlugStartSec: number | undefined;
   let assembledDurationSec = durationSec;
@@ -2182,6 +2596,444 @@ export async function renderFinal(
   } else {
     await fs.copyFile(assembledFinalPath, finalPath);
   }
+}
+
+function overlayIntersectsWindow(
+  overlay: Overlay,
+  window: PatchWindow,
+  fps: number,
+  speed: 1 | 2
+): boolean {
+  const timing = computeOverlayTiming(overlay, fps, speed);
+  return timing.visEndSec > window.startSec && timing.visStartSec < window.endSec;
+}
+
+function shiftOverlayForWindow(overlay: Overlay, sourceStartFrame: number): Overlay {
+  const shiftFrame = (value: number | undefined) =>
+    typeof value === "number" ? value - sourceStartFrame : undefined;
+  const motion = overlay.motion
+    ? {
+        ...overlay.motion,
+        visibleStartFrame: shiftFrame(overlay.motion.visibleStartFrame),
+        visibleEndFrame: shiftFrame(overlay.motion.visibleEndFrame),
+      }
+    : undefined;
+  return {
+    ...overlay,
+    startFrame: overlay.startFrame - sourceStartFrame,
+    endFrame: overlay.endFrame - sourceStartFrame,
+    motion,
+  };
+}
+
+async function renderPatchWindow(input: {
+  project: Project;
+  projectForRender: Project;
+  exportDir: string;
+  baseSourcePath: string;
+  window: PatchWindow;
+  windowIndex: number;
+  speed: 1 | 2;
+  renderTuning: RenderTuning;
+  onProgress?: (update: RenderProgress) => void;
+}): Promise<string> {
+  const {
+    project,
+    projectForRender,
+    exportDir,
+    baseSourcePath,
+    window,
+    windowIndex,
+    speed,
+    renderTuning,
+    onProgress,
+  } = input;
+  const fps = projectForRender.video.fpsNum / projectForRender.video.fpsDen;
+  const projectRoot = path.join(WORKSPACE_ROOT, project.id);
+  const patchDir = path.join(exportDir, "patch_windows");
+  await ensureDir(patchDir);
+  const outputPath = path.join(patchDir, `${String(windowIndex).padStart(3, "0")}.mp4`);
+  const windowDurationSec = window.endSec - window.startSec;
+  const sourceStartSec = window.startSec * speed;
+  const sourceDurationSec = windowDurationSec * speed;
+  const sourceStartFrame = sourceStartSec * fps;
+
+  const activeOverlays = sortOverlays(
+    projectForRender.overlays.filter((overlay) =>
+      overlayIntersectsWindow(overlay, window, fps, speed)
+    )
+  );
+  const shiftedOverlays = activeOverlays.map((overlay) =>
+    shiftOverlayForWindow(overlay, sourceStartFrame)
+  );
+  const shiftedProject: Project = {
+    ...projectForRender,
+    overlays: shiftedOverlays,
+  };
+  const preLines = [
+    `[0:v]trim=start=${formatNumber(sourceStartSec)}:duration=${formatNumber(
+      sourceDurationSec
+    )},setpts=PTS-STARTPTS[base]`,
+  ];
+  const filter = buildFilterScript(
+    shiftedProject,
+    shiftedOverlays,
+    speed,
+    "[base]",
+    preLines,
+    0,
+    {
+      outputFps: renderTuning.outputFps,
+      outputWidth: renderTuning.outputWidth,
+      outputHeight: renderTuning.outputHeight,
+      maxDurationSec: windowDurationSec,
+    }
+  );
+  const scriptPath = path.join(patchDir, `${String(windowIndex).padStart(3, "0")}.txt`);
+  await fs.writeFile(scriptPath, filter.script, "utf-8");
+
+  const overlayInputs = activeOverlays.map((overlay) =>
+    path.join(
+      projectRoot,
+      "render",
+      isArrowOverlay(overlay) ? "arrows" : "overlays",
+      `${overlay.id}.png`
+    )
+  );
+  const missingInputs: string[] = [];
+  for (const inputPath of overlayInputs) {
+    if (!(await fileExists(inputPath))) missingInputs.push(inputPath);
+  }
+  if (missingInputs.length) {
+    throw new Error(`Missing overlay assets: ${missingInputs.join(", ")}`);
+  }
+
+  const preset = EXPORT_PRESETS[renderTuning.presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
+  const args = ["-y", "-i", baseSourcePath];
+  for (const inputPath of overlayInputs) {
+    args.push("-loop", "1", "-framerate", STATIC_OVERLAY_INPUT_FPS, "-i", inputPath);
+  }
+  args.push(
+    "-filter_complex_script",
+    scriptPath,
+    "-map",
+    filter.outputLabel,
+    "-c:v",
+    preset.codec,
+    ...preset.args,
+    "-pix_fmt",
+    "yuv420p",
+    outputPath
+  );
+
+  onProgress?.({
+    stage: "patch-window",
+    message: `Rendering patch window ${windowIndex + 1}`,
+    percent: 0,
+  });
+  await runFfmpeg(args, exportDir, onProgress, windowDurationSec, "ffmpeg-patch");
+  return outputPath;
+}
+
+async function stitchPatchWindows(input: {
+  exportDir: string;
+  baseMainPath: string;
+  patchPaths: string[];
+  windows: PatchWindow[];
+  mainOutputPath: string;
+  durationSec: number;
+  presetId: string;
+  includeAudio: boolean;
+  onProgress?: (update: RenderProgress) => void;
+}): Promise<void> {
+  const {
+    exportDir,
+    baseMainPath,
+    patchPaths,
+    windows,
+    mainOutputPath,
+    durationSec,
+    presetId,
+    includeAudio,
+    onProgress,
+  } = input;
+  const preset = EXPORT_PRESETS[presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
+  const stitchedVideoPath = path.join(exportDir, "main_noslug_patched_video.mp4");
+  const parts: Array<{ kind: "base"; startSec: number; endSec: number } | { kind: "patch"; index: number }> = [];
+  let cursor = 0;
+  for (const [index, window] of windows.entries()) {
+    if (window.startSec > cursor + 0.001) {
+      parts.push({ kind: "base", startSec: cursor, endSec: window.startSec });
+    }
+    parts.push({ kind: "patch", index });
+    cursor = window.endSec;
+  }
+  if (cursor < durationSec - 0.001) {
+    parts.push({ kind: "base", startSec: cursor, endSec: durationSec });
+  }
+  if (!parts.length) {
+    throw new Error("No patch windows were available to stitch.");
+  }
+
+  const filterLines: string[] = [];
+  const labels: string[] = [];
+  parts.forEach((part, index) => {
+    const label = `[sv${index}]`;
+    labels.push(label);
+    if (part.kind === "base") {
+      filterLines.push(
+        `[0:v]trim=start=${formatNumber(part.startSec)}:end=${formatNumber(
+          part.endSec
+        )},setpts=PTS-STARTPTS${label}`
+      );
+      return;
+    }
+    filterLines.push(`[${part.index + 1}:v]setpts=PTS-STARTPTS${label}`);
+  });
+
+  if (labels.length === 1) {
+    filterLines.push(`${labels[0]}copy[v]`);
+  } else {
+    filterLines.push(`${labels.join("")}concat=n=${labels.length}:v=1:a=0[v]`);
+  }
+
+  onProgress?.({ stage: "stitch", message: "Stitching patch windows", percent: 0 });
+  await runFfmpeg(
+    [
+      "-y",
+      "-i",
+      baseMainPath,
+      ...patchPaths.flatMap((patchPath) => ["-i", patchPath]),
+      "-filter_complex",
+      filterLines.join(";"),
+      "-map",
+      "[v]",
+      "-c:v",
+      preset.codec,
+      ...preset.args,
+      "-pix_fmt",
+      "yuv420p",
+      stitchedVideoPath,
+    ],
+    exportDir,
+    onProgress,
+    durationSec,
+    "ffmpeg-stitch"
+  );
+
+  const baseInfo = await probeVideo(baseMainPath);
+  if (includeAudio && baseInfo.audio?.hasAudio) {
+    await runFfmpeg(
+      [
+        "-y",
+        "-i",
+        stitchedVideoPath,
+        "-i",
+        baseMainPath,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        mainOutputPath,
+      ],
+      exportDir,
+      onProgress,
+      durationSec,
+      "ffmpeg-stitch-audio"
+    );
+    return;
+  }
+
+  await fs.copyFile(stitchedVideoPath, mainOutputPath);
+}
+
+export async function renderSurgicalPatch(
+  project: Project,
+  options: ExportRequest = {},
+  onProgress?: (update: RenderProgress) => void
+): Promise<{
+  exportDir: string;
+  exportId: string;
+  finalPath: string;
+  manifest: ExportManifest;
+}> {
+  const analysis = await buildSurgicalPatchAnalysis(project, options);
+  if (!analysis.patchable || !analysis.latest || !analysis.projectForRender || !analysis.renderTuning) {
+    throw new Error(analysis.reason ?? "Latest final export is not patchable.");
+  }
+
+  onProgress?.({ stage: "assets", message: "Rendering overlay assets", percent: 0 });
+  await renderProjectAssets(analysis.projectForRender);
+
+  const { exportDir, exportId, manifest, outputFrames, projectForRender, renderTuning } =
+    await writeExportBundle(project, options);
+  manifest.source = analysis.latest.manifest.source;
+  manifest.timelineSource = analysis.latest.manifest.timelineSource;
+  manifest.timelineAssetInputs = analysis.latest.manifest.timelineAssetInputs;
+  manifest.patch = {
+    baseExportId: analysis.latest.exportId,
+    changedOverlayIds: analysis.changedOverlayIds,
+    affectedWindows: analysis.affectedWindows,
+  };
+
+  const baseMainPath = resolveLatestMainOutput(analysis.latest);
+  const mainOutputPath = manifest.mainOutput
+    ? path.isAbsolute(manifest.mainOutput)
+      ? manifest.mainOutput
+      : path.join(exportDir, manifest.mainOutput)
+    : path.join(exportDir, "main_noslug_patched.mp4");
+  manifest.mainOutput = mainOutputPath;
+
+  const patchPaths: string[] = [];
+  for (const [index, window] of analysis.affectedWindows.entries()) {
+    patchPaths.push(
+      await renderPatchWindow({
+        project,
+        projectForRender,
+        exportDir,
+        baseSourcePath: analysis.latest.manifest.source,
+        window,
+        windowIndex: index,
+        speed: analysis.speed ?? manifest.speed,
+        renderTuning,
+        onProgress,
+      })
+    );
+  }
+
+  const fps = projectForRender.video.fpsNum / projectForRender.video.fpsDen;
+  const durationSec = outputFrames / fps / manifest.speed;
+  await stitchPatchWindows({
+    exportDir,
+    baseMainPath,
+    patchPaths,
+    windows: analysis.affectedWindows,
+    mainOutputPath,
+    durationSec,
+    presetId: manifest.presetId,
+    includeAudio: manifest.includeAudio,
+    onProgress,
+  });
+
+  const finalPath = path.join(exportDir, "final.mp4");
+  await assembleFinalOutput(
+    project,
+    projectForRender,
+    renderTuning,
+    exportDir,
+    mainOutputPath,
+    finalPath,
+    manifest,
+    durationSec,
+    onProgress
+  );
+
+  await fs.writeFile(
+    path.join(exportDir, "manifest.json"),
+    JSON.stringify(manifest, null, 2),
+    "utf-8"
+  );
+
+  onProgress?.({ stage: "done", message: "Patch render complete", percent: 1 });
+  return { exportDir, exportId, finalPath, manifest };
+}
+
+export async function renderFinal(
+  project: Project,
+  options: ExportRequest = {},
+  onProgress?: (update: RenderProgress) => void
+): Promise<{
+  exportDir: string;
+  exportId: string;
+  finalPath: string;
+  manifest: ExportManifest;
+}> {
+  const { exportDir, exportId, manifest, outputFrames, projectForRender, renderTuning } =
+    await writeExportBundle(project, options);
+
+  if (manifest.timelineSource) {
+    onProgress?.({ stage: "timeline", message: "Rendering flattened source timeline" });
+    await renderFlattenedSourceTimeline(
+      project,
+      exportDir,
+      manifest.source,
+      manifest.includeAudio,
+      onProgress
+    );
+  }
+
+  onProgress?.({ stage: "assets", message: "Rendering overlay assets" });
+  await renderProjectAssets(projectForRender);
+  const preset = EXPORT_PRESETS[manifest.presetId] ?? EXPORT_PRESETS[DEFAULT_PRESET_ID];
+
+  const missingInputs = [];
+  for (const input of [...manifest.timelineInputs, ...manifest.overlayInputs, ...manifest.arrowInputs]) {
+    if (!(await fileExists(input))) {
+      missingInputs.push(input);
+    }
+  }
+  if (missingInputs.length) {
+    throw new Error(`Missing overlay assets: ${missingInputs.join(", ")}`);
+  }
+
+  const hasArrows = manifest.arrowInputs.length > 0;
+  const filterScript = hasArrows ? manifest.filterCardsArrows : manifest.filterCards;
+  const outputLabel = hasArrows ? manifest.outputLabelCardsArrows : manifest.outputLabelCards;
+  const audioLabel = hasArrows
+    ? manifest.outputLabelCardsArrowsAudio
+    : manifest.outputLabelCardsAudio;
+  const mainOutputName = hasArrows ? "main_noslug_arrows.mp4" : "main_noslug.mp4";
+  const mainOutputPath = path.join(exportDir, mainOutputName);
+
+  const args = ["-y", "-i", manifest.source];
+  for (const input of manifest.timelineInputs) {
+    args.push("-i", input);
+  }
+  for (const input of manifest.overlayInputs) {
+    args.push("-loop", "1", "-framerate", STATIC_OVERLAY_INPUT_FPS, "-i", input);
+  }
+  for (const input of manifest.arrowInputs) {
+    args.push("-loop", "1", "-framerate", STATIC_OVERLAY_INPUT_FPS, "-i", input);
+  }
+  args.push(
+    "-filter_complex_script",
+    filterScript,
+    "-map",
+    outputLabel,
+    ...(manifest.includeAudio && audioLabel ? ["-map", audioLabel] : []),
+    "-c:v",
+    preset.codec,
+    ...(manifest.includeAudio && audioLabel ? ["-c:a", "aac", "-b:a", "192k"] : []),
+    ...preset.args,
+    "-shortest",
+    "-pix_fmt",
+    "yuv420p",
+    mainOutputPath
+  );
+
+  const fps = project.video.fpsNum / project.video.fpsDen;
+  const durationSec = outputFrames / fps / manifest.speed;
+  await runFfmpeg(args, exportDir, onProgress, durationSec, "ffmpeg-main");
+
+  const finalPath = path.join(exportDir, "final.mp4");
+  await assembleFinalOutput(
+    project,
+    projectForRender,
+    renderTuning,
+    exportDir,
+    mainOutputPath,
+    finalPath,
+    manifest,
+    durationSec,
+    onProgress
+  );
 
   await fs.writeFile(
     path.join(exportDir, "manifest.json"),
