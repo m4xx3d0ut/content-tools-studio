@@ -1,9 +1,12 @@
+export type ExportCapability = "nvenc";
+
 export type ExportPreset = {
   id: string;
   label: string;
   codec: string;
   args: string[];
   hardware?: boolean;
+  requiresCapability?: ExportCapability;
 };
 
 export const EXPORT_PRESETS: Record<string, ExportPreset> = {
@@ -37,6 +40,7 @@ export const EXPORT_PRESETS: Record<string, ExportPreset> = {
     codec: "h264_nvenc",
     args: ["-preset", "p5", "-cq", "20"],
     hardware: true,
+    requiresCapability: "nvenc",
   },
 };
 

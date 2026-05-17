@@ -348,6 +348,30 @@ export type ExportOptions = {
   renderMode?: "final" | "rough";
 };
 
+export type RenderCapability = "nvenc";
+
+export type RenderCapabilityStatus = {
+  available: boolean;
+  reason?: string;
+};
+
+export type RenderPresetStatus = {
+  id: string;
+  label: string;
+  codec: string;
+  hardware: boolean;
+  requiresCapability?: RenderCapability;
+  available: boolean;
+  reason?: string;
+};
+
+export type RenderCapabilities = {
+  checkedAt: string;
+  ffmpegPath: string;
+  capabilities: Record<RenderCapability, RenderCapabilityStatus>;
+  presets: RenderPresetStatus[];
+};
+
 export type SurgicalPatchStatus = {
   patchable: boolean;
   reason?: string;
@@ -356,6 +380,13 @@ export type SurgicalPatchStatus = {
   affectedWindows: Array<{ startSec: number; endSec: number }>;
   estimatedPatchSec?: number;
 };
+
+export async function getRenderCapabilities(options: { refresh?: boolean } = {}) {
+  const params = new URLSearchParams();
+  if (options.refresh) params.set("refresh", "true");
+  const query = params.toString();
+  return request<RenderCapabilities>(`/render/capabilities${query ? `?${query}` : ""}`);
+}
 
 export async function exportProject(projectId: string, options: ExportOptions) {
   return request(`/projects/${projectId}/export`, {

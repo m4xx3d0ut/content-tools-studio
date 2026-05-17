@@ -9,6 +9,10 @@ import { ensureDir, fileExists } from "../utils/fs.js";
 import { renderProjectAssets } from "./renderer.js";
 import { probeVideo } from "./ffprobe.js";
 import { getTemplateById } from "./templates.js";
+import {
+  assertRenderPresetAvailable,
+  RenderPresetUnavailableError,
+} from "./render-capabilities.js";
 
 type RenderMode = "final" | "rough";
 
@@ -2096,6 +2100,19 @@ async function buildSurgicalPatchAnalysis(
 
   const timelinePlan = buildTimelinePlan(project);
   const renderTuning = resolveRenderTuning(project, options);
+  try {
+    await assertRenderPresetAvailable(renderTuning.presetId);
+  } catch (error) {
+    if (error instanceof RenderPresetUnavailableError) {
+      return {
+        patchable: false,
+        reason: error.message,
+        changedOverlayIds: [],
+        affectedWindows: [],
+      };
+    }
+    throw error;
+  }
   const requestedSpeed = options.speed ?? project.exportOptions?.speed ?? 1;
   const speed = timelinePlan.usesSourceSegments ? 1 : requestedSpeed;
   const hasAudio = Boolean(project.video.audio?.hasAudio);
@@ -2183,6 +2200,7 @@ export async function writeExportBundle(
 }> {
   const timelinePlan = buildTimelinePlan(project);
   const renderTuning = resolveRenderTuning(project, options);
+  await assertRenderPresetAvailable(renderTuning.presetId);
   const projectForRender =
     renderTuning.mode === "rough"
       ? scaleProjectForRender(timelinePlan.project, renderTuning)
@@ -2868,6 +2886,7 @@ export async function renderSurgicalPatch(
   if (!analysis.patchable || !analysis.latest || !analysis.projectForRender || !analysis.renderTuning) {
     throw new Error(analysis.reason ?? "Latest final export is not patchable.");
   }
+  await assertRenderPresetAvailable(analysis.renderTuning.presetId);
 
   onProgress?.({ stage: "assets", message: "Rendering overlay assets", percent: 0 });
   await renderProjectAssets(analysis.projectForRender);

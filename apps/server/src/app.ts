@@ -10,6 +10,7 @@ import { slugsRoutes } from "./routes/slugs.js";
 import { templatesRoutes } from "./routes/templates.js";
 import { ensureSlugLibrary } from "./services/slugs.js";
 import { ensureWorkspaceRoot } from "./services/workspace.js";
+import { getRenderCapabilities } from "./services/render-capabilities.js";
 
 export async function buildApp() {
   const app = Fastify({ logger: true });
@@ -59,6 +60,24 @@ export async function buildApp() {
       },
     }),
     async () => ({ ok: true, at: new Date().toISOString() })
+  );
+
+  app.get(
+    "/render/capabilities",
+    routeDoc(["Rendering"], "Report render preset and hardware encoder availability", {
+      querystring: {
+        type: "object",
+        properties: {
+          refresh: { type: "string" },
+        },
+      },
+      response: { 200: { type: "object", additionalProperties: true } },
+    }),
+    async (request) => {
+      const query = request.query as { refresh?: string };
+      const refresh = query.refresh === "true" || query.refresh === "1";
+      return getRenderCapabilities({ refresh });
+    }
   );
 
   await app.register(projectsRoutes, { prefix: "/projects" });

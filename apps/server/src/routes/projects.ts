@@ -36,6 +36,7 @@ import {
   writeExportBundle,
   type RenderProgress,
 } from "../services/exporter.js";
+import { RenderPresetUnavailableError } from "../services/render-capabilities.js";
 import { FFMPEG_PATH, UPLOAD_MAX_BYTES, WORKSPACE_ROOT } from "../config.js";
 import { ensureDir, fileExists } from "../utils/fs.js";
 import { ensureThumbnail } from "../services/thumbnails.js";
@@ -137,6 +138,17 @@ type RenderOptionsQuery = {
   speed?: string;
   renderMode?: string;
 };
+
+function sendRenderError(reply: FastifyReply, error: unknown) {
+  if (error instanceof RenderPresetUnavailableError) {
+    return reply.code(error.statusCode).send({
+      error: error.message,
+      presetId: error.presetId,
+      capability: error.capability,
+    });
+  }
+  return reply.code(500).send({ error: (error as Error).message });
+}
 
 function parseRenderOptionsQuery(query: RenderOptionsQuery): {
   presetId?: string;
@@ -1449,7 +1461,12 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       speed?: 1 | 2;
       renderMode?: "final" | "rough";
     };
-    const result = await writeExportBundle(project, body ?? {});
+    let result: Awaited<ReturnType<typeof writeExportBundle>>;
+    try {
+      result = await writeExportBundle(project, body ?? {});
+    } catch (error) {
+      return sendRenderError(reply, error);
+    }
 
     const now = new Date().toISOString();
     const hasAudio = Boolean(project.video.audio?.hasAudio);
@@ -1565,7 +1582,7 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
         manifest: result.manifest,
       };
     } catch (error) {
-      return reply.code(500).send({ error: (error as Error).message });
+      return sendRenderError(reply, error);
     }
   });
 

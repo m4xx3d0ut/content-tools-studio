@@ -20,6 +20,7 @@ import {
   exportLatestUrl,
   getPatchStatus,
   getProject,
+  getRenderCapabilities,
   importAudioAssetFromUrl,
   importProjectBundle,
   importSlugVideo,
@@ -45,6 +46,8 @@ import {
   type Project,
   type ProjectBundleMode,
   type ProjectSummary,
+  type RenderCapabilities,
+  type RenderCapability,
   type SlugAsset,
   type SourceSegment,
   type SurgicalPatchStatus,
@@ -56,9 +59,14 @@ const DEFAULT_ARROW_SIZE = { w: 128, h: 128 };
 
 const DEFAULT_PRESET_ID = "balanced";
 const DEFAULT_CROSSFADE_FRAMES = 12;
-const RENDER_PRESET_OPTIONS = [
+const RENDER_PRESET_OPTIONS: Array<{
+  id: string;
+  label: string;
+  requiresCapability?: RenderCapability;
+}> = [
   { id: "balanced", label: "Balanced (CPU)" },
   { id: "quality", label: "High quality (CPU)" },
+  { id: "nvencP5Cq20", label: "NVENC P5 CQ20", requiresCapability: "nvenc" },
 ];
 const RENDER_MODE_OPTIONS = [
   { id: "final", label: "Final" },
@@ -531,6 +539,8 @@ export default function App() {
   const [renderActive, setRenderActive] = useState(false);
   const [renderReady, setRenderReady] = useState(false);
   const [renderFinalPath, setRenderFinalPath] = useState("");
+  const [renderCapabilities, setRenderCapabilities] = useState<RenderCapabilities | null>(null);
+  const [renderCapabilitiesError, setRenderCapabilitiesError] = useState<string | null>(null);
   const [patchStatus, setPatchStatus] = useState<SurgicalPatchStatus | null>(null);
   const [patchStatusLoading, setPatchStatusLoading] = useState(false);
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
@@ -614,6 +624,42 @@ export default function App() {
     durationFrames: 0,
   };
   const isRoughPreview = renderOptions.renderMode === "rough";
+  const presetStatusMap = useMemo(() => {
+    const entries = (renderCapabilities?.presets ?? []).map((preset) => [preset.id, preset] as const);
+    return Object.fromEntries(entries);
+  }, [renderCapabilities]);
+  const selectedPresetId = renderOptions.presetId ?? DEFAULT_PRESET_ID;
+  const selectedPresetStatus = presetStatusMap[selectedPresetId];
+  const selectedPresetOption = RENDER_PRESET_OPTIONS.find((preset) => preset.id === selectedPresetId);
+  const selectedPresetUnavailable =
+    !isRoughPreview &&
+    Boolean(
+      selectedPresetOption?.requiresCapability &&
+        (!selectedPresetStatus || !selectedPresetStatus.available)
+    );
+  const renderPresetOptions = useMemo(
+    () =>
+      RENDER_PRESET_OPTIONS.map((preset) => {
+        const status = presetStatusMap[preset.id];
+        const unavailable = Boolean(
+          preset.requiresCapability && (!status || !status.available)
+        );
+        return {
+          ...preset,
+          unavailable,
+          reason: status?.reason,
+          label: unavailable ? `${preset.label} (unavailable)` : preset.label,
+        };
+      }),
+    [presetStatusMap]
+  );
+  const hardwarePresetMessage = renderCapabilitiesError
+    ? `Hardware preset check failed: ${renderCapabilitiesError}`
+    : renderCapabilities?.capabilities.nvenc?.available
+      ? "NVENC available."
+      : renderCapabilities?.capabilities.nvenc?.reason
+        ? `NVENC unavailable: ${renderCapabilities.capabilities.nvenc.reason}`
+        : "Checking hardware presets...";
   const hasAudio = project?.video?.audio?.hasAudio ?? false;
   const edits = project?.edits ?? {
     trimStartFrames: 0,
@@ -696,7 +742,11 @@ export default function App() {
 
   const downloadUrl = selectedId ? exportLatestUrl(selectedId) : "";
   const canPatchLatestFinal =
-    Boolean(project) && !renderActive && !isRoughPreview && (isDirty || Boolean(patchStatus?.patchable));
+    Boolean(project) &&
+    !renderActive &&
+    !isRoughPreview &&
+    !selectedPresetUnavailable &&
+    (isDirty || Boolean(patchStatus?.patchable));
   const patchStatusMessage = isRoughPreview
     ? "Patch latest final is unavailable in rough preview mode."
     : isDirty
@@ -760,6 +810,34 @@ export default function App() {
     const timer = window.setTimeout(() => setToast(null), 4500);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getRenderCapabilities()
+      .then((capabilities) => {
+        if (cancelled) return;
+        setRenderCapabilities(capabilities);
+        setRenderCapabilitiesError(null);
+      })
+      .catch((error) => {
+        if (!cancelled) setRenderCapabilitiesError((error as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!renderCapabilities || isRoughPreview) return;
+    const current = renderCapabilities.presets.find((preset) => preset.id === selectedPresetId);
+    if (!current || current.available) return;
+    setRenderOptions((prev) =>
+      (prev.presetId ?? DEFAULT_PRESET_ID) === selectedPresetId
+        ? { ...prev, presetId: DEFAULT_PRESET_ID }
+        : prev
+    );
+    setStatus(`${current.label} unavailable; using Balanced (CPU).`);
+  }, [renderCapabilities, isRoughPreview, selectedPresetId]);
 
   useEffect(() => {
     try {
@@ -2489,7 +2567,7 @@ export default function App() {
                   : "Final renders live in workspace exports folder."}
               </div>
               <div className="actions">
-                <button onClick={handleRenderFinal} disabled={!project}>
+                <button onClick={handleRenderFinal} disabled={!project || selectedPresetUnavailable}>
                   {isRoughPreview ? "Render preview" : "Render final"}
                 </button>
                 {!isRoughPreview && (
@@ -3154,7 +3232,7 @@ export default function App() {
             <button className="secondary" onClick={handleSaveProject} disabled={!project}>
               Save
             </button>
-            <button onClick={handleRenderFinal} disabled={!project}>
+            <button onClick={handleRenderFinal} disabled={!project || selectedPresetUnavailable}>
               {isRoughPreview ? "Render preview" : "Render final"}
             </button>
             {!isRoughPreview && (
@@ -3262,12 +3340,13 @@ export default function App() {
                 }
               }}
             >
-              {RENDER_PRESET_OPTIONS.map((preset) => (
-                <option key={preset.id} value={preset.id}>
+              {renderPresetOptions.map((preset) => (
+                <option key={preset.id} value={preset.id} disabled={preset.unavailable}>
                   {preset.label}
                 </option>
               ))}
             </select>
+            {!isRoughPreview && <div className="details">{hardwarePresetMessage}</div>}
           </div>
           <div className="render-setting">
             <label htmlFor="speed">Speed</label>
