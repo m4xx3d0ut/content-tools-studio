@@ -122,6 +122,7 @@ const server = createServer((req, res) => {
     pathname === "/openapi.json" ||
     pathname.startsWith("/docs") ||
     pathname.startsWith("/automation") ||
+    pathname.startsWith("/render") ||
     pathname.startsWith("/projects") ||
     pathname.startsWith("/slugs") ||
     pathname.startsWith("/templates")

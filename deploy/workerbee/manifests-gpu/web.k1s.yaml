@@ -1,0 +1,47 @@
+apiVersion: ae.dev/v1alpha1
+kind: Deployment
+metadata:
+  name: web
+  namespace: content-tools-studio-dev-6b01ab0b06
+  labels:
+    workerbee.k1s.dev/project: content-tools-studio-dev-6b01ab0b06
+spec:
+  # Opt-in GPU variant for WorkerBee/k1s hosts with a working NVIDIA runtime.
+  # Build the image with:
+  # workerbee_v1_image_build tag=content-tools-studio:workerbee
+  image: content-tools-studio:workerbee
+  imagePullPolicy: Never
+  replicas: 1
+  runtimeClassName: nvidia
+  nodeSelector:
+    gpu.present: "true"
+  env:
+    - name: WORKERBEE_DEPLOY_REV
+      value: render-gpu-v3
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: all
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: compute,utility,video
+  ports:
+    - name: http
+      containerPort: 8080
+  service:
+    port: 8080
+    targetPort: 8080
+  health:
+    readiness:
+      httpGet: { path: /healthz, port: 8080 }
+      initialDelaySeconds: 1
+      periodSeconds: 2
+  resources:
+    requests:
+      cpu: 0.5
+      memory: 1Gi
+      nvidia.com/gpu: 1
+    limits:
+      cpu: 2
+      memory: 8Gi
+      nvidia.com/gpu: 1
+  ingress:
+    host: app.content-tools-studio-dev-6b01ab0b06.workerbee.localhost
+    path: /

@@ -148,6 +148,14 @@ codex mcp add workerbee --url http://127.0.0.1:8765/mcp
 
 Then ask the agent to bring the stack up in WorkerBee. The app should be validated through the WorkerBee HTTPS URL and the OpenAPI document at `/openapi.json`.
 
+#### WorkerBee GPU/NVENC
+
+The default WorkerBee manifest stays CPU-only. For NVIDIA hosts, use the opt-in GPU manifest in `deploy/workerbee/manifests-gpu/`. It requests exactly one GPU with `runtimeClassName: nvidia`, matching `nvidia.com/gpu` requests/limits, and `nodeSelector: gpu.present=true`.
+
+Before using the GPU manifest, the host/container runtime should make `nvidia-smi`, `/dev/nvidia*`, `nvidia-container-runtime`, and the NVIDIA encode libraries visible to the workload. The GPU manifest sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video` so `libnvidia-encode.so.1` is injected for NVENC. The app exposes `GET /render/capabilities`; NVENC is considered available only when FFmpeg both lists `h264_nvenc` and completes a tiny real encode probe. If the probe fails, the UI disables the NVENC preset and the API rejects hardware renders with a clear error.
+
+For core-proxy edge deployments, run this app on the GPU-capable edge node and expose it through the normal ingress/core-proxy path. Keep rendering physically on the edge node; core-proxy should only transport UI/API/SSE/download traffic.
+
 ### Podman on macOS
 
 Podman works through a Linux VM on macOS, so give the machine enough resources for FFmpeg renders and image builds before deploying through WorkerBee.
