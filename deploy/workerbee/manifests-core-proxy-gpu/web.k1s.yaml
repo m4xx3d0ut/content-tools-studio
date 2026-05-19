@@ -1,0 +1,50 @@
+apiVersion: ae.dev/v1alpha1
+kind: Deployment
+metadata:
+  name: web
+  namespace: content-tools-studio-gpu-dev
+  labels:
+    workerbee.k1s.dev/project: content-tools-studio-gpu-dev
+    workerbee.k1s.dev/deploy-target: remote-core-proxy-gpu
+spec:
+  # Remote k1s GPU variant for the MicroK8s dev cluster.
+  # Build and push this image before staging/deploying:
+  # docker build -t reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu .
+  # docker push reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu
+  image: reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu
+  imagePullPolicy: IfNotPresent
+  replicas: 1
+  runtimeClassName: nvidia
+  nodeSelector:
+    site: host-b
+    gpu.present: "true"
+  env:
+    - name: WORKERBEE_DEPLOY_REV
+      value: remote-core-proxy-gpu-43cb3ea
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: all
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: compute,utility,video
+  ports:
+    - name: http
+      containerPort: 8080
+  service:
+    port: 8080
+    targetPort: 8080
+  health:
+    readiness:
+      httpGet: { path: /healthz, port: 8080 }
+      initialDelaySeconds: 1
+      periodSeconds: 2
+  resources:
+    requests:
+      cpu: 0.5
+      memory: 1Gi
+      nvidia.com/gpu: 1
+    limits:
+      cpu: 2
+      memory: 8Gi
+      nvidia.com/gpu: 1
+  ingress:
+    host: content-tools-studio.apps.k1s-dev-a.core.home.arpa
+    path: /

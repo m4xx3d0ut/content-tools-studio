@@ -156,6 +156,25 @@ Before using the GPU manifest, the host/container runtime should make `nvidia-sm
 
 For core-proxy edge deployments, run this app on the GPU-capable edge node and expose it through the normal ingress/core-proxy path. Keep rendering physically on the edge node; core-proxy should only transport UI/API/SSE/download traffic.
 
+#### MicroK8s remote k1s GPU test
+
+Use `deploy/workerbee/manifests-core-proxy-gpu/` to test WorkerBee remote deploy against the `k1s-dev-a` MicroK8s dev cluster. The manifest pins the app to k1s site `host-b`, requests one NVIDIA GPU with `runtimeClassName: nvidia`, and exposes the app through `content-tools-studio.apps.k1s-dev-a.core.home.arpa`.
+
+Before deploying, build and push the registry image referenced by the manifest:
+
+```bash
+docker build -t reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu .
+docker push reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu
+```
+
+Then stage the manifest with WorkerBee, validate it, and deploy the returned stage with `workerbee_v1_manifest_deploy_remote_k1s`. The remote deploy tool needs the controller apply API on port `9108`, not the externally exposed node/agent API on `9110`; for this dev cluster, port-forward the controller API and use the forwarded URL:
+
+```bash
+kubectl -n k1s-dev-a port-forward --address 127.0.0.1 pod/<controller-pod> 19118:9108
+```
+
+Use `server=http://127.0.0.1:19118`, namespace `content-tools-studio-gpu-dev`, and the `apishim-admin-token` from the `k1s-dev-a-k1s-core-ha-auth` secret. The controller must have mutations enabled with `AE_API_MUTATIONS=1` and an `AE_API_ADMIN_TOKEN` matching that token. Validate the route through the core ingress and refresh `/render/capabilities` to confirm NVENC.
+
 ### Podman on macOS
 
 Podman works through a Linux VM on macOS, so give the machine enough resources for FFmpeg renders and image builds before deploying through WorkerBee.
