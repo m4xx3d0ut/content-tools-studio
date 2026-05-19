@@ -47,3 +47,4 @@ yarn-debug.log*
 yarn-error.log*
 .codex/
 .local/
+state/
