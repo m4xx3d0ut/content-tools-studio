@@ -154,6 +154,14 @@ The default WorkerBee manifest stays CPU-only. For NVIDIA hosts, use the opt-in 
 
 Before using the GPU manifest, the host/container runtime should make `nvidia-smi`, `/dev/nvidia*`, `nvidia-container-runtime`, and the NVIDIA encode libraries visible to the workload. The GPU manifest sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video` so `libnvidia-encode.so.1` is injected for NVENC. The app exposes `GET /render/capabilities`; NVENC is considered available only when FFmpeg both lists `h264_nvenc` and completes a tiny real encode probe. If the probe fails, the UI disables the NVENC preset and the API rejects hardware renders with a clear error.
 
+To seed a repeatable manual smoke project, run:
+
+```bash
+npm run seed:nvenc-smoke
+```
+
+The script creates or replaces `workspace/nvenc-smoke` with a generated 720p MP4, overlay/card assets to render, and `lastExportPresetId=nvencP5Cq20`. In the WorkerBee container it writes to `WORKSPACE_ROOT`, so the same script can be run with `node /app/scripts/seed-nvenc-smoke-project.mjs` after the app is deployed. Open the app, select **NVENC smoke test**, confirm **NVENC P5 CQ20** is available, and run a final render.
+
 For core-proxy edge deployments, run this app on the GPU-capable edge node and expose it through the normal ingress/core-proxy path. Keep rendering physically on the edge node; core-proxy should only transport UI/API/SSE/download traffic.
 
 #### MicroK8s remote k1s GPU test
@@ -163,8 +171,8 @@ Use `deploy/workerbee/manifests-core-proxy-gpu/` to test WorkerBee remote deploy
 Before deploying, build and push the registry image referenced by the manifest:
 
 ```bash
-docker build -t reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu .
-docker push reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu
+docker build -t reg.microk8s.core.home.arpa:32000/content-tools-studio:nvenc-smoke .
+docker push reg.microk8s.core.home.arpa:32000/content-tools-studio:nvenc-smoke
 ```
 
 Then stage the manifest with WorkerBee, validate it, and deploy the returned stage with `workerbee_v1_manifest_deploy_remote_k1s`. The remote deploy tool needs the controller apply API on port `9108`, not the externally exposed node/agent API on `9110`; for this dev cluster, port-forward the controller API and use the forwarded URL:

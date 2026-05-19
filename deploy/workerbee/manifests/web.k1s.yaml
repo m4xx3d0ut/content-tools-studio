@@ -13,7 +13,9 @@ spec:
   replicas: 1
   env:
     - name: WORKERBEE_DEPLOY_REV
-      value: render-memory-v1
+      value: render-memory-nvenc-smoke-v1
+    - name: WORKSPACE_ROOT
+      value: /data/workspace
   ports:
     - name: http
       containerPort: 8080
@@ -32,6 +34,11 @@ spec:
     limits:
       cpu: 2
       memory: 8Gi
+  storage:
+    - name: workspace
+      mountPath: /data/workspace
+      retention: Retain
+      size: 20Gi
   ingress:
     host: app.content-tools-studio-dev-6b01ab0b06.workerbee.localhost
     path: /

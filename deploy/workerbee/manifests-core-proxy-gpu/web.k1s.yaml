@@ -9,10 +9,10 @@ metadata:
 spec:
   # Remote k1s GPU variant for the MicroK8s dev cluster.
   # Build and push this image before staging/deploying:
-  # docker build -t reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu .
-  # docker push reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu
-  image: reg.microk8s.core.home.arpa:32000/content-tools-studio:43cb3ea-core-proxy-gpu
-  imagePullPolicy: IfNotPresent
+  # docker build -t reg.microk8s.core.home.arpa:32000/content-tools-studio:nvenc-smoke .
+  # docker push reg.microk8s.core.home.arpa:32000/content-tools-studio:nvenc-smoke
+  image: reg.microk8s.core.home.arpa:32000/content-tools-studio:nvenc-smoke
+  imagePullPolicy: Always
   replicas: 1
   runtimeClassName: nvidia
   nodeSelector:
@@ -20,7 +20,9 @@ spec:
     gpu.present: "true"
   env:
     - name: WORKERBEE_DEPLOY_REV
-      value: remote-core-proxy-gpu-43cb3ea
+      value: remote-core-proxy-gpu-nvenc-smoke-v1
+    - name: WORKSPACE_ROOT
+      value: /data/workspace
     - name: NVIDIA_VISIBLE_DEVICES
       value: all
     - name: NVIDIA_DRIVER_CAPABILITIES
@@ -45,6 +47,11 @@ spec:
       cpu: 2
       memory: 8Gi
       nvidia.com/gpu: 1
+  storage:
+    - name: workspace
+      mountPath: /data/workspace
+      retention: Retain
+      size: 20Gi
   ingress:
     host: content-tools-studio.apps.k1s-dev-a.core.home.arpa
     path: /

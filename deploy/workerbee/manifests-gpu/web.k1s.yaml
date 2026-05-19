@@ -17,7 +17,9 @@ spec:
     gpu.present: "true"
   env:
     - name: WORKERBEE_DEPLOY_REV
-      value: render-gpu-v3
+      value: render-gpu-nvenc-smoke-v1
+    - name: WORKSPACE_ROOT
+      value: /data/workspace
     - name: NVIDIA_VISIBLE_DEVICES
       value: all
     - name: NVIDIA_DRIVER_CAPABILITIES
@@ -42,6 +44,11 @@ spec:
       cpu: 2
       memory: 8Gi
       nvidia.com/gpu: 1
+  storage:
+    - name: workspace
+      mountPath: /data/workspace
+      retention: Retain
+      size: 20Gi
   ingress:
     host: app.content-tools-studio-dev-6b01ab0b06.workerbee.localhost
     path: /
