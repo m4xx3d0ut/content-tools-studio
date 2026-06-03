@@ -6,6 +6,7 @@ import swaggerUi from "@fastify/swagger-ui";
 import { UPLOAD_MAX_BYTES } from "./config.js";
 import { openApiDocument, openApiSchemas, routeDoc } from "./openapi.js";
 import { projectsRoutes } from "./routes/projects.js";
+import { rawformRoutes } from "./routes/rawform.js";
 import { slugsRoutes } from "./routes/slugs.js";
 import { templatesRoutes } from "./routes/templates.js";
 import { ensureSlugLibrary } from "./services/slugs.js";
@@ -81,6 +82,7 @@ export async function buildApp() {
   );
 
   await app.register(projectsRoutes, { prefix: "/projects" });
+  await app.register(rawformRoutes, { prefix: "/rawform" });
   await app.register(slugsRoutes, { prefix: "/slugs" });
   await app.register(templatesRoutes, { prefix: "/templates" });
 

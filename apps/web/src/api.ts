@@ -48,7 +48,7 @@ export type ProjectSummary = {
   name: string;
   createdAt: string;
   updatedAt: string;
-  source: { filename: string };
+  source: { filename: string; rawFormSessionId?: string };
   video: {
     width: number;
     height: number;
@@ -56,6 +56,53 @@ export type ProjectSummary = {
     fpsDen: number;
     audio: { hasAudio: boolean; sampleRate?: number; channels?: number };
   };
+};
+
+export type RawFormEditType = "unsigned" | "commentator" | "signed";
+
+export type RawFormConfig = {
+  enabled: boolean;
+  apiBaseConfigured: boolean;
+  publicBaseUrl?: string;
+  editorIngressUrl?: string;
+  editTypes: RawFormEditType[];
+};
+
+export type RawFormEditSubmission = {
+  projectId: string;
+  sessionId: string;
+  editType: RawFormEditType;
+  editor?: Record<string, unknown>;
+  copyrightHolder?: Record<string, unknown>;
+  attestation?: Record<string, unknown>;
+  sourceReferences?: Array<Record<string, unknown>>;
+  commentaryContext?: Record<string, unknown>;
+};
+
+export type RawFormSessionSummary = {
+  session_id?: string;
+  sessionId: string;
+  created_at_ms?: number;
+  createdAtMs?: number | null;
+  analysis_status?: string;
+  record_present?: boolean;
+  trust_color?: string | null;
+  label?: string;
+};
+
+export type RawFormSessionsResponse = {
+  sessions: RawFormSessionSummary[];
+};
+
+export type RawFormSessionImportRequest = {
+  sessionId: string;
+  projectId?: string;
+};
+
+export type RawFormSessionImportResponse = {
+  ok: boolean;
+  project: Project;
+  sessionId: string;
 };
 
 export type Rect = { x: number; y: number; w: number; h: number };
@@ -183,7 +230,7 @@ export type AudioAsset = {
 export type Project = ProjectSummary & {
   schemaVersion: 1;
   revision: number;
-  source: { filename: string; sizeBytes?: number; sha256?: string };
+  source: { filename: string; sizeBytes?: number; sha256?: string; rawFormSessionId?: string };
   video: {
     width: number;
     height: number;
@@ -235,6 +282,32 @@ export type Project = ProjectSummary & {
 export async function listProjects(): Promise<ProjectSummary[]> {
   const data = await request<{ projects: ProjectSummary[] }>("/projects");
   return data.projects;
+}
+
+export async function getRawFormConfig(): Promise<RawFormConfig> {
+  return request<RawFormConfig>("/rawform/config");
+}
+
+export async function listRawFormSessions(limit = 50): Promise<RawFormSessionsResponse> {
+  return request<RawFormSessionsResponse>(`/rawform/sessions?limit=${limit}`);
+}
+
+export async function importRawFormSession(
+  payload: RawFormSessionImportRequest
+): Promise<RawFormSessionImportResponse> {
+  return request<RawFormSessionImportResponse>("/rawform/session-imports", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function submitRawFormEdit(payload: RawFormEditSubmission) {
+  return request<{ ok: boolean; rawform: Record<string, unknown> }>("/rawform/edit-submissions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function listTemplates(): Promise<{

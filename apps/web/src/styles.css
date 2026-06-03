@@ -234,6 +234,11 @@ button.secondary {
   color: var(--ink);
 }
 
+button.small {
+  padding: 6px 12px;
+  font-size: 0.78rem;
+}
+
 button.danger {
   background: rgba(228, 88, 88, 0.15);
   border: 1px solid rgba(228, 88, 88, 0.5);
@@ -323,6 +328,17 @@ button.danger:hover {
 .asset-section {
   display: grid;
   gap: 10px;
+}
+
+.section-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.section-row label {
+  margin-bottom: 0;
 }
 
 .asset-grid {
@@ -584,6 +600,35 @@ button.danger:hover {
   height: 1px;
   background: rgba(255, 255, 255, 0.08);
   margin: 4px 0;
+}
+
+.rawform-submit-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.rawform-submit-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.rawform-submit-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
+.rawform-submit-grid input,
+.rawform-submit-grid select {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(15, 17, 20, 0.7);
+  color: var(--ink);
 }
 
 .segment-section h3,

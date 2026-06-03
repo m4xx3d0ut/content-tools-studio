@@ -14,3 +14,7 @@ export const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 5 * 1024 
 export const REPO_ROOT = process.env.REPO_ROOT
   ? path.resolve(process.env.REPO_ROOT)
   : path.resolve(process.cwd(), "../..");
+
+export const RAWFORM_API_BASE = (process.env.RAWFORM_API_BASE || "").replace(/\/+$/, "");
+export const RAWFORM_PUBLIC_BASE_URL = (process.env.RAWFORM_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+export const RAWFORM_EDITOR_INGRESS_URL = (process.env.RAWFORM_EDITOR_INGRESS_URL || "").replace(/\/+$/, "");
