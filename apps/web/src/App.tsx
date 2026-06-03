@@ -573,7 +573,6 @@ export default function App() {
   );
   const [autosavePausedProjectId, setAutosavePausedProjectId] = useState<string | null>(null);
   const [lastAutosaveAt, setLastAutosaveAt] = useState<string | null>(null);
-  const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
   const currentFrameRef = useRef(0);
   const totalFramesRef = useRef(0);
@@ -600,6 +599,12 @@ export default function App() {
 
   const editorGridStyle: CSSProperties | undefined = editorCenterHeight
     ? ({ "--editor-center-height": `${editorCenterHeight}px` } as CSSProperties)
+    : undefined;
+  const previewPaneStyle: CSSProperties | undefined = project
+    ? ({
+        "--preview-aspect-ratio": `${project.video.width} / ${project.video.height}`,
+        "--preview-aspect-value": project.video.width / project.video.height,
+      } as CSSProperties)
     : undefined;
 
   const fps = useMemo(() => getFps(project), [project]);
@@ -1120,22 +1125,22 @@ export default function App() {
     transformerRef.current.getLayer()?.batchDraw();
   }, [selectedOverlayId, selectedOverlay, stageMetrics]);
 
-  useEffect(() => {
-    if (!videoRef.current) return;
-    videoRef.current.currentTime = currentFrame / fps;
-    if (seekPauseRef.current) {
-      videoRef.current.pause();
-      isPlayingRef.current = false;
-      seekPauseRef.current = false;
-    }
-  }, [currentFrame, fps]);
-
   const seekToFrame = useCallback((frame: number, pause = true) => {
+    const nextFrame = Math.max(0, Math.min(totalFramesRef.current - 1, formatFrame(frame)));
+    const video = videoRef.current;
     if (pause) {
-      seekPauseRef.current = true;
+      video?.pause();
+      isPlayingRef.current = false;
     }
-    setCurrentFrame(frame);
-  }, []);
+    if (video && Number.isFinite(fps) && fps > 0) {
+      const nextTime = nextFrame / fps;
+      if (Math.abs(video.currentTime - nextTime) > 0.001) {
+        video.currentTime = nextTime;
+      }
+    }
+    currentFrameRef.current = nextFrame;
+    setCurrentFrame(nextFrame);
+  }, [fps]);
 
   async function handleCreate() {
     if (!nameInput.trim()) return;
@@ -2589,6 +2594,7 @@ export default function App() {
           <div
             className="preview-pane"
             ref={videoWrapperRef}
+            style={previewPaneStyle}
             onDragOver={handleDragOver}
             onDrop={handleDrop}
             onKeyDown={handlePreviewKeyDown}
@@ -2608,7 +2614,10 @@ export default function App() {
                   onTimeUpdate={(event) => {
                     if (!isPlayingRef.current) return;
                     const time = (event.target as HTMLVideoElement).currentTime;
-                    setCurrentFrame(formatFrame(time * fps));
+                    const nextFrame = formatFrame(time * fps);
+                    if (nextFrame === currentFrameRef.current) return;
+                    currentFrameRef.current = nextFrame;
+                    setCurrentFrame(nextFrame);
                   }}
                   onPlay={() => {
                     isPlayingRef.current = true;
@@ -2618,29 +2627,31 @@ export default function App() {
                   }}
                 />
                 {stageMetrics.width > 0 && (
-                  <Stage
-                    width={stageMetrics.width}
-                    height={stageMetrics.height}
-                    className="overlay-stage"
-                  >
-                    <Layer>
-                      {project.overlays
-                        .filter((overlay: Overlay) => isOverlayVisibleAtFrame(overlay, currentFrame))
-                        .map((overlay: Overlay) =>
-                          isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
-                        )}
-                      <Transformer
-                        ref={transformerRef}
-                        rotateEnabled={isArrowSelected}
-                        keepRatio={isArrowSelected}
-                        enabledAnchors={isArrowSelected ? [] : undefined}
-                        boundBoxFunc={(oldBox, newBox) => {
-                          if (newBox.width < 40 || newBox.height < 20) return oldBox;
-                          return newBox;
-                        }}
-                      />
-                    </Layer>
-                  </Stage>
+                  <div className="overlay-stage-hit-area">
+                    <Stage
+                      width={stageMetrics.width}
+                      height={stageMetrics.height}
+                      className="overlay-stage"
+                    >
+                      <Layer>
+                        {project.overlays
+                          .filter((overlay: Overlay) => isOverlayVisibleAtFrame(overlay, currentFrame))
+                          .map((overlay: Overlay) =>
+                            isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
+                          )}
+                        <Transformer
+                          ref={transformerRef}
+                          rotateEnabled={isArrowSelected}
+                          keepRatio={isArrowSelected}
+                          enabledAnchors={isArrowSelected ? [] : undefined}
+                          boundBoxFunc={(oldBox, newBox) => {
+                            if (newBox.width < 40 || newBox.height < 20) return oldBox;
+                            return newBox;
+                          }}
+                        />
+                      </Layer>
+                    </Stage>
+                  </div>
                 )}
               </>
             ) : (

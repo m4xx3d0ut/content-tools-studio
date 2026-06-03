@@ -1,7 +1,7 @@
 const fallbackBase =
-  typeof window !== "undefined"
+  import.meta.env.DEV && typeof window !== "undefined"
     ? `${window.location.protocol}//${window.location.hostname}:3033`
-    : "http://127.0.0.1:3033";
+    : "";
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? fallbackBase;
 
 export class ApiError extends Error {

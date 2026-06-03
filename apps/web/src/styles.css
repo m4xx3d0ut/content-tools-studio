@@ -27,6 +27,7 @@ body {
 
 .app-shell {
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
   padding: 24px 24px 32px;
@@ -80,6 +81,7 @@ body {
   grid-template-columns: 280px minmax(0, 1fr) 320px;
   gap: 20px;
   align-items: start;
+  min-height: 0;
 }
 
 .sidebar {
@@ -142,15 +144,23 @@ body {
 .editor-center {
   display: grid;
   gap: 12px;
+  min-height: 0;
+  align-content: start;
 }
 
 .preview-pane {
   position: relative;
+  display: grid;
+  place-items: center;
+  justify-self: center;
   border-radius: 18px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(0, 0, 0, 0.4);
-  min-height: 340px;
+  aspect-ratio: var(--preview-aspect-ratio, 16 / 9);
+  width: min(100%, calc((100dvh - 244px) * var(--preview-aspect-value, 1.7778)));
+  max-height: calc(100dvh - 244px);
+  min-height: min(340px, calc(100dvh - 244px));
 }
 
 .preview-placeholder {
@@ -492,15 +502,23 @@ button.danger:hover {
 
 .video-preview {
   display: block;
-  width: 100%;
+  width: auto;
+  max-width: 100%;
   height: auto;
+  max-height: calc(100dvh - 244px);
+}
+
+.overlay-stage-hit-area {
+  position: absolute;
+  inset: 0 0 48px 0;
+  width: 100%;
+  overflow: hidden;
+  pointer-events: auto;
 }
 
 .overlay-stage {
   position: absolute;
   inset: 0;
-  width: 100%;
-  height: 100%;
   pointer-events: auto;
 }
 
