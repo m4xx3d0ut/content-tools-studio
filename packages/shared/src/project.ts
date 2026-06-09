@@ -26,6 +26,7 @@ export const SourceSchema = z.object({
   filename: z.string().min(1),
   sizeBytes: z.number().int().nonnegative().optional(),
   sha256: z.string().length(64).optional(),
+  rawFormSessionId: z.string().optional(),
 });
 
 export const MotionSchema = z
