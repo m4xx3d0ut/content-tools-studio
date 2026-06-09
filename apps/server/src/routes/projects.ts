@@ -83,6 +83,13 @@ const AUDIO_CONTENT_TYPE_EXTENSION: Record<string, string> = {
   "application/ogg": ".ogg",
 };
 
+function clampEven(value: number): number {
+  if (!Number.isFinite(value)) return 2;
+  const rounded = Math.round(value);
+  const even = rounded % 2 === 0 ? rounded : rounded - 1;
+  return Math.max(2, even);
+}
+
 class SizeLimitTransform extends Transform {
   private bytes = 0;
 
@@ -93,7 +100,7 @@ class SizeLimitTransform extends Transform {
   _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     this.bytes += chunk.length;
     if (this.bytes > this.limitBytes) {
-      callback(new Error(`audio download exceeds ${this.limitBytes} bytes`));
+      callback(new Error(`download exceeds ${this.limitBytes} bytes`));
       return;
     }
     callback(null, chunk);
@@ -188,14 +195,22 @@ async function normalizeVideoIfNeeded(
   originalName: string,
   mediaDir: string
 ): Promise<{ filePath: string; filename: string; video: VideoInfo }> {
-  if (video.width <= NORMALIZED_WIDTH && video.height <= NORMALIZED_HEIGHT) {
+  const isPortrait = video.height > video.width;
+  const maxWidth = isPortrait ? NORMALIZED_HEIGHT : NORMALIZED_WIDTH;
+  const maxHeight = isPortrait ? NORMALIZED_WIDTH : NORMALIZED_HEIGHT;
+  const widthScale = maxWidth / video.width;
+  const heightScale = maxHeight / video.height;
+  const scale = Math.min(1, widthScale, heightScale);
+  if (scale >= 1) {
     return { filePath: inputPath, filename: originalName, video };
   }
 
   const parsed = path.parse(originalName);
-  const normalizedName = `${parsed.name}_1920x1080.mp4`;
+  const normalizedWidth = clampEven(video.width * scale);
+  const normalizedHeight = clampEven(video.height * scale);
+  const normalizedName = `${parsed.name}_${normalizedWidth}x${normalizedHeight}.mp4`;
   const outputPath = path.join(mediaDir, normalizedName);
-  const filter = `scale=${NORMALIZED_WIDTH}:${NORMALIZED_HEIGHT}:force_original_aspect_ratio=decrease,pad=${NORMALIZED_WIDTH}:${NORMALIZED_HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
+  const filter = `scale=${normalizedWidth}:${normalizedHeight},setsar=1`;
 
   const args = [
     "-y",
@@ -225,6 +240,55 @@ async function normalizeVideoIfNeeded(
   await runFfmpeg(args);
   const normalizedVideo = await probeVideo(outputPath);
   return { filePath: outputPath, filename: normalizedName, video: normalizedVideo };
+}
+
+export async function importSourceVideo(
+  project: Project,
+  input: { stream: NodeJS.ReadableStream; filename: string }
+): Promise<Project> {
+  const filename = path.basename(input.filename);
+  const projectRoot = path.join(WORKSPACE_ROOT, project.id);
+  const mediaDir = path.join(projectRoot, "media");
+  await ensureDir(mediaDir);
+
+  const targetPath = path.join(mediaDir, filename);
+  try {
+    await pipeline(input.stream, new SizeLimitTransform(UPLOAD_MAX_BYTES), createWriteStream(targetPath));
+  } catch (error) {
+    await fs.unlink(targetPath).catch(() => undefined);
+    throw error;
+  }
+
+  let video;
+  try {
+    video = await probeVideo(targetPath);
+  } catch (error) {
+    await fs.unlink(targetPath).catch(() => undefined);
+    throw new Error(`video probe failed: ${(error as Error).message}`);
+  }
+
+  const normalized = await normalizeVideoIfNeeded(video, targetPath, filename, mediaDir);
+  video = normalized.video;
+  const finalPath = normalized.filePath;
+  const finalFilename = normalized.filename;
+  const stat = await fs.stat(finalPath);
+  const sha256 = await hashFile(finalPath);
+
+  const now = new Date().toISOString();
+  const updatedProject = ProjectSchema.parse({
+    ...project,
+    revision: (project.revision ?? 1) + 1,
+    updatedAt: now,
+    source: {
+      filename: finalFilename,
+      sizeBytes: stat.size,
+      sha256,
+    },
+    video,
+  });
+
+  await writeProject(updatedProject);
+  return updatedProject;
 }
 
 async function getEditingTemplates(): Promise<TemplateForEditing[]> {
@@ -875,56 +939,22 @@ export const projectsRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(400).send({ error: "file is required" });
     }
 
-    const filename = path.basename(data.filename);
-    const projectRoot = path.join(WORKSPACE_ROOT, id);
-    const mediaDir = path.join(projectRoot, "media");
-    await ensureDir(mediaDir);
-
-    const targetPath = path.join(mediaDir, filename);
-    await pipeline(data.file, createWriteStream(targetPath));
-
-    let video;
     try {
-      video = await probeVideo(targetPath);
+      const updatedProject = await importSourceVideo(project, {
+        stream: data.file,
+        filename: data.filename,
+      });
+      emitProjectUpdated(updatedProject, "import", {
+        actor: "api",
+        summary: `Imported source video ${updatedProject.source.filename}.`,
+      });
+      return updatedProject;
     } catch (error) {
-      await fs.unlink(targetPath).catch(() => undefined);
       return reply.code(400).send({
-        error: "video probe failed",
+        error: "video import failed",
         message: (error as Error).message,
       });
     }
-
-    const normalized = await normalizeVideoIfNeeded(
-      video,
-      targetPath,
-      filename,
-      mediaDir
-    );
-    video = normalized.video;
-    const finalPath = normalized.filePath;
-    const finalFilename = normalized.filename;
-    const stat = await fs.stat(finalPath);
-    const sha256 = await hashFile(finalPath);
-
-    const now = new Date().toISOString();
-    const updatedProject = ProjectSchema.parse({
-      ...project,
-      revision: (project.revision ?? 1) + 1,
-      updatedAt: now,
-      source: {
-        filename: finalFilename,
-        sizeBytes: stat.size,
-        sha256,
-      },
-      video,
-    });
-
-    await writeProject(updatedProject);
-    emitProjectUpdated(updatedProject, "import", {
-      actor: "api",
-      summary: `Imported source video ${finalFilename}.`,
-    });
-    return updatedProject;
   });
 
   app.get(

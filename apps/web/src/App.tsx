@@ -20,11 +20,14 @@ import {
   exportLatestUrl,
   getPatchStatus,
   getProject,
+  getRawFormConfig,
   getRenderCapabilities,
+  importRawFormSession,
   importAudioAssetFromUrl,
   importProjectBundle,
   importSlugVideo,
   importVideo,
+  listRawFormSessions,
   listProjects,
   listSlugs,
   listTemplates,
@@ -35,6 +38,7 @@ import {
   patchStreamUrl,
   renderStreamUrl,
   slugMediaUrl,
+  submitRawFormEdit,
   thumbnailUrl,
   updateProject,
   uploadAsset,
@@ -46,6 +50,9 @@ import {
   type Project,
   type ProjectBundleMode,
   type ProjectSummary,
+  type RawFormConfig,
+  type RawFormEditType,
+  type RawFormSessionSummary,
   type RenderCapabilities,
   type RenderCapability,
   type SlugAsset,
@@ -56,6 +63,7 @@ import {
 
 const DEFAULT_CARD_SIZE = { w: 1100, h: 180 };
 const DEFAULT_ARROW_SIZE = { w: 128, h: 128 };
+const RAWFORM_SESSION_ID_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 const DEFAULT_PRESET_ID = "balanced";
 const DEFAULT_CROSSFADE_FRAMES = 12;
@@ -134,6 +142,30 @@ function formatTimecode(frames: number, fps: number) {
   const millis = totalMillis % 1000;
   const pad = (value: number, size = 2) => String(value).padStart(size, "0");
   return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}.${pad(millis, 3)}`;
+}
+
+function frameToMillis(frame: number, fps: number) {
+  if (!Number.isFinite(fps) || fps <= 0) return 0;
+  return Math.max(0, Math.round((formatFrame(frame) / fps) * 1000));
+}
+
+function formatMillis(ms: number) {
+  if (!Number.isFinite(ms)) return "0 ms";
+  return String(Math.max(0, Math.round(ms))).replace(/\B(?=(\d{3})+(?!\d))/g, ",") + " ms";
+}
+
+function isRawFormSessionId(value: string) {
+  return new RegExp(`^${RAWFORM_SESSION_ID_REGEX.source}$`, "i").test(value.trim());
+}
+
+function getProjectRawFormSessionId(project: Project | null) {
+  if (!project) return "";
+  const recorded = project.source.rawFormSessionId?.trim() ?? "";
+  if (isRawFormSessionId(recorded)) return recorded;
+
+  const match = project.source.filename.match(RAWFORM_SESSION_ID_REGEX);
+  if (match && project.name.startsWith("RawForm ")) return match[0];
+  return "";
 }
 
 function formatSeconds(seconds: number) {
@@ -541,6 +573,21 @@ export default function App() {
   const [renderFinalPath, setRenderFinalPath] = useState("");
   const [renderCapabilities, setRenderCapabilities] = useState<RenderCapabilities | null>(null);
   const [renderCapabilitiesError, setRenderCapabilitiesError] = useState<string | null>(null);
+  const [rawFormConfig, setRawFormConfig] = useState<RawFormConfig | null>(null);
+  const [rawFormSessions, setRawFormSessions] = useState<RawFormSessionSummary[]>([]);
+  const [rawFormSessionsLoading, setRawFormSessionsLoading] = useState(false);
+  const [rawFormSessionsError, setRawFormSessionsError] = useState<string | null>(null);
+  const [selectedRawFormSessionId, setSelectedRawFormSessionId] = useState("");
+  const [rawFormImporting, setRawFormImporting] = useState(false);
+  const [rawFormSessionId, setRawFormSessionId] = useState("");
+  const [rawFormEditType, setRawFormEditType] = useState<RawFormEditType>("unsigned");
+  const [rawFormEditorOrg, setRawFormEditorOrg] = useState("");
+  const [rawFormHolderOrg, setRawFormHolderOrg] = useState("");
+  const [rawFormSourceSessionId, setRawFormSourceSessionId] = useState("");
+  const [rawFormSourceStartMs, setRawFormSourceStartMs] = useState("");
+  const [rawFormSourceEndMs, setRawFormSourceEndMs] = useState("");
+  const [rawFormCommentary, setRawFormCommentary] = useState("");
+  const [rawFormSubmitting, setRawFormSubmitting] = useState(false);
   const [patchStatus, setPatchStatus] = useState<SurgicalPatchStatus | null>(null);
   const [patchStatusLoading, setPatchStatusLoading] = useState(false);
   const [leftTab, setLeftTab] = useState<"media" | "overlays" | "exports">("media");
@@ -573,7 +620,6 @@ export default function App() {
   );
   const [autosavePausedProjectId, setAutosavePausedProjectId] = useState<string | null>(null);
   const [lastAutosaveAt, setLastAutosaveAt] = useState<string | null>(null);
-  const seekPauseRef = useRef(false);
   const isPlayingRef = useRef(false);
   const currentFrameRef = useRef(0);
   const totalFramesRef = useRef(0);
@@ -600,6 +646,12 @@ export default function App() {
 
   const editorGridStyle: CSSProperties | undefined = editorCenterHeight
     ? ({ "--editor-center-height": `${editorCenterHeight}px` } as CSSProperties)
+    : undefined;
+  const previewPaneStyle: CSSProperties | undefined = project
+    ? ({
+        "--preview-aspect-ratio": `${project.video.width} / ${project.video.height}`,
+        "--preview-aspect-value": project.video.width / project.video.height,
+      } as CSSProperties)
     : undefined;
 
   const fps = useMemo(() => getFps(project), [project]);
@@ -688,6 +740,17 @@ export default function App() {
     () => formatTimecode(totalFrames, fps),
     [totalFrames, fps]
   );
+  const totalDurationMs = useMemo(() => {
+    if (project?.video.durationMs && hasMedia) {
+      return Math.max(0, Math.round(project.video.durationMs));
+    }
+    return Math.max(0, Math.round(videoDurationSec * 1000));
+  }, [project?.video.durationMs, hasMedia, videoDurationSec]);
+  const currentFrameMs = useMemo(() => {
+    const frameMs = frameToMillis(currentFrame, fps);
+    return totalDurationMs > 0 ? Math.min(totalDurationMs, frameMs) : frameMs;
+  }, [currentFrame, fps, totalDurationMs]);
+  const frameMetricLabel = currentFrame + " / " + totalFrames + " · " + formatMillis(currentFrameMs) + " / " + formatMillis(totalDurationMs);
   const parsedTrimStart = useMemo(
     () => parseCompleteTimecode(trimStartTime),
     [trimStartTime]
@@ -828,6 +891,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    loadRawFormConfig()
+      .then((config) => {
+        if (!cancelled) setRawFormConfig(config);
+      })
+      .catch(() => {
+        if (!cancelled) setRawFormConfig({ enabled: false, apiBaseConfigured: false, editTypes: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    void refreshRawFormSessions();
+  }, [rawFormConfig?.enabled]);
+
+  useEffect(() => {
     if (!renderCapabilities || isRoughPreview) return;
     const current = renderCapabilities.presets.find((preset) => preset.id === selectedPresetId);
     if (!current || current.available) return;
@@ -838,6 +919,12 @@ export default function App() {
     );
     setStatus(`${current.label} unavailable; using Balanced (CPU).`);
   }, [renderCapabilities, isRoughPreview, selectedPresetId]);
+
+  useEffect(() => {
+    const rawFormSourceId = getProjectRawFormSessionId(project);
+    setRawFormSessionId(rawFormSourceId);
+    setRawFormSourceSessionId(rawFormSourceId);
+  }, [project?.id, project?.name, project?.source.filename, project?.source.rawFormSessionId]);
 
   useEffect(() => {
     try {
@@ -870,6 +957,49 @@ export default function App() {
   async function refreshSlugs() {
     const slugs = await listSlugs();
     setSlugLibrary(slugs);
+  }
+
+  async function loadRawFormConfig() {
+    const config = await getRawFormConfig();
+    setRawFormConfig(config);
+    return config;
+  }
+
+  async function refreshRawFormSessions(refreshConfig = false) {
+    let config = rawFormConfig;
+    if (refreshConfig || !config) {
+      try {
+        config = await loadRawFormConfig();
+      } catch (error) {
+        setRawFormConfig({ enabled: false, apiBaseConfigured: false, editTypes: [] });
+        setRawFormSessions([]);
+        setSelectedRawFormSessionId("");
+        setRawFormSessionsError((error as Error).message);
+        return;
+      }
+    }
+    if (!config?.enabled) {
+      setRawFormSessions([]);
+      setSelectedRawFormSessionId("");
+      setRawFormSessionsError("RawForm integration is not configured.");
+      return;
+    }
+    setRawFormSessionsLoading(true);
+    setRawFormSessionsError(null);
+    try {
+      const response = await listRawFormSessions(50);
+      setRawFormSessions(response.sessions);
+      setSelectedRawFormSessionId((current) => {
+        if (current && response.sessions.some((session) => session.sessionId === current)) {
+          return current;
+        }
+        return response.sessions[0]?.sessionId ?? "";
+      });
+    } catch (error) {
+      setRawFormSessionsError((error as Error).message);
+    } finally {
+      setRawFormSessionsLoading(false);
+    }
   }
 
   useEffect(() => {
@@ -1120,22 +1250,22 @@ export default function App() {
     transformerRef.current.getLayer()?.batchDraw();
   }, [selectedOverlayId, selectedOverlay, stageMetrics]);
 
-  useEffect(() => {
-    if (!videoRef.current) return;
-    videoRef.current.currentTime = currentFrame / fps;
-    if (seekPauseRef.current) {
-      videoRef.current.pause();
-      isPlayingRef.current = false;
-      seekPauseRef.current = false;
-    }
-  }, [currentFrame, fps]);
-
   const seekToFrame = useCallback((frame: number, pause = true) => {
+    const nextFrame = Math.max(0, Math.min(totalFramesRef.current - 1, formatFrame(frame)));
+    const video = videoRef.current;
     if (pause) {
-      seekPauseRef.current = true;
+      video?.pause();
+      isPlayingRef.current = false;
     }
-    setCurrentFrame(frame);
-  }, []);
+    if (video && Number.isFinite(fps) && fps > 0) {
+      const nextTime = nextFrame / fps;
+      if (Math.abs(video.currentTime - nextTime) > 0.001) {
+        video.currentTime = nextTime;
+      }
+    }
+    currentFrameRef.current = nextFrame;
+    setCurrentFrame(nextFrame);
+  }, [fps]);
 
   async function handleCreate() {
     if (!nameInput.trim()) return;
@@ -1185,6 +1315,34 @@ export default function App() {
       setStatus(`Imported ${file.name}.`);
     } catch (error) {
       setStatus((error as Error).message);
+    }
+  }
+
+  async function handleImportRawFormSession() {
+    const sessionId = selectedRawFormSessionId.trim();
+    if (!sessionId) {
+      setStatus("Select a RawForm video first.");
+      return;
+    }
+    setRawFormImporting(true);
+    setStatus("Importing RawForm video...");
+    try {
+      const response = await importRawFormSession({
+        sessionId,
+        projectId: selectedId ?? undefined,
+      });
+      setSelectedId(response.project.id);
+      setProject(response.project);
+      setSelectedOverlayId(response.project.overlays[0]?.id ?? null);
+      historyRef.current = { past: [], future: [] };
+      setRawFormSessionId(sessionId);
+      setRawFormSourceSessionId(sessionId);
+      await refreshProjects(response.project.id);
+      setStatus(`Opened RawForm session ${sessionId.slice(0, 8)} in the editor.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    } finally {
+      setRawFormImporting(false);
     }
   }
 
@@ -2076,6 +2234,71 @@ export default function App() {
     }
   }
 
+  async function handleSubmitRawFormEdit() {
+    if (!project || !selectedId) return;
+    const sessionId = rawFormSessionId.trim();
+    if (!sessionId) {
+      setStatus("Enter the RawForm source session id before submitting an edit.");
+      return;
+    }
+    if (!isRawFormSessionId(sessionId)) {
+      setStatus("Use the full RawForm source session UUID from the video picker.");
+      return;
+    }
+    const sourceSessionId = rawFormSourceSessionId.trim() || sessionId;
+    if (!isRawFormSessionId(sourceSessionId)) {
+      setStatus("Clip session must be a full RawForm session UUID, or leave it blank to use the source session.");
+      return;
+    }
+    setRawFormSubmitting(true);
+    setStatus("Submitting edit to RawForm...");
+    try {
+      const editorOrg = rawFormEditorOrg.trim();
+      const holderOrg = rawFormHolderOrg.trim();
+      const startMs = Number(rawFormSourceStartMs || 0);
+      const endMs = Number(rawFormSourceEndMs || project.video.durationMs || 0);
+      const sourceReferences =
+        rawFormEditType === "commentator" || sourceSessionId
+          ? [
+              {
+                source_session_id: sourceSessionId,
+                t_start_ms: Number.isFinite(startMs) ? Math.max(0, Math.round(startMs)) : 0,
+                t_end_ms:
+                  Number.isFinite(endMs) && endMs > startMs
+                    ? Math.round(endMs)
+                    : Math.max(1, project.video.durationMs || 1),
+                rights: {
+                  basis: rawFormEditType === "commentator" ? "commentary" : "edit_reference",
+                },
+                transforms: [
+                  { type: "content-tools-project", project_id: project.id, revision: project.revision },
+                ],
+              },
+            ]
+          : [];
+      await submitRawFormEdit({
+        projectId: selectedId,
+        sessionId,
+        editType: rawFormEditType,
+        editor: editorOrg ? { org_id: editorOrg, user_id: "demo-editor" } : {},
+        copyrightHolder: holderOrg ? { org_id: holderOrg } : {},
+        attestation:
+          rawFormEditType === "signed"
+            ? { identity_proof_id: `demo-${editorOrg || holderOrg || "signed"}-${Date.now()}` }
+            : {},
+        sourceReferences,
+        commentaryContext: rawFormCommentary.trim()
+          ? { claim: rawFormCommentary.trim(), submitted_from: "content-tools-studio" }
+          : {},
+      });
+      setStatus(`Submitted ${rawFormEditType} edit to RawForm.`);
+    } catch (error) {
+      setStatus((error as Error).message);
+    } finally {
+      setRawFormSubmitting(false);
+    }
+  }
+
   function handleDragStart(type: "card" | "arrow", templateId?: string) {
     return (event: DragEvent) => {
       const payload = JSON.stringify({ type, templateId });
@@ -2402,6 +2625,59 @@ export default function App() {
               </div>
 
               <div className="media-section">
+                <div className="section-row">
+                  <label htmlFor="rawform-session-select">RawForm videos</label>
+                  <button
+                    type="button"
+                    className="secondary small"
+                    disabled={rawFormSessionsLoading}
+                    onClick={() => void refreshRawFormSessions(true)}
+                  >
+                    {rawFormSessionsLoading ? "Loading..." : "Refresh"}
+                  </button>
+                </div>
+                <select
+                  id="rawform-session-select"
+                  value={selectedRawFormSessionId}
+                  disabled={!rawFormConfig?.enabled || rawFormSessionsLoading || rawFormSessions.length === 0}
+                  onChange={(event) => setSelectedRawFormSessionId(event.target.value)}
+                >
+                  {rawFormSessions.length === 0 ? (
+                    <option value="">
+                      {rawFormConfig?.enabled ? "No RawForm videos found" : "RawForm unavailable"}
+                    </option>
+                  ) : (
+                    rawFormSessions.map((session) => (
+                      <option key={session.sessionId} value={session.sessionId}>
+                        {session.label ?? session.sessionId}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <div className="actions">
+                  <button
+                    type="button"
+                    disabled={
+                      !rawFormConfig?.enabled ||
+                      rawFormImporting ||
+                      rawFormSessionsLoading ||
+                      !selectedRawFormSessionId
+                    }
+                    onClick={() => void handleImportRawFormSession()}
+                  >
+                    {rawFormImporting ? "Opening..." : selectedId ? "Open in project" : "Open as project"}
+                  </button>
+                </div>
+                <div className="details">
+                  {rawFormSessionsError
+                    ? rawFormSessionsError
+                    : selectedId
+                      ? "Imports into the selected project."
+                      : "Creates a project when none is selected."}
+                </div>
+              </div>
+
+              <div className="media-section">
                 <h3>Project bundle</h3>
                 <label htmlFor="bundle-mode">Export mode</label>
                 <select
@@ -2589,6 +2865,7 @@ export default function App() {
           <div
             className="preview-pane"
             ref={videoWrapperRef}
+            style={previewPaneStyle}
             onDragOver={handleDragOver}
             onDrop={handleDrop}
             onKeyDown={handlePreviewKeyDown}
@@ -2602,13 +2879,23 @@ export default function App() {
                   src={mediaUrl(project.id)}
                   className="video-preview"
                   controls
+                  playsInline
+                  preload="metadata"
                   onLoadedMetadata={(event) => {
                     setVideoDurationSec((event.target as HTMLVideoElement).duration || 0);
+                  }}
+                  onError={(event) => {
+                    const mediaError = (event.currentTarget as HTMLVideoElement).error;
+                    const suffix = mediaError?.code ? " (media error " + mediaError.code + ")" : "";
+                    setStatus("Video preview failed to load" + suffix + ". Reload the editor or reopen the RawForm video.");
                   }}
                   onTimeUpdate={(event) => {
                     if (!isPlayingRef.current) return;
                     const time = (event.target as HTMLVideoElement).currentTime;
-                    setCurrentFrame(formatFrame(time * fps));
+                    const nextFrame = formatFrame(time * fps);
+                    if (nextFrame === currentFrameRef.current) return;
+                    currentFrameRef.current = nextFrame;
+                    setCurrentFrame(nextFrame);
                   }}
                   onPlay={() => {
                     isPlayingRef.current = true;
@@ -2618,29 +2905,31 @@ export default function App() {
                   }}
                 />
                 {stageMetrics.width > 0 && (
-                  <Stage
-                    width={stageMetrics.width}
-                    height={stageMetrics.height}
-                    className="overlay-stage"
-                  >
-                    <Layer>
-                      {project.overlays
-                        .filter((overlay: Overlay) => isOverlayVisibleAtFrame(overlay, currentFrame))
-                        .map((overlay: Overlay) =>
-                          isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
-                        )}
-                      <Transformer
-                        ref={transformerRef}
-                        rotateEnabled={isArrowSelected}
-                        keepRatio={isArrowSelected}
-                        enabledAnchors={isArrowSelected ? [] : undefined}
-                        boundBoxFunc={(oldBox, newBox) => {
-                          if (newBox.width < 40 || newBox.height < 20) return oldBox;
-                          return newBox;
-                        }}
-                      />
-                    </Layer>
-                  </Stage>
+                  <div className="overlay-stage-hit-area">
+                    <Stage
+                      width={stageMetrics.width}
+                      height={stageMetrics.height}
+                      className="overlay-stage"
+                    >
+                      <Layer>
+                        {project.overlays
+                          .filter((overlay: Overlay) => isOverlayVisibleAtFrame(overlay, currentFrame))
+                          .map((overlay: Overlay) =>
+                            isArrow(overlay) ? renderArrowShape(overlay) : renderCardShape(overlay)
+                          )}
+                        <Transformer
+                          ref={transformerRef}
+                          rotateEnabled={isArrowSelected}
+                          keepRatio={isArrowSelected}
+                          enabledAnchors={isArrowSelected ? [] : undefined}
+                          boundBoxFunc={(oldBox, newBox) => {
+                            if (newBox.width < 40 || newBox.height < 20) return oldBox;
+                            return newBox;
+                          }}
+                        />
+                      </Layer>
+                    </Stage>
+                  </div>
                 )}
               </>
             ) : (
@@ -2668,7 +2957,7 @@ export default function App() {
               Frame ▶︎
             </button>
             <div className="details">
-              {project ? project.source.filename : "No media"} · {currentFrame} / {totalFrames}
+              {project ? project.source.filename : "No media"} · {frameMetricLabel}
             </div>
           </div>
         </section>
@@ -3080,7 +3369,7 @@ export default function App() {
                 onChange={(event) => seekToFrame(Number(event.target.value))}
               />
               <div className="details">
-                Frame {currentFrame} / {totalFrames}
+                Frame {frameMetricLabel}
               </div>
             </div>
             <div className="thumbnail-strip">
@@ -3566,6 +3855,106 @@ export default function App() {
                 })
               }
             />
+          </div>
+        </div>
+        <div className="render-divider" />
+        <div className="rawform-submit-panel">
+          <div className="rawform-submit-header">
+            <div>
+              <strong>RawForm edit ingest</strong>
+              <div className="details">
+                {rawFormConfig?.enabled
+                  ? rawFormConfig.publicBaseUrl || "RawForm API configured"
+                  : "RawForm API not configured"}
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={!project || rawFormSubmitting || !rawFormConfig?.enabled || !rawFormSessionId}
+              onClick={() => void handleSubmitRawFormEdit()}
+            >
+              {rawFormSubmitting ? "Submitting..." : "Submit edit"}
+            </button>
+          </div>
+          <div className="rawform-submit-grid">
+            <label>
+              Source session
+              <input
+                value={rawFormSessionId}
+                placeholder="Open a RawForm video first"
+                readOnly
+              />
+            </label>
+            <label>
+              Edit type
+              <select
+                value={rawFormEditType}
+                disabled={!project}
+                onChange={(event) => setRawFormEditType(event.target.value as RawFormEditType)}
+              >
+                <option value="unsigned">Unsigned</option>
+                <option value="commentator">Commentator</option>
+                <option value="signed">Signed</option>
+              </select>
+            </label>
+            <label>
+              Editor org
+              <input
+                value={rawFormEditorOrg}
+                placeholder={rawFormEditType === "unsigned" ? "Optional" : "Required"}
+                disabled={!project}
+                onChange={(event) => setRawFormEditorOrg(event.target.value)}
+              />
+            </label>
+            <label>
+              Holder org
+              <input
+                value={rawFormHolderOrg}
+                placeholder={rawFormEditType === "unsigned" ? "Optional" : "Required"}
+                disabled={!project}
+                onChange={(event) => setRawFormHolderOrg(event.target.value)}
+              />
+            </label>
+            <label>
+              Clip session
+              <input
+                value={rawFormSourceSessionId}
+                placeholder="Defaults to source session"
+                disabled={!project}
+                onChange={(event) => setRawFormSourceSessionId(event.target.value)}
+              />
+            </label>
+            <label>
+              Clip start ms
+              <input
+                type="number"
+                min={0}
+                value={rawFormSourceStartMs}
+                placeholder="0"
+                disabled={!project}
+                onChange={(event) => setRawFormSourceStartMs(event.target.value)}
+              />
+            </label>
+            <label>
+              Clip end ms
+              <input
+                type="number"
+                min={0}
+                value={rawFormSourceEndMs}
+                placeholder={String(project?.video.durationMs ?? 0)}
+                disabled={!project}
+                onChange={(event) => setRawFormSourceEndMs(event.target.value)}
+              />
+            </label>
+            <label>
+              Commentary
+              <input
+                value={rawFormCommentary}
+                placeholder="Claim, context, or rights note"
+                disabled={!project}
+                onChange={(event) => setRawFormCommentary(event.target.value)}
+              />
+            </label>
           </div>
         </div>
         <div className="render-divider" />

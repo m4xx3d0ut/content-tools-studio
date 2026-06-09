@@ -1,10 +1,24 @@
-import test, { type TestContext } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildApp } from "./app.js";
-import { probeRenderCapabilitiesForTests } from "./services/render-capabilities.js";
+
+const startingCwd = process.cwd();
+const repoRoot = startingCwd.endsWith(path.join("apps", "server"))
+  ? path.resolve(startingCwd, "../..")
+  : startingCwd;
+const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "content-tools-render-capabilities-"));
+process.env.WORKSPACE_ROOT = workspaceRoot;
+process.env.REPO_ROOT = repoRoot;
+process.chdir(path.join(repoRoot, "apps", "server"));
+
+after(async () => {
+  await fs.rm(workspaceRoot, { recursive: true, force: true });
+});
+
+const { buildApp } = await import("./app.js");
+const { probeRenderCapabilitiesForTests } = await import("./services/render-capabilities.js");
 
 async function writeFakeFfmpeg(
   t: TestContext,
