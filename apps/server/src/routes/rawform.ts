@@ -1,11 +1,19 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import path from "node:path";
-import { promises as fs } from "node:fs";
+import { createReadStream, promises as fs } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import type { VideoInfo } from "@content-tools/shared";
-import { RAWFORM_API_BASE, RAWFORM_EDITOR_INGRESS_URL, RAWFORM_PUBLIC_BASE_URL, WORKSPACE_ROOT } from "../config.js";
+import {
+  RAWFORM_API_BASE,
+  RAWFORM_EDITOR_INGRESS_URL,
+  RAWFORM_FETCH_TIMEOUT_MS,
+  RAWFORM_MEDIA_TIMEOUT_MS,
+  RAWFORM_PUBLIC_BASE_URL,
+  UPLOAD_MAX_BYTES,
+  WORKSPACE_ROOT,
+} from "../config.js";
 import { routeDoc } from "../openapi.js";
 import { createProject, readProject, writeProject } from "../services/workspace.js";
 import { fileExists } from "../utils/fs.js";
@@ -27,6 +35,8 @@ type RawFormSessionImportBody = {
   sessionId?: string;
   projectId?: string;
 };
+
+type RawFormFetchInit = RequestInit & { duplex?: "half" };
 
 export const rawformRoutes: FastifyPluginAsync = async (app) => {
   app.get(
@@ -55,11 +65,15 @@ export const rawformRoutes: FastifyPluginAsync = async (app) => {
 
       const rawLimit = Number((request.query as { limit?: string })?.limit ?? 50);
       const limit = Math.max(1, Math.min(100, Number.isFinite(rawLimit) ? rawLimit : 50));
-      const response = await rawformFetch(`/api/sessions?limit=${limit}`, { method: "GET" });
-      const sessions = Array.isArray(response.sessions) ? response.sessions : [];
-      return {
-        sessions: sessions.map((session) => normalizeRawFormSession(session)),
-      };
+      try {
+        const response = await rawformFetch(`/api/sessions?limit=${limit}`, { method: "GET" });
+        const sessions = Array.isArray(response.sessions) ? response.sessions : [];
+        return {
+          sessions: sessions.map((session) => normalizeRawFormSession(session)),
+        };
+      } catch (error) {
+        return sendRawFormError(reply, error);
+      }
     }
   );
 
@@ -80,22 +94,40 @@ export const rawformRoutes: FastifyPluginAsync = async (app) => {
       if (!sessionId) {
         return reply.code(400).send({ error: "sessionId is required" });
       }
-
-      const mediaResponse = await fetch(
-        `${RAWFORM_API_BASE}/api/raw_media/${encodeURIComponent(sessionId)}`,
-        { headers: { "User-Agent": "content-tools-studio/1.0" } }
-      );
-      if (!mediaResponse.ok || !mediaResponse.body) {
-        const text = await mediaResponse.text().catch(() => "");
-        return reply.code(mediaResponse.status || 502).send({
-          error: text || `RawForm media request failed: ${mediaResponse.status}`,
-        });
+      if (!isRawFormSessionId(sessionId)) {
+        return reply.code(400).send({ error: "sessionId must be the full RawForm session UUID" });
       }
 
       let project = projectId ? await readProject(projectId) : null;
       if (projectId && !project) {
         return reply.code(404).send({ error: "project not found" });
       }
+
+      const mediaTimeout = createRawFormTimeout(RAWFORM_MEDIA_TIMEOUT_MS);
+      let mediaResponse: Response;
+      try {
+        mediaResponse = await fetch(`${RAWFORM_API_BASE}/api/raw_media/${encodeURIComponent(sessionId)}`, {
+          headers: { "User-Agent": "content-tools-studio/1.0" },
+          signal: mediaTimeout.signal,
+        });
+      } catch (error) {
+        mediaTimeout.clear();
+        return sendRawFormError(reply, rawFormNetworkError(error, RAWFORM_MEDIA_TIMEOUT_MS, "RawForm media request"));
+      }
+      if (!mediaResponse.ok || !mediaResponse.body) {
+        const text = await mediaResponse.text().catch(() => "");
+        mediaTimeout.clear();
+        return reply.code(mediaResponse.status || 502).send({
+          error: text || `RawForm media request failed: ${mediaResponse.status}`,
+        });
+      }
+      const contentLength = Number(mediaResponse.headers.get("content-length") ?? 0);
+      if (Number.isFinite(contentLength) && contentLength > UPLOAD_MAX_BYTES) {
+        await mediaResponse.body.cancel().catch(() => undefined);
+        mediaTimeout.clear();
+        return reply.code(400).send({ error: `RawForm media exceeds ${UPLOAD_MAX_BYTES} bytes` });
+      }
+
       if (!project) {
         project = await createProject(`RawForm ${sessionId.slice(0, 8)}`);
       }
@@ -124,7 +156,14 @@ export const rawformRoutes: FastifyPluginAsync = async (app) => {
         });
         return { ok: true, project: rawFormProject, sessionId };
       } catch (error) {
+        if (mediaTimeout.signal.aborted) {
+          return reply.code(504).send({
+            error: `RawForm media request timed out after ${RAWFORM_MEDIA_TIMEOUT_MS}ms`,
+          });
+        }
         return reply.code(400).send({ error: (error as Error).message });
+      } finally {
+        mediaTimeout.clear();
       }
     }
   );
@@ -176,25 +215,33 @@ export const rawformRoutes: FastifyPluginAsync = async (app) => {
         return reply.code(400).send({ error: "render a final export before submitting to RawForm" });
       }
 
-      const fileBuffer = await fs.readFile(latest.finalPath);
-      const sha256 = createHash("sha256").update(fileBuffer).digest("hex");
+      const media = await hashFileWithSize(latest.finalPath);
       const editId = randomUUID();
-      const uploadResponse = await rawformFetch(
-        `/api/edited_clip/${encodeURIComponent(sessionId)}/upload?ext=mp4&edit_id=${encodeURIComponent(editId)}`,
-        {
-          method: "POST",
-          headers: { "content-type": "video/mp4" },
-          body: fileBuffer,
-        }
-      );
+      let uploadResponse: Record<string, unknown>;
+      try {
+        uploadResponse = await rawformFetch(
+          `/api/edited_clip/${encodeURIComponent(sessionId)}/upload?ext=mp4&edit_id=${encodeURIComponent(editId)}`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "video/mp4",
+              "content-length": String(media.bytes),
+            },
+            body: createReadStream(latest.finalPath) as unknown as BodyInit,
+            duplex: "half",
+          }
+        );
+      } catch (error) {
+        return sendRawFormError(reply, error);
+      }
 
       const manifest = {
         edit_id: editId,
         session_id: sessionId,
         edit_type: editType,
         edited_media_key: uploadResponse.edited_media_key,
-        edited_media_sha256: sha256,
-        edited_media_bytes: fileBuffer.length,
+        edited_media_sha256: media.sha256,
+        edited_media_bytes: media.bytes,
         content_type: "video/mp4",
         editor: body.editor ?? {},
         copyright_holder: body.copyrightHolder ?? {},
@@ -225,11 +272,16 @@ export const rawformRoutes: FastifyPluginAsync = async (app) => {
         },
       };
 
-      const manifestResponse = await rawformFetch("/api/edit_manifest", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(manifest),
-      });
+      let manifestResponse: Record<string, unknown>;
+      try {
+        manifestResponse = await rawformFetch("/api/edit_manifest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(manifest),
+        });
+      } catch (error) {
+        return sendRawFormError(reply, error);
+      }
 
       return {
         ok: true,
@@ -311,23 +363,76 @@ function firstPositiveInteger(...values: number[]): number {
   return 0;
 }
 
-async function rawformFetch(pathname: string, init: RequestInit): Promise<Record<string, unknown>> {
-  const response = await fetch(`${RAWFORM_API_BASE}${pathname}`, init);
-  const text = await response.text();
-  let payload: unknown = text;
+async function hashFileWithSize(filePath: string): Promise<{ sha256: string; bytes: number }> {
+  const hash = createHash("sha256");
+  let bytes = 0;
+  for await (const chunk of createReadStream(filePath)) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    hash.update(buffer);
+  }
+  return { sha256: hash.digest("hex"), bytes };
+}
+
+class RawFormUpstreamError extends Error {
+  constructor(message: string, readonly statusCode = 502) {
+    super(message);
+    this.name = "RawFormUpstreamError";
+  }
+}
+
+function createRawFormTimeout(timeoutMs: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    clear: () => clearTimeout(timeout),
+  };
+}
+
+function rawFormNetworkError(error: unknown, timeoutMs: number, label = "RawForm request"): RawFormUpstreamError {
+  if (error instanceof Error && error.name === "AbortError") {
+    return new RawFormUpstreamError(`${label} timed out after ${timeoutMs}ms`, 504);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return new RawFormUpstreamError(`${label} failed: ${message}`, 502);
+}
+
+function sendRawFormError(reply: FastifyReply, error: unknown) {
+  if (error instanceof RawFormUpstreamError) {
+    return reply.code(error.statusCode).send({ error: error.message });
+  }
+  return reply.code(400).send({ error: (error as Error).message });
+}
+
+async function rawformFetch(pathname: string, init: RawFormFetchInit): Promise<Record<string, unknown>> {
+  const timeout = createRawFormTimeout(RAWFORM_FETCH_TIMEOUT_MS);
   try {
-    payload = text ? JSON.parse(text) : null;
-  } catch {
-    payload = text;
+    const response = await fetch(`${RAWFORM_API_BASE}${pathname}`, {
+      ...init,
+      signal: timeout.signal,
+    });
+    const text = await response.text();
+    let payload: unknown = text;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text;
+    }
+    if (!response.ok) {
+      const message =
+        payload && typeof payload === "object" && "error" in payload
+          ? String((payload as { error: unknown }).error)
+          : text || `RawForm request failed: ${response.status}`;
+      throw new RawFormUpstreamError(message, response.status || 502);
+    }
+    return (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
+  } catch (error) {
+    if (error instanceof RawFormUpstreamError) throw error;
+    throw rawFormNetworkError(error, RAWFORM_FETCH_TIMEOUT_MS);
+  } finally {
+    timeout.clear();
   }
-  if (!response.ok) {
-    const message =
-      payload && typeof payload === "object" && "error" in payload
-        ? String((payload as { error: unknown }).error)
-        : text || `RawForm request failed: ${response.status}`;
-    throw new Error(message);
-  }
-  return (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
 }
 
 function isRawFormSessionId(value: string): boolean {

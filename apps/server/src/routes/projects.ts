@@ -100,7 +100,7 @@ class SizeLimitTransform extends Transform {
   _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     this.bytes += chunk.length;
     if (this.bytes > this.limitBytes) {
-      callback(new Error(`audio download exceeds ${this.limitBytes} bytes`));
+      callback(new Error(`download exceeds ${this.limitBytes} bytes`));
       return;
     }
     callback(null, chunk);
@@ -252,7 +252,12 @@ export async function importSourceVideo(
   await ensureDir(mediaDir);
 
   const targetPath = path.join(mediaDir, filename);
-  await pipeline(input.stream, createWriteStream(targetPath));
+  try {
+    await pipeline(input.stream, new SizeLimitTransform(UPLOAD_MAX_BYTES), createWriteStream(targetPath));
+  } catch (error) {
+    await fs.unlink(targetPath).catch(() => undefined);
+    throw error;
+  }
 
   let video;
   try {
